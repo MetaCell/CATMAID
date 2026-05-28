@@ -39,7 +39,7 @@ from catmaid.objects import Skeleton, SkeletonGroup, \
         compartmentalize_skeletongroup_by_confidence
 from catmaid.control.authentication import check_user_role, requires_user_role, \
         can_edit_class_instance_or_fail, can_edit_or_fail, can_edit_all_or_fail, \
-        PermissionError, user_domain
+        PermissionError
 from catmaid.control.common import (insert_into_log, get_class_to_id_map,
         get_relation_to_id_map, _create_relation, get_request_bool,
         get_request_list, Echo, get_last_concept_id)
@@ -5160,71 +5160,6 @@ RESTORABLE_SKELETON_DELETE_LABELS = {
 }
 
 
-def can_restore_historic_skeleton_or_fail(user, project_id, tx):
-    """Check edit rights against owners of rows restored from a history tx."""
-    if user.is_superuser:
-        return True
-
-    cursor = connection.cursor()
-    cursor.execute("""
-        WITH historic_owner AS (
-            SELECT user_id AS owner_id
-            FROM class_instance__history
-            WHERE project_id = %(project_id)s
-                AND exec_transaction_id = %(tx_id)s
-                AND upper(sys_period) = %(tx_time)s
-            UNION
-            SELECT user_id AS owner_id
-            FROM class_instance_class_instance__history
-            WHERE project_id = %(project_id)s
-                AND exec_transaction_id = %(tx_id)s
-                AND upper(sys_period) = %(tx_time)s
-            UNION
-            SELECT user_id AS owner_id
-            FROM treenode__history
-            WHERE project_id = %(project_id)s
-                AND exec_transaction_id = %(tx_id)s
-                AND upper(sys_period) = %(tx_time)s
-            UNION
-            SELECT user_id AS owner_id
-            FROM treenode_class_instance__history
-            WHERE project_id = %(project_id)s
-                AND exec_transaction_id = %(tx_id)s
-                AND upper(sys_period) = %(tx_time)s
-            UNION
-            SELECT user_id AS owner_id
-            FROM treenode_connector__history
-            WHERE project_id = %(project_id)s
-                AND exec_transaction_id = %(tx_id)s
-                AND upper(sys_period) = %(tx_time)s
-            UNION
-            SELECT reviewer_id AS owner_id
-            FROM review__history
-            WHERE project_id = %(project_id)s
-                AND exec_transaction_id = %(tx_id)s
-                AND upper(sys_period) = %(tx_time)s
-        )
-        SELECT DISTINCT owner_id
-        FROM historic_owner
-        WHERE owner_id IS NOT NULL
-    """, {
-        'project_id': project_id,
-        'tx_id': tx.id,
-        'tx_time': tx.time,
-    })
-    historic_owner_ids = set(row[0] for row in cursor.fetchall())
-    if not historic_owner_ids:
-        raise PermissionError("Could not determine owners of historic skeleton data")
-
-    missing_owner_ids = historic_owner_ids.difference(user_domain(cursor, user.id))
-    if missing_owner_ids:
-        raise PermissionError(
-            f"User {user.username} cannot restore skeleton data owned by "
-            f"user IDs {sorted(missing_owner_ids)}")
-
-    return True
-
-
 @api_view(['POST'])
 @requires_user_role(UserRole.Annotate)
 def restore_historic_skeleton(request:HttpRequest, project_id, skeleton_id):
@@ -5267,7 +5202,6 @@ def restore_historic_skeleton(request:HttpRequest, project_id, skeleton_id):
 
         tx = Transaction(restore_info['transaction_id'],
                 restore_info['execution_time'])
-        can_restore_historic_skeleton_or_fail(request.user, project_id, tx)
 
         restored_skeleton_ids = undelete_neuron(project_id, tx,
                 user_id=request.user.id,

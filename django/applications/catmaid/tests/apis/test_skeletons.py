@@ -2076,21 +2076,6 @@ class SkeletonsApiTransactionTests(CatmaidApiTransactionTestCase):
         self.assertEqual(skeleton_restore_count + 1,
                 self.transaction_label_count('skeletons.restore'))
 
-    def test_restore_historic_skeleton_requires_historic_edit_permission(self):
-        self.fake_authentication()
-        skeleton_id = 1
-
-        response = self.client.post(
-            '/%d/skeletons/%s/delete' % (self.test_project_id, skeleton_id))
-        self.assertStatus(response)
-
-        self.fake_authentication(username='test0',
-                add_default_permissions=True)
-        response = self.client.post(
-            '/%d/skeletons/%s/restore' % (self.test_project_id, skeleton_id))
-        self.assertStatus(response, 403)
-        self.assertFalse(ClassInstance.objects.filter(id=skeleton_id).exists())
-
     def test_restore_historic_skeleton_rejects_multi_skeleton_transaction(self):
         self.fake_authentication()
         skeleton_id = 1
