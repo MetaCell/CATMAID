@@ -2092,6 +2092,42 @@ class SkeletonsApiTransactionTests(CatmaidApiTransactionTestCase):
         self.assertFalse(ClassInstance.objects.filter(id=skeleton_id).exists())
         self.assertFalse(ClassInstance.objects.filter(id=extra_skeleton.id).exists())
 
+    def test_restore_historic_skeleton_rejects_unlabeled_transaction(self):
+        self.fake_authentication()
+        skeleton_id = 1
+
+        response = self.client.post(
+            '/%d/skeletons/%s/delete' % (self.test_project_id, skeleton_id))
+        self.assertStatus(response)
+
+        cursor = connection.cursor()
+        cursor.execute("""
+            WITH latest AS (
+                SELECT ci.exec_transaction_id AS transaction_id,
+                    upper(ci.sys_period) AS execution_time
+                FROM class_instance__history ci
+                JOIN class c
+                    ON c.id = ci.class_id
+                    AND c.project_id = ci.project_id
+                    AND c.class_name = 'skeleton'
+                WHERE ci.project_id = %s
+                    AND ci.id = %s
+                    AND ci.sys_period IS NOT NULL
+                    AND NOT upper_inf(ci.sys_period)
+                ORDER BY upper(ci.sys_period) DESC
+                LIMIT 1
+            )
+            DELETE FROM catmaid_transaction_info cti
+            USING latest
+            WHERE cti.transaction_id = latest.transaction_id
+                AND cti.execution_time = latest.execution_time
+        """, (self.test_project_id, skeleton_id))
+
+        response = self.client.post(
+            '/%d/skeletons/%s/restore' % (self.test_project_id, skeleton_id))
+        self.assertStatus(response, 400)
+        self.assertFalse(ClassInstance.objects.filter(id=skeleton_id).exists())
+
     def test_restore_historic_skeleton_rejects_live_skeleton(self):
         self.fake_authentication()
         skeleton_id = 1

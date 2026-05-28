@@ -5188,10 +5188,10 @@ def restore_historic_skeleton(request:HttpRequest, project_id, skeleton_id):
                 f"No deleted historic skeleton found for skeleton {skeleton_id}")
 
         source_label = restore_info['label']
-        if source_label and source_label not in RESTORABLE_SKELETON_DELETE_LABELS:
+        if source_label not in RESTORABLE_SKELETON_DELETE_LABELS:
             raise ValueError(
                 f"Latest historic transaction for skeleton {skeleton_id} has "
-                f"non-restoreable label {source_label}")
+                f"missing or unsupported label {source_label}")
 
         restored_skeleton_set = set(restore_info['skeleton_ids'])
         if restored_skeleton_set != {skeleton_id}:
