@@ -2050,8 +2050,7 @@ class SkeletonsApiTransactionTests(CatmaidApiTransactionTestCase):
         parsed_response = json.loads(response.content.decode('utf-8'))
 
         self.assertEqual(skeleton_id, parsed_response['skeleton_id'])
-        self.assertEqual([skeleton_id],
-                parsed_response['restored_skeleton_ids'])
+        self.assertNotIn('restored_skeleton_ids', parsed_response)
         self.assertEqual('skeletons.remove', parsed_response['source_label'])
 
         self.assertEqual(n_treenodes,

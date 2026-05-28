@@ -5185,7 +5185,8 @@ def restore_historic_skeleton(request:HttpRequest, project_id, skeleton_id):
             project_id, skeleton_id)
         if not restore_info:
             raise ValueError(
-                f"No deleted historic skeleton found for skeleton {skeleton_id}")
+                f"No single-skeleton deleted historic skeleton found for "
+                f"skeleton {skeleton_id}")
 
         source_label = restore_info['label']
         if source_label not in RESTORABLE_SKELETON_DELETE_LABELS:
@@ -5193,23 +5194,13 @@ def restore_historic_skeleton(request:HttpRequest, project_id, skeleton_id):
                 f"Latest historic transaction for skeleton {skeleton_id} has "
                 f"missing or unsupported label {source_label}")
 
-        restored_skeleton_set = set(restore_info['skeleton_ids'])
-        if restored_skeleton_set != {skeleton_id}:
-            raise ValueError(
-                f"Historic transaction affects skeletons "
-                f"{sorted(restored_skeleton_set)}, refusing to restore only "
-                f"skeleton {skeleton_id}")
-
         tx = Transaction(restore_info['transaction_id'],
                 restore_info['execution_time'])
 
-        restored_skeleton_ids = undelete_neuron(project_id, tx,
-                user_id=request.user.id,
-                expected_skeleton_ids={skeleton_id})
+        undelete_neuron(project_id, tx, user_id=request.user.id)
 
     return JsonResponse({
         'skeleton_id': skeleton_id,
-        'restored_skeleton_ids': restored_skeleton_ids,
         'transaction_id': restore_info['transaction_id'],
         'execution_time': restore_info['execution_time'],
         'source_label': source_label,
