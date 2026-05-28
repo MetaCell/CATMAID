@@ -404,6 +404,8 @@ location_queries.update({
         ORDER BY t.edition_time DESC
         LIMIT 1;
     """),
+    'skeletons.remove': QueryRef(location_queries, "neurons.remove"),
+    'skeletons.restore': QueryRef(location_queries, "nodes.update_location"),
     'textlabels.create': HistoryQuery("""
         SELECT t.location_x, t.location_y, t.location_z
         FROM textlabel{history} t
@@ -537,6 +539,8 @@ skeleton_queries.update({
         WHERE so.{txid} = %s AND t.skeleton_id = so.skeleton_id
         ORDER BY t.edition_time DESC
     """),
+    'skeletons.remove': QueryRef(skeleton_queries, "neurons.remove"),
+    'skeletons.restore': QueryRef(skeleton_queries, "nodes.update_location"),
     'textlabels.create': HistoryQuery("""
         SELECT t.skeleton_id
         FROM textlabel{history} t

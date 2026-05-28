@@ -6,3 +6,5 @@ base_lock_id = 123666608142000
 spatial_update_event_lock = base_lock_id + 1
 # Postgres advisory lock ID to update history update even handling
 history_update_event_lock = base_lock_id + 2
+# Postgres advisory lock ID to serialize historic skeleton restores
+skeleton_restore_lock = base_lock_id + 3

@@ -15,9 +15,9 @@ from guardian.shortcuts import assign_perm
 from catmaid.control.annotation import _annotate_entities, annotations_for_skeleton
 from catmaid.control.skeleton import _get_neuronname_from_skeletonid
 from catmaid.models import (
-    ClassInstance, ClassInstanceClassInstance, Log, Review, TreenodeConnector,
-    ReviewerWhitelist, Treenode, User, ClientDatastore, ClientData,
-    TreenodeClassInstance
+    Class, ClassInstance, ClassInstanceClassInstance, Log, Relation, Review,
+    SkeletonSummary, TreenodeConnector, ReviewerWhitelist, Treenode, User,
+    ClientDatastore, ClientData, TreenodeClassInstance
 )
 
 from .common import CatmaidApiTestCase, CatmaidApiTransactionTestCase
@@ -1411,6 +1411,32 @@ class SkeletonsApiTests(CatmaidApiTestCase):
 
 
 class SkeletonsApiTransactionTests(CatmaidApiTransactionTestCase):
+    def create_extra_skeleton_for_neuron(self, neuron_id):
+        skeleton_class = Class.objects.get(project_id=self.test_project_id,
+                class_name='skeleton')
+        model_of = Relation.objects.get(project_id=self.test_project_id,
+                relation_name='model_of')
+        skeleton = ClassInstance.objects.create(user=self.test_user,
+                project=self.test_project, class_column=skeleton_class,
+                name='extra test skeleton')
+        Treenode.objects.create(user=self.test_user, editor=self.test_user,
+                project=self.test_project, location_x=1, location_y=2,
+                location_z=3, parent=None, radius=-1, confidence=5,
+                skeleton=skeleton)
+        ClassInstanceClassInstance.objects.create(user=self.test_user,
+                project=self.test_project, relation=model_of,
+                class_instance_a=skeleton, class_instance_b_id=neuron_id)
+        return skeleton
+
+    def transaction_label_count(self, label):
+        cursor = connection.cursor()
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM catmaid_transaction_info
+            WHERE project_id = %s
+                AND label = %s
+        """, (self.test_project_id, label))
+        return cursor.fetchone()[0]
 
     def test_import_skeleton(self):
         self.fake_authentication()
@@ -2003,3 +2029,88 @@ class SkeletonsApiTransactionTests(CatmaidApiTransactionTestCase):
         self.assertEqual(0, TreenodeClassInstance.objects.filter(id=353).count())
 
         self.assertEqual(log_count + 1, count_logs())
+
+    def test_restore_historic_skeleton(self):
+        self.fake_authentication()
+        skeleton_id = 1
+        neuron_id = 2
+        n_treenodes = Treenode.objects.filter(skeleton_id=skeleton_id).count()
+        skeleton_remove_count = self.transaction_label_count('skeletons.remove')
+        skeleton_restore_count = self.transaction_label_count('skeletons.restore')
+
+        response = self.client.post(
+            '/%d/skeletons/%s/delete' % (self.test_project_id, skeleton_id))
+        self.assertStatus(response)
+        self.assertEqual(skeleton_remove_count + 1,
+                self.transaction_label_count('skeletons.remove'))
+
+        response = self.client.post(
+            '/%d/skeletons/%s/restore' % (self.test_project_id, skeleton_id))
+        self.assertStatus(response)
+        parsed_response = json.loads(response.content.decode('utf-8'))
+
+        self.assertEqual(skeleton_id, parsed_response['skeleton_id'])
+        self.assertEqual([skeleton_id],
+                parsed_response['restored_skeleton_ids'])
+        self.assertEqual('skeletons.remove', parsed_response['source_label'])
+
+        self.assertEqual(n_treenodes,
+                Treenode.objects.filter(skeleton_id=skeleton_id).count())
+        self.assertTrue(ClassInstance.objects.filter(id=skeleton_id).exists())
+        self.assertTrue(ClassInstance.objects.filter(id=neuron_id).exists())
+        self.assertTrue(ClassInstanceClassInstance.objects.filter(
+                class_instance_a=skeleton_id, class_instance_b=neuron_id,
+                relation__relation_name='model_of').exists())
+        self.assertEqual(n_treenodes,
+                SkeletonSummary.objects.get(skeleton_id=skeleton_id).num_nodes)
+
+        cursor = connection.cursor()
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM treenode_edge te
+            JOIN treenode t
+                ON t.id = te.id
+            WHERE t.skeleton_id = %s
+        """, (skeleton_id,))
+        self.assertEqual(n_treenodes, cursor.fetchone()[0])
+        self.assertEqual(skeleton_restore_count + 1,
+                self.transaction_label_count('skeletons.restore'))
+
+    def test_restore_historic_skeleton_requires_historic_edit_permission(self):
+        self.fake_authentication()
+        skeleton_id = 1
+
+        response = self.client.post(
+            '/%d/skeletons/%s/delete' % (self.test_project_id, skeleton_id))
+        self.assertStatus(response)
+
+        self.fake_authentication(username='test0',
+                add_default_permissions=True)
+        response = self.client.post(
+            '/%d/skeletons/%s/restore' % (self.test_project_id, skeleton_id))
+        self.assertStatus(response, 403)
+        self.assertFalse(ClassInstance.objects.filter(id=skeleton_id).exists())
+
+    def test_restore_historic_skeleton_rejects_multi_skeleton_transaction(self):
+        self.fake_authentication()
+        skeleton_id = 1
+        neuron_id = 2
+        extra_skeleton = self.create_extra_skeleton_for_neuron(neuron_id)
+
+        response = self.client.post(
+            '/%d/neuron/%s/delete' % (self.test_project_id, neuron_id))
+        self.assertStatus(response)
+
+        response = self.client.post(
+            '/%d/skeletons/%s/restore' % (self.test_project_id, skeleton_id))
+        self.assertStatus(response, 400)
+        self.assertFalse(ClassInstance.objects.filter(id=skeleton_id).exists())
+        self.assertFalse(ClassInstance.objects.filter(id=extra_skeleton.id).exists())
+
+    def test_restore_historic_skeleton_rejects_live_skeleton(self):
+        self.fake_authentication()
+        skeleton_id = 1
+
+        response = self.client.post(
+            '/%d/skeletons/%s/restore' % (self.test_project_id, skeleton_id))
+        self.assertStatus(response, 400)

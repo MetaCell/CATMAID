@@ -16,7 +16,7 @@ from django.conf import settings
 from django.http import HttpRequest, HttpResponse, HttpResponseBadRequest, Http404, \
         JsonResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404
-from django.db import connection
+from django.db import connection, transaction
 from django.db.models import Q
 from django.views.decorators.cache import never_cache
 from django.utils.decorators import method_decorator
@@ -26,7 +26,9 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from catmaid.history import add_log_entry
+from catmaid import locks
+from catmaid.history import add_log_entry, Transaction, \
+        find_latest_deleted_skeleton_transaction, undelete_neuron
 from catmaid.control import tracing
 from catmaid.models import (Project, UserRole, Class, ClassInstance, Review,
         ClassInstanceClassInstance, Relation, Sampler, Treenode,
@@ -37,7 +39,7 @@ from catmaid.objects import Skeleton, SkeletonGroup, \
         compartmentalize_skeletongroup_by_confidence
 from catmaid.control.authentication import check_user_role, requires_user_role, \
         can_edit_class_instance_or_fail, can_edit_or_fail, can_edit_all_or_fail, \
-        PermissionError
+        PermissionError, user_domain
 from catmaid.control.common import (insert_into_log, get_class_to_id_map,
         get_relation_to_id_map, _create_relation, get_request_bool,
         get_request_list, Echo, get_last_concept_id)
@@ -5150,6 +5152,135 @@ class SkeletonIdDetails(APIView):
             'skeleton_updated': updated_skeleton,
             'neuron_updated': updated_neuron,
         })
+
+
+RESTORABLE_SKELETON_DELETE_LABELS = {
+    'neurons.remove',
+    'skeletons.remove',
+}
+
+
+def can_restore_historic_skeleton_or_fail(user, project_id, tx):
+    """Check edit rights against owners of rows restored from a history tx."""
+    if user.is_superuser:
+        return True
+
+    cursor = connection.cursor()
+    cursor.execute("""
+        WITH historic_owner AS (
+            SELECT user_id AS owner_id
+            FROM class_instance__history
+            WHERE project_id = %(project_id)s
+                AND exec_transaction_id = %(tx_id)s
+                AND upper(sys_period) = %(tx_time)s
+            UNION
+            SELECT user_id AS owner_id
+            FROM class_instance_class_instance__history
+            WHERE project_id = %(project_id)s
+                AND exec_transaction_id = %(tx_id)s
+                AND upper(sys_period) = %(tx_time)s
+            UNION
+            SELECT user_id AS owner_id
+            FROM treenode__history
+            WHERE project_id = %(project_id)s
+                AND exec_transaction_id = %(tx_id)s
+                AND upper(sys_period) = %(tx_time)s
+            UNION
+            SELECT user_id AS owner_id
+            FROM treenode_class_instance__history
+            WHERE project_id = %(project_id)s
+                AND exec_transaction_id = %(tx_id)s
+                AND upper(sys_period) = %(tx_time)s
+            UNION
+            SELECT user_id AS owner_id
+            FROM treenode_connector__history
+            WHERE project_id = %(project_id)s
+                AND exec_transaction_id = %(tx_id)s
+                AND upper(sys_period) = %(tx_time)s
+            UNION
+            SELECT reviewer_id AS owner_id
+            FROM review__history
+            WHERE project_id = %(project_id)s
+                AND exec_transaction_id = %(tx_id)s
+                AND upper(sys_period) = %(tx_time)s
+        )
+        SELECT DISTINCT owner_id
+        FROM historic_owner
+        WHERE owner_id IS NOT NULL
+    """, {
+        'project_id': project_id,
+        'tx_id': tx.id,
+        'tx_time': tx.time,
+    })
+    historic_owner_ids = set(row[0] for row in cursor.fetchall())
+    if not historic_owner_ids:
+        raise PermissionError("Could not determine owners of historic skeleton data")
+
+    missing_owner_ids = historic_owner_ids.difference(user_domain(cursor, user.id))
+    if missing_owner_ids:
+        raise PermissionError(
+            f"User {user.username} cannot restore skeleton data owned by "
+            f"user IDs {sorted(missing_owner_ids)}")
+
+    return True
+
+
+@api_view(['POST'])
+@requires_user_role(UserRole.Annotate)
+def restore_historic_skeleton(request:HttpRequest, project_id, skeleton_id):
+    """Restore the latest deleted historic version of a single skeleton."""
+    project_id = int(project_id)
+    skeleton_id = int(skeleton_id)
+
+    with transaction.atomic():
+        cursor = connection.cursor()
+        cursor.execute("""
+            SELECT pg_advisory_xact_lock(%(lock_id)s::bigint)
+        """, {
+            'lock_id': locks.skeleton_restore_lock,
+        })
+        cursor.execute("SET LOCAL catmaid.user_id=%(user_id)s", {
+            'user_id': request.user.id,
+        })
+
+        if ClassInstance.objects.filter(pk=skeleton_id).exists():
+            raise ValueError(f"An object with ID {skeleton_id} already exists")
+
+        restore_info = find_latest_deleted_skeleton_transaction(
+            project_id, skeleton_id)
+        if not restore_info:
+            raise ValueError(
+                f"No deleted historic skeleton found for skeleton {skeleton_id}")
+
+        source_label = restore_info['label']
+        if source_label and source_label not in RESTORABLE_SKELETON_DELETE_LABELS:
+            raise ValueError(
+                f"Latest historic transaction for skeleton {skeleton_id} has "
+                f"non-restoreable label {source_label}")
+
+        restored_skeleton_set = set(restore_info['skeleton_ids'])
+        if restored_skeleton_set != {skeleton_id}:
+            raise ValueError(
+                f"Historic transaction affects skeletons "
+                f"{sorted(restored_skeleton_set)}, refusing to restore only "
+                f"skeleton {skeleton_id}")
+
+        tx = Transaction(restore_info['transaction_id'],
+                restore_info['execution_time'])
+        can_restore_historic_skeleton_or_fail(request.user, project_id, tx)
+
+        restored_skeleton_ids = undelete_neuron(project_id, tx,
+                user_id=request.user.id,
+                expected_skeleton_ids={skeleton_id})
+
+    return JsonResponse({
+        'skeleton_id': skeleton_id,
+        'restored_skeleton_ids': restored_skeleton_ids,
+        'transaction_id': restore_info['transaction_id'],
+        'execution_time': restore_info['execution_time'],
+        'source_label': source_label,
+        'success': f"Restored skeleton {skeleton_id} from history.",
+    })
 
 
 @api_view(['POST'])

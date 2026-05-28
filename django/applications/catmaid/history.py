@@ -153,6 +153,113 @@ class Transaction:
         return "TX {} @ {}".format(self.id, self.time)
 
 
+def find_latest_deleted_skeleton_transaction(project_id, skeleton_id):
+    """Find the newest transaction that removed the passed in skeleton.
+
+    This intentionally only identifies a candidate. Callers still have to
+    decide whether the transaction label and affected skeleton set are safe for
+    their restore use case.
+    """
+    cursor = connection.cursor()
+    cursor.execute("""
+        WITH candidates AS (
+            SELECT ci.exec_transaction_id AS transaction_id,
+                upper(ci.sys_period) AS execution_time
+            FROM class_instance__history ci
+            JOIN class c
+                ON c.id = ci.class_id
+                AND c.project_id = ci.project_id
+                AND c.class_name = 'skeleton'
+            WHERE ci.project_id = %(project_id)s
+                AND ci.id = %(skeleton_id)s
+                AND ci.sys_period IS NOT NULL
+                AND NOT upper_inf(ci.sys_period)
+            GROUP BY ci.exec_transaction_id, upper(ci.sys_period)
+        ),
+        latest AS (
+            SELECT transaction_id, execution_time
+            FROM candidates
+            ORDER BY execution_time DESC
+            LIMIT 1
+        )
+        SELECT latest.transaction_id,
+            latest.execution_time::text,
+            cti.label
+        FROM latest
+        LEFT JOIN catmaid_transaction_info cti
+            ON cti.transaction_id = latest.transaction_id
+            AND cti.execution_time = latest.execution_time
+    """, {
+        'project_id': project_id,
+        'skeleton_id': skeleton_id,
+    })
+    result = cursor.fetchone()
+    if not result:
+        return None
+
+    return {
+        'transaction_id': result[0],
+        'execution_time': result[1],
+        'label': result[2],
+        'skeleton_ids': find_skeletons_affected_by_deletion_transaction(
+            project_id, Transaction(result[0], result[1])),
+    }
+
+
+def find_skeletons_affected_by_deletion_transaction(project_id, tx):
+    """Find skeletons touched by a skeleton/neuron deletion transaction.
+
+    This deliberately uses skeleton class instances and model_of links rather
+    than treenodes so empty skeletons and multi-skeleton neuron deletions are
+    represented correctly.
+    """
+    cursor = connection.cursor()
+    cursor.execute("""
+        WITH skeleton_class AS (
+            SELECT id
+            FROM class
+            WHERE project_id = %(project_id)s
+                AND class_name = 'skeleton'
+        ),
+        model_of AS (
+            SELECT id
+            FROM relation
+            WHERE project_id = %(project_id)s
+                AND relation_name = 'model_of'
+        ),
+        affected_skeleton AS (
+            SELECT ci.id AS skeleton_id
+            FROM class_instance__history ci
+            JOIN skeleton_class sc
+                ON sc.id = ci.class_id
+            WHERE ci.project_id = %(project_id)s
+                AND ci.exec_transaction_id = %(tx_id)s
+                AND ci.sys_period IS NOT NULL
+                AND NOT upper_inf(ci.sys_period)
+                AND upper(ci.sys_period) >= %(tx_time)s
+            UNION
+            SELECT cici.class_instance_a AS skeleton_id
+            FROM class_instance_class_instance__history cici
+            JOIN model_of mo
+                ON mo.id = cici.relation_id
+            WHERE cici.project_id = %(project_id)s
+                AND cici.exec_transaction_id = %(tx_id)s
+                AND cici.sys_period IS NOT NULL
+                AND NOT upper_inf(cici.sys_period)
+                AND upper(cici.sys_period) >= %(tx_time)s
+        )
+        SELECT DISTINCT skeleton_id
+        FROM affected_skeleton
+        WHERE skeleton_id IS NOT NULL
+        ORDER BY skeleton_id
+    """, {
+        'project_id': project_id,
+        'tx_id': tx.id,
+        'tx_time': tx.time,
+    })
+    return [row[0] for row in cursor.fetchall()]
+
+
 def get_historic_row_count_affected_by_tx(tx):
     """Counts how many historic rows reference the passed in transaction.
     Returned is a list of tuples (table_name, count).
@@ -269,7 +376,8 @@ def get_dependent_historic_tx(tx, target_list=None):
     return target_list
 
 
-def undelete_neuron(project_id, tx, user_id=None, interactive=False):
+def undelete_neuron(project_id, tx, user_id=None, interactive=False,
+        expected_skeleton_ids=None):
     """Recreates a neuron and its connections. This simply restores everything
     from a delete.neuron transaction. Some materialized views as
     treenode_connector_edge or treenode_edge need to be recreated selectively
@@ -280,9 +388,6 @@ def undelete_neuron(project_id, tx, user_id=None, interactive=False):
         from .apps import get_system_user
         user_id = get_system_user().id
         logger.info('No user ID provided, working as system user')
-
-    # Transaction log entry
-    add_log_entry(user_id, 'neurons.undelete', project_id)
 
     tx_matches = get_historic_row_count_affected_by_tx(tx)
 
@@ -296,6 +401,32 @@ def undelete_neuron(project_id, tx, user_id=None, interactive=False):
 
     cursor = connection.cursor()
     nr_notices = len(cursor.connection.notices)
+
+    skeleton_ids = find_skeletons_affected_by_deletion_transaction(
+        project_id, tx)
+    if not skeleton_ids:
+        cursor.execute("""
+            SELECT DISTINCT skeleton_id
+            FROM treenode__history th
+            WHERE th.exec_transaction_id = %(tx_id)s
+            AND upper(th.sys_period) >= %(tx_time)s
+            ORDER BY skeleton_id
+        """, {
+            'tx_id': tx.id,
+            'tx_time': tx.time,
+        })
+        skeleton_ids = [r[0] for r in cursor.fetchall()]
+        if not skeleton_ids:
+            raise ValueError(f"No skeletons found in historic transaction {tx}")
+
+    if expected_skeleton_ids is not None and \
+            set(skeleton_ids) != set(expected_skeleton_ids):
+        raise ValueError(f"Historic transaction {tx} affects skeletons "
+                f"{skeleton_ids}, expected {sorted(expected_skeleton_ids)}")
+
+    # Transaction log entry
+    add_log_entry(user_id, 'neurons.undelete', project_id)
+
     cursor.execute("""
         DO $$
         DECLARE
@@ -303,16 +434,6 @@ def undelete_neuron(project_id, tx, user_id=None, interactive=False):
             row record;
 
         BEGIN
-
-            CREATE TEMPORARY TABLE seen_skeleton (
-                id bigint
-            );
-
-            INSERT INTO seen_skeleton
-            SELECT DISTINCT skeleton_id
-            FROM treenode__history th
-            WHERE th.exec_transaction_id = %(tx_id)s
-            AND upper(th.sys_period) >= %(tx_time)s;
 
             FOR row IN SELECT format('INSERT INTO %%1$s (', cht.live_table) ||
                     array_to_string(array_agg(column_name::text order by pos), ',') ||
@@ -338,16 +459,10 @@ def undelete_neuron(project_id, tx, user_id=None, interactive=False):
 
         END
         $$;
-
-        SELECT id FROM seen_skeleton;
     """, {
         'tx_id': tx.id,
         'tx_time': tx.time,
     })
-
-    skeleton_ids = [r[0] for r in cursor.fetchall()]
-
-    cursor.execute('DROP TABLE seen_skeleton')
 
     for notice in cursor.connection.notices:
         logger.debug(f'NOTICE: {notice}')
