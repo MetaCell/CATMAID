@@ -176,6 +176,7 @@ def find_latest_deleted_skeleton_transaction(project_id, skeleton_id):
             WHERE ci.project_id = %(project_id)s
                 AND ci.id = %(skeleton_id)s
                 AND ci.sys_period IS NOT NULL
+                AND NOT isempty(ci.sys_period)
                 AND NOT upper_inf(ci.sys_period)
             GROUP BY ci.exec_transaction_id, upper(ci.sys_period)
         ),
@@ -194,6 +195,7 @@ def find_latest_deleted_skeleton_transaction(project_id, skeleton_id):
                 ON latest.transaction_id = ci.exec_transaction_id
             WHERE ci.project_id = %(project_id)s
                 AND ci.sys_period IS NOT NULL
+                AND NOT isempty(ci.sys_period)
                 AND NOT upper_inf(ci.sys_period)
                 AND upper(ci.sys_period) >= latest.execution_time
         ),

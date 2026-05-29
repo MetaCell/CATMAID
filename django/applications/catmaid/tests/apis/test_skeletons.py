@@ -2075,6 +2075,38 @@ class SkeletonsApiTransactionTests(CatmaidApiTransactionTestCase):
         self.assertEqual(skeleton_restore_count + 1,
                 self.transaction_label_count('skeletons.restore'))
 
+    def test_restore_historic_skeleton_after_split_delete(self):
+        self.fake_authentication()
+
+        response = self.client.post(
+            '/%d/skeleton/split' % (self.test_project_id,),
+            {
+                'treenode_id': 2394,
+                'upstream_annotation_map': '{}',
+                'downstream_annotation_map': '{}',
+            })
+        self.assertStatus(response)
+        parsed_response = json.loads(response.content.decode('utf-8'))
+        skeleton_id = parsed_response['new_skeleton_id']
+        n_treenodes = Treenode.objects.filter(skeleton_id=skeleton_id).count()
+
+        response = self.client.post(
+            '/%d/skeletons/%s/delete' % (self.test_project_id, skeleton_id),
+            {'delete_multi_skeleton_neurons': 'false'})
+        self.assertStatus(response)
+        self.assertFalse(ClassInstance.objects.filter(id=skeleton_id).exists())
+
+        response = self.client.post(
+            '/%d/skeletons/%s/restore' % (self.test_project_id, skeleton_id))
+        self.assertStatus(response)
+        parsed_response = json.loads(response.content.decode('utf-8'))
+
+        self.assertEqual(skeleton_id, parsed_response['skeleton_id'])
+        self.assertEqual('skeletons.remove', parsed_response['source_label'])
+        self.assertTrue(ClassInstance.objects.filter(id=skeleton_id).exists())
+        self.assertEqual(n_treenodes,
+                Treenode.objects.filter(skeleton_id=skeleton_id).count())
+
     def test_restore_historic_skeleton_rejects_multi_skeleton_transaction(self):
         self.fake_authentication()
         skeleton_id = 1
