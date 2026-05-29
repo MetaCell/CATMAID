@@ -5169,7 +5169,7 @@ def restore_historic_skeleton(request:HttpRequest, project_id, skeleton_id):
         cursor.execute("""
             SELECT pg_advisory_xact_lock(%(lock_id)s::bigint)
         """, {
-            'lock_id': locks.skeleton_restore_lock,
+            'lock_id': locks.skeleton_restore_lock_id(skeleton_id),
         })
         cursor.execute("SET LOCAL catmaid.user_id=%(user_id)s", {
             'user_id': request.user.id,
