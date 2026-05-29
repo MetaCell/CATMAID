@@ -2091,6 +2091,20 @@ class SkeletonsApiTransactionTests(CatmaidApiTransactionTestCase):
         self.assertFalse(ClassInstance.objects.filter(id=skeleton_id).exists())
         self.assertFalse(ClassInstance.objects.filter(id=extra_skeleton.id).exists())
 
+    def test_restore_historic_skeleton_rejects_neuron_delete_transaction(self):
+        self.fake_authentication()
+        skeleton_id = 1
+        neuron_id = 2
+
+        response = self.client.post(
+            '/%d/neuron/%s/delete' % (self.test_project_id, neuron_id))
+        self.assertStatus(response)
+
+        response = self.client.post(
+            '/%d/skeletons/%s/restore' % (self.test_project_id, skeleton_id))
+        self.assertStatus(response, 400)
+        self.assertFalse(ClassInstance.objects.filter(id=skeleton_id).exists())
+
     def test_restore_historic_skeleton_rejects_unlabeled_transaction(self):
         self.fake_authentication()
         skeleton_id = 1
