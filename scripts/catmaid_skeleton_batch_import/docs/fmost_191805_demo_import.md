@@ -122,7 +122,7 @@ export TEMPLATE_PROJECT_ID=<target-cluster-template-project-id>
 ```
 
 The import does not copy template permissions during project creation. The
-project stays hidden until section 12.
+project stays hidden until section 11.
 
 ## 4. Create the hidden project and stack
 
@@ -418,82 +418,7 @@ SELECT
 The sequence values may be higher than max IDs because gaps are acceptable.
 They must not be lower.
 
-## 11. Map soma CSV marker IDs to skeletons
-
-Marker IDs map directly to SWC member names by zero-padding the marker number:
-
-```text
-191805_markerID-1554 -> 191805/0001554.swc
-191805_markerID-1    -> 191805/0000001.swc
-```
-
-Build a marker-to-skeleton map from the manifest:
-
-```bash
-export SOMA_CSV=/path/to/fmost_soma_markers.csv
-export MANIFEST="$STAGING_BASE/completed/batch_00001/manifest.tsv.gz"
-export MARKER_MAP="$FMOST_WORKDIR/soma_marker_skeleton_map.tsv"
-
-python3 - <<'PY'
-import ast
-import csv
-import gzip
-import os
-import re
-
-soma_csv = os.environ["SOMA_CSV"]
-manifest_path = os.environ["MANIFEST"]
-out_path = os.environ["MARKER_MAP"]
-
-member_to_ids = {}
-with gzip.open(manifest_path, "rt", newline="") as f:
-    reader = csv.DictReader(f, delimiter="\t")
-    for row in reader:
-        member_to_ids[row["member"]] = row
-
-with open(soma_csv, newline="") as in_file, open(out_path, "w", newline="") as out_file:
-    reader = csv.DictReader(in_file)
-    fieldnames = [
-        "marker_id",
-        "member",
-        "neuron_id",
-        "skeleton_id",
-        "soma_x_nm",
-        "soma_y_nm",
-        "soma_z_nm",
-    ]
-    writer = csv.DictWriter(out_file, fieldnames=fieldnames, delimiter="\t")
-    writer.writeheader()
-
-    for row in reader:
-        marker_id = row["brainID-markerID"]
-        match = re.search(r"markerID-(\d+)$", marker_id)
-        if not match:
-            raise ValueError(f"Cannot parse marker ID: {marker_id}")
-
-        member = f"191805/{int(match.group(1)):07d}.swc"
-        if member not in member_to_ids:
-            raise ValueError(f"No imported SWC found for marker {marker_id}: {member}")
-
-        x_um, y_um, z_um = ast.literal_eval(row["raw_um_xyz_coordinate"])
-        imported = member_to_ids[member]
-        writer.writerow({
-            "marker_id": marker_id,
-            "member": member,
-            "neuron_id": imported["neuron_id"],
-            "skeleton_id": imported["skeleton_id"],
-            "soma_x_nm": f"{x_um * 1000:.3f}",
-            "soma_y_nm": f"{y_um * 1000:.3f}",
-            "soma_z_nm": f"{z_um * 1000:.3f}",
-        })
-
-print(out_path)
-PY
-
-sed -n '1,20p' "$MARKER_MAP"
-```
-
-## 12. Publish permissions
+## 11. Publish permissions
 
 Only publish after verification passes:
 
@@ -504,62 +429,3 @@ Only publish after verification passes:
 This clears current object permissions, copies all user/group object
 permissions from `TEMPLATE_PROJECT_ID`, and re-adds system-user admin/import
 permissions.
-
-## 13. Annotate skeletons with soma marker IDs
-
-For a small marker CSV, use the CATMAID annotation API after publishing.
-CATMAID's `annotations/add` endpoint accepts `skeleton_ids[...]` and resolves
-them to the modeled neurons.
-
-```bash
-export CATMAID_USER=<dev-user>
-read -rsp "CATMAID password: " CATMAID_PASSWORD
-printf '\n'
-
-export CATMAID_TOKEN="$(
-  curl -fsS -X POST "$CATMAID_URL/api-token-auth/" \
-    --data-urlencode "username=$CATMAID_USER" \
-    --data-urlencode "password=$CATMAID_PASSWORD" |
-  python3 -c 'import json, sys; print(json.load(sys.stdin)["token"])'
-)"
-unset CATMAID_PASSWORD
-```
-
-Annotate each mapped skeleton:
-
-```bash
-tail -n +2 "$MARKER_MAP" |
-  while IFS=$'\t' read -r marker_id member neuron_id skeleton_id soma_x_nm soma_y_nm soma_z_nm; do
-    curl -fsS \
-      -H "X-Authorization: Token $CATMAID_TOKEN" \
-      -F "skeleton_ids[0]=${skeleton_id}" \
-      -F "annotations[0]=${marker_id}" \
-      -F "annotations[1]=autodetected soma" \
-      -F "annotations[2]=fMOST 191805" \
-      "$CATMAID_URL/$PROJECT_ID/annotations/add" \
-      > /dev/null
-
-    printf 'Annotated skeleton %s with %s\n' "$skeleton_id" "$marker_id"
-  done
-```
-
-Keep `$MARKER_MAP` as the authoritative mapping for marker coordinates.
-
-## 14. Handoff checklist
-
-- The demo project opens in CATMAID after publishing.
-- Skeleton count is `129302`.
-- Treenode count is `1469021`.
-- `catmaid_skeleton_summary` and `catmaid_stats_summary` are populated.
-- Grid caches exist and have no dirty cells for this project.
-- Marker annotation spot checks work by searching for a marker ID, for example
-  `191805_markerID-1554`.
-- The database backup and `$STAGING_BASE/completed` manifests are retained.
-
-## Rollback
-
-If the load fails before publishing, delete the hidden project and its data.
-This does not restore database sequences; sequence gaps are expected and safe.
-
-If the load partially succeeds and the database state is uncertain, restore the
-pre-import database backup created in section 6.
