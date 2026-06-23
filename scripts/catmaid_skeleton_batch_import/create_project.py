@@ -13,7 +13,7 @@ from catmaid.apps import get_system_user
 from catmaid.control.project import validate_project_setup
 from catmaid.control.tracing import setup_tracing
 from catmaid.models import Project, ProjectStack, Stack
-from guardian.shortcuts import assign_perm, get_groups_with_perms, get_users_with_perms, remove_perm
+from guardian.shortcuts import assign_perm, get_groups_with_perms, get_users_with_perms, remove_perm, get_anonymous_user
 
 
 def load_config():
@@ -209,8 +209,14 @@ if not project_stack_created:
         project_stack_updated = True
 
 clear_project_permissions(project)
-for permission in ("can_browse", "can_annotate", "can_import", "can_administer"):
+for permission in ("can_browse", "can_annotate", "can_annotate_with_token", "can_import", "can_administer"):
     assign_perm(permission, system_user, project)
+
+if os.environ.get("ALLOW_ANONYMOUS") or config_get(config, "allow_anonymous"):
+    anonymous_user = get_anonymous_user()
+    assign_perm("can_browse", anonymous_user, project)
+    assign_perm("can_annotate", anonymous_user, project)
+    assign_perm("can_annotate_with_token", anonymous_user, project)
 
 print("PROJECT_CREATED=%s" % project_created)
 print("STACK_CREATED=%s" % stack_created)
@@ -221,3 +227,5 @@ print("PROJECT_HIDDEN_FROM_TEMPLATE_USERS=true")
 print("PROJECT_ID=%s" % project.id)
 print("STACK_ID=%s" % stack.id)
 print("IMPORT_USER_ID=%s" % system_user.id)
+if os.environ.get("ALLOW_ANONYMOUS") or config_get(config, "allow_anonymous"):
+    print("ANONYMOUS_USER_ID=%s" % get_anonymous_user().id)
