@@ -2354,6 +2354,7 @@ def _reroot_skeleton(treenode_id, project_id):
                 WHERE treenode.id = v.id
                 ''' % ','.join(['(%s,%s,%s)' % node for node in new_parents]))
 
+        rootnode.refresh_from_db(fields=['parent_id', 'confidence', 'edition_time'])
         return rootnode
 
     except Exception as e:
