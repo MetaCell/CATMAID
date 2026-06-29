@@ -4,7 +4,7 @@
     "title": "Allen Dense Skeletons"
   },
   "source": {
-    "swc_zip_dir": "/home/afonso/swcs",
+    "swc_zip_dir": "/path/to/allen_dense_skeletons/swcs",
     "coordinate_units": "voxel",
     "coordinate_scale_nm": [748, 748, 1000],
     "radius_scale_nm": 1,
