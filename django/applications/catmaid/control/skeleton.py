@@ -5166,10 +5166,16 @@ def restore_historic_skeleton(request:HttpRequest, project_id, skeleton_id):
 
     with transaction.atomic():
         cursor = connection.cursor()
+        lock_namespace, skeleton_lock_key = locks.skeleton_restore_lock_keys(
+                skeleton_id)
         cursor.execute("""
-            SELECT pg_advisory_xact_lock(%(lock_id)s::bigint)
+            SELECT pg_advisory_xact_lock(
+                %(lock_namespace)s::integer,
+                %(skeleton_lock_key)s::integer
+            )
         """, {
-            'lock_id': locks.skeleton_restore_lock_id(skeleton_id),
+            'lock_namespace': lock_namespace,
+            'skeleton_lock_key': skeleton_lock_key,
         })
         cursor.execute("SET LOCAL catmaid.user_id=%(user_id)s", {
             'user_id': request.user.id,
