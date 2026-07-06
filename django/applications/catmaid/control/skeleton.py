@@ -5154,7 +5154,8 @@ class SkeletonIdDetails(APIView):
         })
 
 
-RESTORABLE_SKELETON_DELETE_LABEL = 'skeletons.remove'
+SKELETON_REMOVE_TRANSACTION_LABEL = 'skeletons.remove'
+SKELETON_RESTORE_TRANSACTION_LABEL = 'skeletons.restore'
 
 
 @api_view(['POST'])
@@ -5192,11 +5193,11 @@ def restore_historic_skeleton(request:HttpRequest, project_id, skeleton_id):
                 f"skeleton {skeleton_id}")
 
         source_label = restore_info['label']
-        if source_label != RESTORABLE_SKELETON_DELETE_LABEL:
+        if source_label != SKELETON_REMOVE_TRANSACTION_LABEL:
             raise ValueError(
                 f"Latest historic transaction for skeleton {skeleton_id} has "
                 f"missing or unsupported label {source_label}; expected "
-                f"{RESTORABLE_SKELETON_DELETE_LABEL}")
+                f"{SKELETON_REMOVE_TRANSACTION_LABEL}")
 
         tx = Transaction(restore_info['transaction_id'],
                 restore_info['execution_time'])
