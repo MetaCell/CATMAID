@@ -8,6 +8,7 @@ from typing import Any, Dict
 from unittest import skipIf
 from urllib.parse import urlencode
 
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db import connection, transaction
 from django.shortcuts import get_object_or_404
 from guardian.shortcuts import assign_perm
@@ -32,6 +33,11 @@ def get_last_concept_id():
         SELECT last_value FROM concept_id_seq;
     """)
     return cursor.fetchone()[0]
+
+
+def encode_datetime(value):
+    return json.loads(json.dumps(value, cls=DjangoJSONEncoder))
+
 
 class SkeletonsApiTests(CatmaidApiTestCase):
     def compare_swc_data(self, s1, s2):
@@ -787,8 +793,9 @@ class SkeletonsApiTests(CatmaidApiTestCase):
                 {'treenode_id': new_root})
         self.assertStatus(response)
         parsed_response = json.loads(response.content.decode('utf-8'))
+        rerooted_treenode = get_object_or_404(Treenode, id=new_root)
         expected_result:Dict[str, Any] = {
-                'edition_time': '2011-12-09T08:01:48.933Z',
+                'edition_time': encode_datetime(rerooted_treenode.edition_time),
                 'newroot': 2394,
                 'skeleton_id': 2388}
         self.assertEqual(expected_result, parsed_response)
@@ -1028,8 +1035,9 @@ class SkeletonsApiTests(CatmaidApiTestCase):
                 {'treenode_id': new_root})
         self.assertStatus(response)
         parsed_response = json.loads(response.content.decode('utf-8'))
+        rerooted_treenode = get_object_or_404(Treenode, id=new_root)
         expected_result = {
-                'edition_time': '2011-12-05T13:51:36.955Z',
+                'edition_time': encode_datetime(rerooted_treenode.edition_time),
                 'newroot': 407,
                 'skeleton_id': 373}
         self.assertEqual(expected_result, parsed_response)
@@ -1042,6 +1050,26 @@ class SkeletonsApiTests(CatmaidApiTestCase):
         assertHasParent(405, 407)
         assertHasParent(377, 405)
         assertHasParent(407, None)
+
+
+    def test_reroot_skeleton_response_uses_updated_edition_time(self):
+        self.fake_authentication()
+
+        new_root = 407
+        pre_reroot_edition_time = get_object_or_404(Treenode, id=new_root).edition_time
+
+        response = self.client.post(
+                '/%d/skeleton/reroot' % self.test_project_id,
+                {'treenode_id': new_root})
+        self.assertStatus(response)
+        parsed_response = json.loads(response.content.decode('utf-8'))
+
+        rerooted_treenode = get_object_or_404(Treenode, id=new_root)
+        self.assertIsNone(rerooted_treenode.parent_id)
+        self.assertNotEqual(pre_reroot_edition_time, rerooted_treenode.edition_time)
+        self.assertEqual(
+                encode_datetime(rerooted_treenode.edition_time),
+                parsed_response['edition_time'])
 
 
     def test_review_status(self):
