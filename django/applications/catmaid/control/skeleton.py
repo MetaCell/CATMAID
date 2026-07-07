@@ -16,7 +16,7 @@ from django.conf import settings
 from django.http import HttpRequest, HttpResponse, HttpResponseBadRequest, Http404, \
         JsonResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404
-from django.db import connection
+from django.db import connection, transaction
 from django.db.models import Q
 from django.views.decorators.cache import never_cache
 from django.utils.decorators import method_decorator
@@ -26,7 +26,9 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from catmaid.history import add_log_entry
+from catmaid import locks
+from catmaid.history import add_log_entry, Transaction, \
+        find_latest_deleted_skeleton_transaction, undelete_neuron
 from catmaid.control import tracing
 from catmaid.models import (Project, UserRole, Class, ClassInstance, Review,
         ClassInstanceClassInstance, Relation, Sampler, Treenode,
@@ -5150,6 +5152,65 @@ class SkeletonIdDetails(APIView):
             'skeleton_updated': updated_skeleton,
             'neuron_updated': updated_neuron,
         })
+
+
+SKELETON_REMOVE_TRANSACTION_LABEL = 'skeletons.remove'
+SKELETON_RESTORE_TRANSACTION_LABEL = 'skeletons.restore'
+
+
+@api_view(['POST'])
+@requires_user_role(UserRole.Annotate)
+def restore_historic_skeleton(request:HttpRequest, project_id, skeleton_id):
+    """Restore the latest deleted historic version of a single skeleton."""
+    project_id = int(project_id)
+    skeleton_id = int(skeleton_id)
+
+    with transaction.atomic():
+        cursor = connection.cursor()
+        lock_namespace, skeleton_lock_key = locks.skeleton_restore_lock_keys(
+                skeleton_id)
+        cursor.execute("""
+            SELECT pg_advisory_xact_lock(
+                %(lock_namespace)s::integer,
+                %(skeleton_lock_key)s::integer
+            )
+        """, {
+            'lock_namespace': lock_namespace,
+            'skeleton_lock_key': skeleton_lock_key,
+        })
+        cursor.execute("SET LOCAL catmaid.user_id=%(user_id)s", {
+            'user_id': request.user.id,
+        })
+
+        if ClassInstance.objects.filter(pk=skeleton_id).exists():
+            raise ValueError(f"An object with ID {skeleton_id} already exists")
+
+        restore_info = find_latest_deleted_skeleton_transaction(
+            project_id, skeleton_id)
+        if not restore_info:
+            raise ValueError(
+                f"No single-skeleton deleted historic skeleton found for "
+                f"skeleton {skeleton_id}")
+
+        source_label = restore_info['label']
+        if source_label != SKELETON_REMOVE_TRANSACTION_LABEL:
+            raise ValueError(
+                f"Latest historic transaction for skeleton {skeleton_id} has "
+                f"missing or unsupported label {source_label}; expected "
+                f"{SKELETON_REMOVE_TRANSACTION_LABEL}")
+
+        tx = Transaction(restore_info['transaction_id'],
+                restore_info['execution_time'])
+
+        undelete_neuron(project_id, tx, user_id=request.user.id)
+
+    return JsonResponse({
+        'skeleton_id': skeleton_id,
+        'transaction_id': restore_info['transaction_id'],
+        'execution_time': restore_info['execution_time'],
+        'source_label': source_label,
+        'success': f"Restored skeleton {skeleton_id} from history.",
+    })
 
 
 @api_view(['POST'])

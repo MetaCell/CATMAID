@@ -153,6 +153,82 @@ class Transaction:
         return "TX {} @ {}".format(self.id, self.time)
 
 
+def find_latest_deleted_skeleton_transaction(project_id, skeleton_id):
+    """Find the newest transaction that removed the passed in skeleton.
+
+    Only single-skeleton delete candidates are returned. Callers still have to
+    decide whether the transaction label is safe for their restore use case.
+    """
+    cursor = connection.cursor()
+    cursor.execute("""
+        WITH skeleton_class AS (
+            SELECT id
+            FROM class
+            WHERE project_id = %(project_id)s
+                AND class_name = 'skeleton'
+        ),
+        candidates AS (
+            SELECT ci.exec_transaction_id AS transaction_id,
+                upper(ci.sys_period) AS execution_time
+            FROM class_instance__history ci
+            JOIN skeleton_class sc
+                ON sc.id = ci.class_id
+            WHERE ci.project_id = %(project_id)s
+                AND ci.id = %(skeleton_id)s
+                AND ci.sys_period IS NOT NULL
+                AND NOT isempty(ci.sys_period)
+                AND NOT upper_inf(ci.sys_period)
+            GROUP BY ci.exec_transaction_id, upper(ci.sys_period)
+        ),
+        latest AS (
+            SELECT transaction_id, execution_time
+            FROM candidates
+            ORDER BY execution_time DESC
+            LIMIT 1
+        ),
+        affected_skeleton AS (
+            SELECT ci.id AS skeleton_id
+            FROM class_instance__history ci
+            JOIN skeleton_class sc
+                ON sc.id = ci.class_id
+            JOIN latest
+                ON latest.transaction_id = ci.exec_transaction_id
+            WHERE ci.project_id = %(project_id)s
+                AND ci.sys_period IS NOT NULL
+                AND NOT isempty(ci.sys_period)
+                AND NOT upper_inf(ci.sys_period)
+                AND upper(ci.sys_period) >= latest.execution_time
+        ),
+        affected_summary AS (
+            SELECT COUNT(DISTINCT skeleton_id) AS skeleton_count,
+                BOOL_OR(skeleton_id = %(skeleton_id)s) AS includes_requested
+            FROM affected_skeleton
+        )
+        SELECT latest.transaction_id,
+            latest.execution_time::text,
+            cti.label
+        FROM latest
+        JOIN affected_summary affected
+            ON affected.skeleton_count = 1
+            AND affected.includes_requested
+        LEFT JOIN catmaid_transaction_info cti
+            ON cti.transaction_id = latest.transaction_id
+            AND cti.execution_time = latest.execution_time
+    """, {
+        'project_id': project_id,
+        'skeleton_id': skeleton_id,
+    })
+    result = cursor.fetchone()
+    if not result:
+        return None
+
+    return {
+        'transaction_id': result[0],
+        'execution_time': result[1],
+        'label': result[2],
+    }
+
+
 def get_historic_row_count_affected_by_tx(tx):
     """Counts how many historic rows reference the passed in transaction.
     Returned is a list of tuples (table_name, count).
