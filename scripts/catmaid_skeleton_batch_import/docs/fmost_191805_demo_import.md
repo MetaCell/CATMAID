@@ -232,7 +232,11 @@ $STAGING_BASE/completed/batch_00001/manifest.tsv.gz
 
 The manifest maps each source SWC member to CATMAID neuron and skeleton IDs.
 The direct bulk load intentionally skips API-level side effects such as import
-log rows, default `Import` annotations, and provenance rows.
+log rows and provenance rows. Neuron annotations come only from the request's
+`annotations` templates (see the README). `examples/fmost_191805_request.json`
+uses `["{stem}"]`, so the neuron imported from `191805/0000001.swc` carries the
+annotation `0000001`, which Neuroglancer exposes as a searchable segment
+property.
 By default, the loader leaves database triggers enabled because the normal
 `catmaid_user` role cannot set `session_replication_role`. A privileged DB role
 can opt into trigger disabling with `LOAD_DISABLE_TRIGGERS=true`, which also

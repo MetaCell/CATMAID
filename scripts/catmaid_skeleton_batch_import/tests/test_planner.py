@@ -16,7 +16,12 @@ from catmaid_skeleton_batch_import.planner import (
 )
 
 
-def member(path: str, nodes: int, external_id: str | None = None) -> PlannedMember:
+def member(
+    path: str,
+    nodes: int,
+    external_id: str | None = None,
+    annotations: tuple[str, ...] = (),
+) -> PlannedMember:
     return PlannedMember(
         member_path=path,
         node_count=nodes,
@@ -25,7 +30,13 @@ def member(path: str, nodes: int, external_id: str | None = None) -> PlannedMemb
         display_name=Path(path).stem,
         cable_length_nm=float(nodes),
         external_skeleton_id=external_id,
+        annotations=annotations,
     )
+
+
+def write_gzip_text(path: Path, payload: str) -> None:
+    with gzip.open(path, "wt", encoding="utf-8") as target:
+        target.write(payload)
 
 
 def test_sorts_exact_paths_and_greedily_builds_hard_batches() -> None:
@@ -51,6 +62,48 @@ def test_rejects_oversized_and_duplicate_members() -> None:
         build_plan(
             [member("a.swc", 2, "same"), member("b.swc", 2, "same")], 10
         )
+
+
+def test_same_annotation_in_two_folders_aborts_planning_and_names_both() -> None:
+    with pytest.raises(
+        InvalidInputError,
+        match=r"'0000001' is rendered by both 'a/0000001.swc' and 'b/0000001.swc'",
+    ):
+        build_plan(
+            [
+                member("b/0000001.swc", 2, annotations=("0000001",)),
+                member("a/0000001.swc", 2, annotations=("0000001",)),
+            ],
+            10,
+        )
+
+
+def test_stable_join_annotation_is_rejected() -> None:
+    with pytest.raises(InvalidInputError, match="reserves for stable joins"):
+        build_plan([member("stable.swc", 2, annotations=("stable",))], 10)
+
+
+def test_annotation_longer_than_255_characters_is_rejected() -> None:
+    with pytest.raises(InvalidInputError, match="longer than 255 characters"):
+        build_plan([member("long.swc", 2, annotations=("x" * 300,))], 10)
+
+
+def test_plans_written_before_annotation_support_still_load(tmp_path: Path) -> None:
+    path = tmp_path / "old-plan.jsonl.gz"
+    write_gzip_text(
+        path,
+        '{"batch_count":1,"max_nodes_per_batch":4,"member_count":1,'
+        '"record_type":"header","schema_version":1,"total_nodes":2}\n'
+        '{"batch_index":1,"cable_length_nm":2.0,"crc32":2,"display_name":"a",'
+        '"member_path":"a.swc","node_count":2,"record_type":"member",'
+        '"uncompressed_bytes":20}\n',
+    )
+
+    plan = read_plan(path)
+
+    assert plan.members[0].annotations == ()
+    assert plan.total_annotations == 0
+    assert plan.batches[0].concept_count == 3
 
 
 def test_gzip_jsonl_is_deterministic_and_round_trips(tmp_path: Path) -> None:

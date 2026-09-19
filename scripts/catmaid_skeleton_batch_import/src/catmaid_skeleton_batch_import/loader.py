@@ -6,10 +6,18 @@ import csv
 import math
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Callable, Iterator, Sequence, TextIO
 
-from .domain import ImportSettings, IngestionRequest, PlannedBatch, PlannedMember, SwcNode
+from .domain import (
+    AnnotationConceptIds,
+    ImportSettings,
+    IngestionRequest,
+    PlannedBatch,
+    PlannedMember,
+    SwcNode,
+    iter_member_concept_ids,
+)
 from .errors import InvalidInputError, VerificationError
 
 
@@ -22,15 +30,24 @@ class ProjectContext:
     neuron_class_id: int
     skeleton_class_id: int
     model_of_relation_id: int
+    annotation_class_id: int | None = None
+    annotated_with_relation_id: int | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> "ProjectContext":
-        return cls(**{field: int(value[field]) for field in cls.__dataclass_fields__})
+        return cls(
+            **{
+                field: int(value[field])
+                for field in cls.__dataclass_fields__
+                if value.get(field) is not None
+            }
+        )
 
     def to_dict(self) -> dict[str, int]:
         return {
             field: int(getattr(self, field))
             for field in self.__dataclass_fields__
+            if getattr(self, field) is not None
         }
 
 
@@ -43,6 +60,7 @@ class ExpectedSkeleton:
     name: str
     node_count: int
     cable_length_nm: float
+    annotations: tuple[AnnotationConceptIds, ...]
 
     def to_validation_dict(self) -> dict[str, object]:
         return {
@@ -53,6 +71,7 @@ class ExpectedSkeleton:
             "name": self.name,
             "node_count": self.node_count,
             "cable_length_nm": self.cable_length_nm,
+            "annotations": [asdict(annotation) for annotation in self.annotations],
         }
 
 
@@ -132,7 +151,7 @@ def prepare_copy_rows(
     location_ids: Sequence[int],
     load_nodes: Callable[[PlannedMember], Sequence[SwcNode]],
 ) -> PreparedBatch:
-    expected_concepts = batch.skeleton_count * 3
+    expected_concepts = batch.concept_count
     if len(concept_ids) != expected_concepts:
         raise InvalidInputError(
             f"batch {batch.index}: expected {expected_concepts} concept IDs, "
@@ -147,6 +166,14 @@ def prepare_copy_rows(
         raise InvalidInputError(f"batch {batch.index}: concept IDs are not unique")
     if len(set(location_ids)) != len(location_ids):
         raise InvalidInputError(f"batch {batch.index}: location IDs are not unique")
+    if batch.annotation_count and (
+        project.annotation_class_id is None
+        or project.annotated_with_relation_id is None
+    ):
+        raise InvalidInputError(
+            f"batch {batch.index}: the project context predates annotation "
+            "support and cannot receive the requested annotations"
+        )
 
     class_file = _spooled_text_file()
     relationship_file = _spooled_text_file()
@@ -155,11 +182,10 @@ def prepare_copy_rows(
     relationship_writer = csv.writer(relationship_file, lineterminator="\n")
     treenode_writer = csv.writer(treenode_file, lineterminator="\n")
 
-    concept_offset = 0
     location_offset = 0
     expected_skeletons: list[ExpectedSkeleton] = []
     try:
-        for member in batch.members:
+        for member, concepts in iter_member_concept_ids(batch, concept_ids):
             nodes = tuple(load_nodes(member))
             if len(nodes) != member.node_count:
                 raise InvalidInputError(
@@ -178,10 +204,6 @@ def prepare_copy_rows(
                     f"{member.member_path}: cable length no longer matches the plan"
                 )
 
-            neuron_id, skeleton_id, link_id = concept_ids[
-                concept_offset : concept_offset + 3
-            ]
-            concept_offset += 3
             member_location_ids = location_ids[
                 location_offset : location_offset + len(nodes)
             ]
@@ -193,7 +215,7 @@ def prepare_copy_rows(
 
             class_writer.writerow(
                 [
-                    neuron_id,
+                    concepts.neuron_id,
                     project.user_id,
                     project.project_id,
                     project.neuron_class_id,
@@ -202,7 +224,7 @@ def prepare_copy_rows(
             )
             class_writer.writerow(
                 [
-                    skeleton_id,
+                    concepts.skeleton_id,
                     project.user_id,
                     project.project_id,
                     project.skeleton_class_id,
@@ -211,14 +233,34 @@ def prepare_copy_rows(
             )
             relationship_writer.writerow(
                 [
-                    link_id,
+                    concepts.model_of_link_id,
                     project.user_id,
                     project.project_id,
                     project.model_of_relation_id,
-                    skeleton_id,
-                    neuron_id,
+                    concepts.skeleton_id,
+                    concepts.neuron_id,
                 ]
             )
+            for annotation in concepts.annotations:
+                class_writer.writerow(
+                    [
+                        annotation.annotation_id,
+                        project.user_id,
+                        project.project_id,
+                        project.annotation_class_id,
+                        annotation.name,
+                    ]
+                )
+                relationship_writer.writerow(
+                    [
+                        annotation.link_id,
+                        project.user_id,
+                        project.project_id,
+                        project.annotated_with_relation_id,
+                        concepts.neuron_id,
+                        annotation.annotation_id,
+                    ]
+                )
 
             for node in nodes:
                 parent_id = (
@@ -235,7 +277,7 @@ def prepare_copy_rows(
                         repr(node.z * request.scale_nm),
                         project.user_id,
                         project.user_id,
-                        skeleton_id,
+                        concepts.skeleton_id,
                         repr(_scaled_radius(node.radius, request.scale_nm)),
                         parent_id,
                     ]
@@ -244,12 +286,13 @@ def prepare_copy_rows(
             expected_skeletons.append(
                 ExpectedSkeleton(
                     member_path=member.member_path,
-                    neuron_id=int(neuron_id),
-                    skeleton_id=int(skeleton_id),
-                    link_id=int(link_id),
+                    neuron_id=concepts.neuron_id,
+                    skeleton_id=concepts.skeleton_id,
+                    link_id=concepts.model_of_link_id,
                     name=member.display_name,
                     node_count=len(nodes),
                     cable_length_nm=computed_cable,
+                    annotations=concepts.annotations,
                 )
             )
 
@@ -378,8 +421,10 @@ def execute_batch_transaction(
     counts = {
         "skeletons": prepared.batch.skeleton_count,
         "nodes": prepared.batch.node_count,
-        "class_instance_rows": prepared.batch.skeleton_count * 2,
-        "relationship_rows": prepared.batch.skeleton_count,
+        "class_instance_rows": prepared.batch.skeleton_count * 2
+        + prepared.batch.annotation_count,
+        "relationship_rows": prepared.batch.skeleton_count
+        + prepared.batch.annotation_count,
         "treenode_rows": prepared.batch.node_count,
     }
 
@@ -425,6 +470,8 @@ def execute_batch_transaction(
                 neuron_class_id=project.neuron_class_id,
                 skeleton_class_id=project.skeleton_class_id,
                 model_of_relation_id=project.model_of_relation_id,
+                annotation_class_id=project.annotation_class_id,
+                annotated_with_relation_id=project.annotated_with_relation_id,
                 expected_skeletons=[
                     expected.to_validation_dict()
                     for expected in prepared.expected_skeletons

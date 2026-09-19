@@ -18,7 +18,11 @@ from catmaid_skeleton_batch_import.errors import InvalidInputError
 VALID_SWC = b"1 1 0 0 0 -1 -1\n2 3 3 4 0 2 1\n"
 
 
-def request(archive: Path, mapping: Path | None = None) -> IngestionRequest:
+def request(
+    archive: Path,
+    mapping: Path | None = None,
+    annotations: tuple[str, ...] = (),
+) -> IngestionRequest:
     return IngestionRequest(
         schema_version=1,
         archive_path=archive,
@@ -26,6 +30,7 @@ def request(archive: Path, mapping: Path | None = None) -> IngestionRequest:
         dimension=(1, 1, 1),
         resolution_nm=(1.0, 1.0, 1.0),
         external_skeleton_id_map_path=mapping,
+        annotations=annotations,
     )
 
 
@@ -81,6 +86,21 @@ def test_scan_archive_hashes_parses_and_maps_exact_member_paths(tmp_path: Path) 
     assert scanned.total_nodes == 4
     assert scanned.members[0].cable_length_nm == 5000
     assert scanned.members[0].display_name == "a"
+
+
+def test_stem_annotation_is_the_member_filename_stem_verbatim(tmp_path: Path) -> None:
+    archive = tmp_path / "191805.zip"
+    write_zip(
+        archive,
+        [("191805/0000001.swc", VALID_SWC), ("191805/Cell_07.SWC", VALID_SWC)],
+    )
+
+    scanned = scan_archive(request(archive, annotations=("{stem}",)), settings())
+
+    assert [member.annotations for member in scanned.members] == [
+        ("0000001",),
+        ("Cell_07",),
+    ]
 
 
 def test_rejects_non_file_and_invalid_zip(tmp_path: Path) -> None:

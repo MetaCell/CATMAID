@@ -139,8 +139,15 @@ def test_create_hidden_project_is_create_only_and_returns_tracing_ids():
     calls = []
     components = {
         "get_system_user": lambda: system_user,
-        "get_class_to_id_map": lambda *_args: {"neuron": 31, "skeleton": 32},
-        "get_relation_to_id_map": lambda *_args: {"model_of": 41},
+        "get_class_to_id_map": lambda *_args: {
+            "neuron": 31,
+            "skeleton": 32,
+            "annotation": 33,
+        },
+        "get_relation_to_id_map": lambda *_args: {
+            "model_of": 41,
+            "annotated_with": 42,
+        },
         "validate_project_setup": lambda *args, **kwargs: calls.append(
             ("validate", args, kwargs)
         ),
@@ -172,6 +179,8 @@ def test_create_hidden_project_is_create_only_and_returns_tracing_ids():
     assert created["project_stack"]["translation"] == (0.0, 0.0, 0.0)
     assert result["system_user_id"] == 7
     assert result["neuron_class_id"] == 31
+    assert result["annotation_class_id"] == 33
+    assert result["annotated_with_relation_id"] == 42
     assert sum(call[0] == "permission" for call in calls) == len(
         project.SYSTEM_PROJECT_PERMISSIONS
     )
@@ -208,6 +217,7 @@ def test_materialize_and_verify_batch_uses_catmaid_functions_and_exact_checks():
             "name": "a",
             "node_count": 2,
             "cable_length_nm": 5.0,
+            "annotations": [],
         }
     ]
 
@@ -217,6 +227,8 @@ def test_materialize_and_verify_batch_uses_catmaid_functions_and_exact_checks():
         neuron_class_id=31,
         skeleton_class_id=32,
         model_of_relation_id=41,
+        annotation_class_id=33,
+        annotated_with_relation_id=42,
         skeletons=expected,
         location_ids=[20, 21],
         connection=connection,
@@ -249,6 +261,7 @@ def test_materialization_requires_origin_and_rejects_singletons():
             "name": "a",
             "node_count": 1,
             "cable_length_nm": 0,
+            "annotations": [],
         }
     ]
     with pytest.raises(ValueError, match="one-node"):
@@ -258,11 +271,65 @@ def test_materialization_requires_origin_and_rejects_singletons():
             neuron_class_id=31,
             skeleton_class_id=32,
             model_of_relation_id=41,
+            annotation_class_id=33,
+            annotated_with_relation_id=42,
             skeletons=expected,
             location_ids=[20],
             connection=ScriptedConnection(in_atomic_block=True),
             rebuild_edges=lambda *_args, **_kwargs: None,
         )
+
+
+def _annotated_batch_responses():
+    return [
+        [
+            (10, 7, 1, 31, "a"),
+            (11, 7, 1, 32, "a"),
+            (13, 7, 1, 33, "0000001"),
+        ],
+        [(12, 7, 1, 41, 11, 10), (14, 7, 1, 42, 10, 13)],
+        [
+            (20, 1, 7, 7, 11, None),
+            (21, 1, 7, 7, 11, 20),
+        ],
+        [(20, None, 1), (21, 20, 1)],
+        [(11, 1, 7, 2, 5.0)],
+    ]
+
+
+def _annotated_expected_skeleton():
+    return {
+        "neuron_id": 10,
+        "skeleton_id": 11,
+        "link_id": 12,
+        "name": "a",
+        "node_count": 2,
+        "cable_length_nm": 5.0,
+        "annotations": [{"name": "0000001", "annotation_id": 13, "link_id": 14}],
+    }
+
+
+def test_batch_validation_counts_annotation_rows_and_their_neuron_links():
+    connection = ScriptedConnection(_annotated_batch_responses())
+
+    result = materialization.validate_batch(
+        project_id=1,
+        user_id=7,
+        neuron_class_id=31,
+        skeleton_class_id=32,
+        model_of_relation_id=41,
+        annotation_class_id=33,
+        annotated_with_relation_id=42,
+        skeletons=[_annotated_expected_skeleton()],
+        location_ids=[20, 21],
+        connection=connection,
+    )
+
+    assert result["class_instance_count"] == 3
+    assert result["annotation_count"] == 1
+    assert result["annotation_relationship_count"] == 1
+    assert connection.executions[0][1] == ([10, 11, 13],)
+    assert connection.executions[1][1] == ([12, 14],)
 
 
 def test_batch_validation_detects_edge_parent_mismatch():
@@ -277,6 +344,7 @@ def test_batch_validation_detects_edge_parent_mismatch():
             "name": "a",
             "node_count": 2,
             "cable_length_nm": 5.0,
+            "annotations": [],
         }
     ]
     with pytest.raises(VerificationError, match="edge parent"):
@@ -286,6 +354,8 @@ def test_batch_validation_detects_edge_parent_mismatch():
             neuron_class_id=31,
             skeleton_class_id=32,
             model_of_relation_id=41,
+            annotation_class_id=33,
+            annotated_with_relation_id=42,
             skeletons=expected,
             location_ids=[20, 21],
             connection=connection,
@@ -451,7 +521,7 @@ def test_cache_verification_checks_exact_grid_and_no_dirty_cells():
 
 
 def test_project_aggregate_counts_use_one_constant_size_result():
-    connection = ScriptedConnection([(3, 3, 3, 10, 10, 3)])
+    connection = ScriptedConnection([(3, 3, 3, 3, 3, 10, 10, 3)])
 
     result = verification.verify_project_aggregate_counts(
         project_id=1,
@@ -460,14 +530,19 @@ def test_project_aggregate_counts_use_one_constant_size_result():
         model_of_relation_id=41,
         expected_skeleton_count=3,
         expected_node_count=10,
+        annotation_class_id=33,
+        annotated_with_relation_id=42,
+        expected_annotation_count=3,
         connection=connection,
     )
 
     assert result == {
-        "class_instance_count": 6,
+        "class_instance_count": 9,
         "neuron_count": 3,
         "skeleton_count": 3,
+        "annotation_count": 3,
         "relationship_count": 3,
+        "annotation_relationship_count": 3,
         "treenode_count": 10,
         "edge_count": 10,
         "summary_count": 3,
@@ -476,8 +551,8 @@ def test_project_aggregate_counts_use_one_constant_size_result():
     assert "SELECT count(*) FROM treenode" in connection.executions[0][0]
 
 
-def test_project_aggregate_counts_reject_extra_project_rows():
-    connection = ScriptedConnection([(3, 3, 4, 10, 10, 3)])
+def test_project_aggregate_counts_reject_a_missing_annotation_link():
+    connection = ScriptedConnection([(3, 3, 3, 3, 2, 10, 10, 3)])
     with pytest.raises(VerificationError, match="project-wide database counts"):
         verification.verify_project_aggregate_counts(
             project_id=1,
@@ -486,5 +561,25 @@ def test_project_aggregate_counts_reject_extra_project_rows():
             model_of_relation_id=41,
             expected_skeleton_count=3,
             expected_node_count=10,
+            annotation_class_id=33,
+            annotated_with_relation_id=42,
+            expected_annotation_count=3,
+            connection=connection,
+        )
+
+
+def test_project_aggregate_counts_reject_extra_project_rows():
+    connection = ScriptedConnection([(3, 3, 0, 4, 0, 10, 10, 3)])
+    with pytest.raises(VerificationError, match="project-wide database counts"):
+        verification.verify_project_aggregate_counts(
+            project_id=1,
+            neuron_class_id=31,
+            skeleton_class_id=32,
+            model_of_relation_id=41,
+            expected_skeleton_count=3,
+            expected_node_count=10,
+            annotation_class_id=33,
+            annotated_with_relation_id=42,
+            expected_annotation_count=0,
             connection=connection,
         )

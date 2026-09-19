@@ -7,5 +7,6 @@
   "stack": {
     "dimension": [17797, 30801, 10826],
     "resolution_nm": [350, 350, 1000]
-  }
+  },
+  "annotations": ["{stem}"]
 }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -14,25 +15,25 @@ from catmaid_skeleton_batch_import.config import (
 from catmaid_skeleton_batch_import.errors import InvalidInputError
 
 
-def write_request(path: Path, **source_overrides: object) -> None:
+def write_request(
+    path: Path, annotations: object = None, **source_overrides: object
+) -> None:
     source = {
         "archive_path": str(path.parent / "input.zip"),
         "coordinate_unit": "um",
     }
     source.update(source_overrides)
-    path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "source": source,
-                "stack": {
-                    "dimension": [10, 20, 30],
-                    "resolution_nm": [4, 5.5, 6],
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
+    request = {
+        "schema_version": 1,
+        "source": source,
+        "stack": {
+            "dimension": [10, 20, 30],
+            "resolution_nm": [4, 5.5, 6],
+        },
+    }
+    if annotations is not None:
+        request["annotations"] = annotations
+    path.write_text(json.dumps(request), encoding="utf-8")
 
 
 def test_request_is_strict_and_normalized(tmp_path: Path) -> None:
@@ -53,6 +54,44 @@ def test_request_rejects_unknown_input_policy(tmp_path: Path) -> None:
     write_request(request_path, coordinate_scale_nm=[1, 1, 1])
 
     with pytest.raises(InvalidInputError, match="unknown fields"):
+        load_request(request_path)
+
+
+def test_request_accepts_stem_annotation_template(tmp_path: Path) -> None:
+    request_path = tmp_path / "request.json"
+    templates = ["{stem}", "swc:{stem}"]
+    write_request(request_path, annotations=templates)
+
+    request = load_request(request_path)
+
+    assert request.annotations == tuple(templates)
+    assert request.to_dict()["annotations"] == templates
+    assert request.annotation_names("191805/0000001.swc") == (
+        "0000001",
+        "swc:0000001",
+    )
+
+
+@pytest.mark.parametrize(
+    ("annotations", "message"),
+    [
+        (["imported"], "must contain {stem}"),
+        (["{stem}-{neuron_id}"], "may only use"),
+        (["{stem:>8}"], "may only use"),
+        (["{stem!r}"], "may only use"),
+        (["{stem"], "is malformed"),
+        (["{stem}", "{stem}"], "must not repeat"),
+        ([""], "empty template"),
+        ("{stem}", "array of strings"),
+    ],
+)
+def test_request_rejects_unusable_annotation_templates(
+    tmp_path: Path, annotations: object, message: str
+) -> None:
+    request_path = tmp_path / "request.json"
+    write_request(request_path, annotations=annotations)
+
+    with pytest.raises(InvalidInputError, match=re.escape(message)):
         load_request(request_path)
 
 

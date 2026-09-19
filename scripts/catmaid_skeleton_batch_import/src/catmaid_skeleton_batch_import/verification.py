@@ -215,6 +215,9 @@ def verify_project_aggregate_counts(
     model_of_relation_id: int,
     expected_skeleton_count: int,
     expected_node_count: int,
+    annotation_class_id: int | None,
+    annotated_with_relation_id: int | None,
+    expected_annotation_count: int,
     connection: Any | None = None,
 ) -> dict[str, int]:
     """Check whole-project row counts without loading project IDs into memory.
@@ -235,10 +238,19 @@ def verify_project_aggregate_counts(
     for value, label in (
         (expected_skeleton_count, "expected_skeleton_count"),
         (expected_node_count, "expected_node_count"),
+        (expected_annotation_count, "expected_annotation_count"),
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"{label} must be a non-negative integer")
+    if expected_annotation_count and (
+        annotation_class_id is None or annotated_with_relation_id is None
+    ):
+        raise ValueError(
+            "annotation identifiers are required when annotations are expected"
+        )
 
+    # Project contexts written before annotation support carry no annotation
+    # identifiers. Comparing against NULL then counts no rows.
     connection = _default_connection(connection)
     with connection.cursor() as cursor:
         cursor.execute(
@@ -248,6 +260,10 @@ def verify_project_aggregate_counts(
                WHERE project_id = %s AND class_id = %s),
               (SELECT count(*) FROM class_instance
                WHERE project_id = %s AND class_id = %s),
+              (SELECT count(*) FROM class_instance
+               WHERE project_id = %s AND class_id = %s),
+              (SELECT count(*) FROM class_instance_class_instance
+               WHERE project_id = %s AND relation_id = %s),
               (SELECT count(*) FROM class_instance_class_instance
                WHERE project_id = %s AND relation_id = %s),
               (SELECT count(*) FROM treenode WHERE project_id = %s),
@@ -260,28 +276,36 @@ def verify_project_aggregate_counts(
                 project_id,
                 skeleton_class_id,
                 project_id,
+                annotation_class_id,
+                project_id,
                 model_of_relation_id,
+                project_id,
+                annotated_with_relation_id,
                 project_id,
                 project_id,
                 project_id,
             ),
         )
         row = cursor.fetchone()
-    if row is None or len(row) != 6:
+    if row is None or len(row) != 8:
         _fail("could not read project-wide database counts")
 
     actual = {
         "neuron_count": int(row[0]),
         "skeleton_count": int(row[1]),
-        "relationship_count": int(row[2]),
-        "treenode_count": int(row[3]),
-        "edge_count": int(row[4]),
-        "summary_count": int(row[5]),
+        "annotation_count": int(row[2]),
+        "relationship_count": int(row[3]),
+        "annotation_relationship_count": int(row[4]),
+        "treenode_count": int(row[5]),
+        "edge_count": int(row[6]),
+        "summary_count": int(row[7]),
     }
     expected = {
         "neuron_count": expected_skeleton_count,
         "skeleton_count": expected_skeleton_count,
+        "annotation_count": expected_annotation_count,
         "relationship_count": expected_skeleton_count,
+        "annotation_relationship_count": expected_annotation_count,
         "treenode_count": expected_node_count,
         "edge_count": expected_node_count,
         "summary_count": expected_skeleton_count,
@@ -293,7 +317,9 @@ def verify_project_aggregate_counts(
             actual=actual,
         )
     return {
-        "class_instance_count": actual["neuron_count"] + actual["skeleton_count"],
+        "class_instance_count": actual["neuron_count"]
+        + actual["skeleton_count"]
+        + actual["annotation_count"],
         **actual,
     }
 
@@ -307,6 +333,8 @@ def verify_database(
     model_of_relation_id: int,
     skeletons: Sequence[Mapping[str, Any]],
     location_ids: Sequence[int],
+    annotation_class_id: int | None,
+    annotated_with_relation_id: int | None,
     connection: Any | None = None,
     cable_abs_tolerance_nm: float = DEFAULT_CABLE_ABS_TOLERANCE_NM,
     cable_rel_tolerance: float = DEFAULT_CABLE_REL_TOLERANCE,
@@ -327,6 +355,8 @@ def verify_database(
         model_of_relation_id=model_of_relation_id,
         skeletons=skeletons,
         location_ids=location_ids,
+        annotation_class_id=annotation_class_id,
+        annotated_with_relation_id=annotated_with_relation_id,
         connection=connection,
         cable_abs_tolerance_nm=cable_abs_tolerance_nm,
         cable_rel_tolerance=cable_rel_tolerance,
@@ -338,6 +368,11 @@ def verify_database(
         model_of_relation_id=model_of_relation_id,
         expected_skeleton_count=len(skeletons),
         expected_node_count=len(location_ids),
+        annotation_class_id=annotation_class_id,
+        annotated_with_relation_id=annotated_with_relation_id,
+        expected_annotation_count=sum(
+            len(skeleton["annotations"]) for skeleton in skeletons
+        ),
         connection=connection,
     )
     if batch_counts != aggregate_counts:

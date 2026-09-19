@@ -7,6 +7,7 @@ import math
 import sys
 import time
 import zipfile
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -25,7 +26,14 @@ from .config import (
     load_settings,
     settings_from_state,
 )
-from .domain import ImportSettings, IngestionRequest, PlannedBatch, PlannedMember, SwcNode
+from .domain import (
+    ImportSettings,
+    IngestionRequest,
+    PlannedBatch,
+    PlannedMember,
+    SwcNode,
+    iter_member_concept_ids,
+)
 from .errors import (
     ImmutableStateError,
     InvalidInputError,
@@ -494,7 +502,7 @@ def _prepare_batch_artifacts(
         concept_ids = read_id_artifact(
             store.state_dir,
             artifacts["concept_ids"],
-            expected_count=batch.skeleton_count * 3,
+            expected_count=batch.concept_count,
         )
     else:
         from .database import allocate_sequence_ids
@@ -502,7 +510,7 @@ def _prepare_batch_artifacts(
         try:
             concept_ids = list(
                 allocate_sequence_ids(
-                    "concept_id_seq", batch.skeleton_count * 3, connection
+                    "concept_id_seq", batch.concept_count, connection
                 )
             )
         except Exception as exc:
@@ -751,8 +759,8 @@ def _run_batch(
         batch_skeleton_count=batch.skeleton_count,
         node_count=batch.node_count,
         row_counts={
-            "class_instance_rows": batch.skeleton_count * 2,
-            "relationship_rows": batch.skeleton_count,
+            "class_instance_rows": batch.skeleton_count * 2 + batch.annotation_count,
+            "relationship_rows": batch.skeleton_count + batch.annotation_count,
             "treenode_rows": batch.node_count,
         },
     )
@@ -936,25 +944,25 @@ def _expected_batch_data(
     concept_ids = read_id_artifact(
         store.state_dir,
         batch_state["artifacts"]["concept_ids"],
-        expected_count=batch.skeleton_count * 3,
+        expected_count=batch.concept_count,
     )
     location_ids = read_id_artifact(
         store.state_dir,
         batch_state["artifacts"]["location_ids"],
         expected_count=batch.node_count,
     )
-    for member_index, member in enumerate(batch.members):
-        neuron_id, skeleton_id, link_id = concept_ids[
-            member_index * 3 : member_index * 3 + 3
-        ]
+    for member, concepts in iter_member_concept_ids(batch, concept_ids):
         expected_skeletons.append(
             {
-                "neuron_id": neuron_id,
-                "skeleton_id": skeleton_id,
-                "link_id": link_id,
+                "neuron_id": concepts.neuron_id,
+                "skeleton_id": concepts.skeleton_id,
+                "link_id": concepts.model_of_link_id,
                 "name": member.display_name,
                 "node_count": member.node_count,
                 "cable_length_nm": member.cable_length_nm,
+                "annotations": [
+                    asdict(annotation) for annotation in concepts.annotations
+                ],
             }
         )
     return expected_skeletons, location_ids
@@ -991,6 +999,8 @@ def _verify_database_by_batch(
             model_of_relation_id=project.model_of_relation_id,
             skeletons=expected_skeletons,
             location_ids=location_ids,
+            annotation_class_id=project.annotation_class_id,
+            annotated_with_relation_id=project.annotated_with_relation_id,
             connection=connection,
         )
         if (
@@ -1026,6 +1036,9 @@ def _verify_database_by_batch(
         model_of_relation_id=project.model_of_relation_id,
         expected_skeleton_count=plan.member_count,
         expected_node_count=plan.total_nodes,
+        annotation_class_id=project.annotation_class_id,
+        annotated_with_relation_id=project.annotated_with_relation_id,
+        expected_annotation_count=plan.total_annotations,
         connection=connection,
     )
 

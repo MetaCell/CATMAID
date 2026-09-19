@@ -48,6 +48,7 @@ def test_known_rollback_preserves_prior_batch_and_resumes(
                     "dimension": [100, 100, 100],
                     "resolution_nm": [1000, 1000, 1000],
                 },
+                "annotations": ["{stem}"],
             }
         ),
         encoding="utf-8",
@@ -87,3 +88,28 @@ def test_known_rollback_preserves_prior_batch_and_resumes(
         "committed",
         "committed",
     ]
+
+    from django.db import connection
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT neuron.name, annotation.name
+            FROM class_instance neuron
+            JOIN class neuron_class
+              ON neuron_class.id = neuron.class_id
+             AND neuron_class.class_name = 'neuron'
+            LEFT JOIN class_instance_class_instance link
+              ON link.class_instance_a = neuron.id
+             AND link.relation_id = (
+               SELECT id FROM relation
+               WHERE project_id = neuron.project_id
+                 AND relation_name = 'annotated_with'
+             )
+            LEFT JOIN class_instance annotation ON annotation.id = link.class_instance_b
+            WHERE neuron.project_id = %s
+            ORDER BY neuron.name
+            """,
+            [result["project_id"]],
+        )
+        assert cursor.fetchall() == [("alpha", "alpha"), ("beta", "beta")]

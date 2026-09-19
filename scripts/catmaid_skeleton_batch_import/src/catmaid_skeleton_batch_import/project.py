@@ -167,15 +167,15 @@ def create_hidden_project(
         for permission in SYSTEM_PROJECT_PERMISSIONS:
             components["assign_perm"](permission, system_user, project)
 
-        class_map = components["get_class_to_id_map"](
-            project.id, ("neuron", "skeleton")
-        )
+        class_names = ("neuron", "skeleton", "annotation")
+        relation_names = ("model_of", "annotated_with")
+        class_map = components["get_class_to_id_map"](project.id, class_names)
         relation_map = components["get_relation_to_id_map"](
-            project.id, ("model_of",)
+            project.id, relation_names
         )
         missing = {
-            "classes": sorted({"neuron", "skeleton"} - set(class_map)),
-            "relations": sorted({"model_of"} - set(relation_map)),
+            "classes": sorted(set(class_names) - set(class_map)),
+            "relations": sorted(set(relation_names) - set(relation_map)),
         }
         if missing["classes"] or missing["relations"]:
             raise ProjectSetupError(
@@ -192,5 +192,7 @@ def create_hidden_project(
         "neuron_class_id": int(class_map["neuron"]),
         "skeleton_class_id": int(class_map["skeleton"]),
         "model_of_relation_id": int(relation_map["model_of"]),
+        "annotation_class_id": int(class_map["annotation"]),
+        "annotated_with_relation_id": int(relation_map["annotated_with"]),
         "metadata": metadata,
     }
