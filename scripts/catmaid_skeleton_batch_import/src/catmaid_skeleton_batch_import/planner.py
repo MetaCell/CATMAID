@@ -22,6 +22,10 @@ from .util import (
 
 PLAN_SCHEMA_VERSION = 1
 
+# CATMAID's default stable-join annotation. A neuron carrying it always wins a
+# join, and two such neurons cannot be joined at all.
+STABLE_JOIN_ANNOTATION = "stable"
+
 
 @dataclass(frozen=True)
 class ImportPlan:
@@ -43,6 +47,10 @@ class ImportPlan:
     @property
     def total_nodes(self) -> int:
         return sum(member.node_count for member in self.members)
+
+    @property
+    def total_annotations(self) -> int:
+        return sum(len(member.annotations) for member in self.members)
 
     def header_dict(self) -> dict[str, Any]:
         return {
@@ -85,6 +93,17 @@ def _validate_member(member: PlannedMember) -> None:
         raise InvalidInputError(
             f"Planned member {member.member_path!r} has an empty external ID"
         )
+    for annotation in member.annotations:
+        if len(annotation) > 255:
+            raise InvalidInputError(
+                f"Planned member {member.member_path!r} renders annotation "
+                f"{annotation[:32]!r}... longer than 255 characters"
+            )
+        if annotation == STABLE_JOIN_ANNOTATION:
+            raise InvalidInputError(
+                f"Planned member {member.member_path!r} renders annotation "
+                f"{annotation!r}, which CATMAID reserves for stable joins"
+            )
 
 
 def build_plan(
@@ -101,6 +120,7 @@ def build_plan(
 
     seen_paths: set[str] = set()
     seen_external_ids: set[str] = set()
+    annotation_members: dict[str, str] = {}
     for member in ordered:
         _validate_member(member)
         if member.member_path in seen_paths:
@@ -115,6 +135,13 @@ def build_plan(
                     f"{member.external_skeleton_id!r}"
                 )
             seen_external_ids.add(member.external_skeleton_id)
+        for annotation in member.annotations:
+            if annotation in annotation_members:
+                raise InvalidInputError(
+                    f"Annotation {annotation!r} is rendered by both "
+                    f"{annotation_members[annotation]!r} and {member.member_path!r}"
+                )
+            annotation_members[annotation] = member.member_path
         if member.node_count > max_nodes_per_batch:
             raise InvalidInputError(
                 f"SWC member {member.member_path!r} has {member.node_count} nodes; "
@@ -226,7 +253,7 @@ def _member_from_record(
         "cable_length_nm",
         "batch_index",
     }
-    allowed = required | {"external_skeleton_id"}
+    allowed = required | {"external_skeleton_id", "annotations"}
     unknown = set(record) - allowed
     missing = required - set(record)
     if unknown or missing or record.get("record_type") != "member":
@@ -249,6 +276,13 @@ def _member_from_record(
         raise InvalidInputError(
             f"{path}:{line_number}: external_skeleton_id must be a string"
         )
+    annotations = record.get("annotations", [])
+    if not isinstance(annotations, list) or not all(
+        isinstance(annotation, str) for annotation in annotations
+    ):
+        raise InvalidInputError(
+            f"{path}:{line_number}: annotations must be an array of strings"
+        )
     member = PlannedMember(
         member_path=_record_string(record, "member_path", path, line_number),
         node_count=_record_int(record, "node_count", path, line_number),
@@ -260,6 +294,7 @@ def _member_from_record(
         cable_length_nm=float(cable_length),
         external_skeleton_id=external_id,
         batch_index=_record_int(record, "batch_index", path, line_number),
+        annotations=tuple(annotations),
     )
     _validate_member(member)
     if member.batch_index <= 0:

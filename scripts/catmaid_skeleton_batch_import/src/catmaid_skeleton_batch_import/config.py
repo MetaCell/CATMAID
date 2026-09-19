@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import math
 import os
+import string
 from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
-from .domain import ImportSettings, IngestionRequest
+from .domain import ANNOTATION_PLACEHOLDER, ImportSettings, IngestionRequest
 from .errors import InvalidInputError
 
 
@@ -43,8 +44,14 @@ DEFAULTS: dict[str, int | str | None] = {
 }
 
 
-def _expect_keys(value: dict[str, Any], expected: set[str], label: str) -> None:
-    unknown = set(value) - expected
+def _expect_keys(
+    value: dict[str, Any],
+    expected: set[str],
+    label: str,
+    *,
+    optional: frozenset[str] = frozenset(),
+) -> None:
+    unknown = set(value) - expected - optional
     missing = expected - set(value)
     if unknown:
         raise InvalidInputError(
@@ -81,6 +88,37 @@ def _positive_number_tuple(value: Any, label: str) -> tuple[float, float, float]
     return tuple(result)  # type: ignore[return-value]
 
 
+def _check_annotation_template(template: str) -> None:
+    label = f"request.annotations template {template!r}"
+    try:
+        parsed = list(string.Formatter().parse(template))
+    except ValueError as exc:
+        raise InvalidInputError(f"{label} is malformed: {exc}") from exc
+    uses_stem = False
+    for _literal, field_name, format_spec, conversion in parsed:
+        if field_name is None:
+            continue
+        if field_name != ANNOTATION_PLACEHOLDER or format_spec or conversion:
+            raise InvalidInputError(f"{label} may only use {{stem}}")
+        uses_stem = True
+    if not uses_stem:
+        raise InvalidInputError(f"{label} must contain {{stem}}")
+
+
+def _annotation_templates(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise InvalidInputError("request.annotations must be an array of strings")
+    if len(set(value)) != len(value):
+        raise InvalidInputError("request.annotations must not repeat a template")
+    for template in value:
+        if not template:
+            raise InvalidInputError(
+                "request.annotations must not contain an empty template"
+            )
+        _check_annotation_template(template)
+    return tuple(value)
+
+
 def load_request(path: Path) -> IngestionRequest:
     try:
         with path.open("r", encoding="utf-8") as source:
@@ -90,7 +128,12 @@ def load_request(path: Path) -> IngestionRequest:
 
     if not isinstance(raw, dict):
         raise InvalidInputError("request must be a JSON object")
-    _expect_keys(raw, {"schema_version", "source", "stack"}, "request")
+    _expect_keys(
+        raw,
+        {"schema_version", "source", "stack"},
+        "request",
+        optional=frozenset({"annotations"}),
+    )
     if raw["schema_version"] != 1:
         raise InvalidInputError("request.schema_version must be 1")
     if not isinstance(raw["source"], dict):
@@ -142,6 +185,7 @@ def load_request(path: Path) -> IngestionRequest:
             raw["stack"]["resolution_nm"], "request.stack.resolution_nm"
         ),
         external_skeleton_id_map_path=mapping_path,
+        annotations=_annotation_templates(raw.get("annotations", [])),
     )
 
 

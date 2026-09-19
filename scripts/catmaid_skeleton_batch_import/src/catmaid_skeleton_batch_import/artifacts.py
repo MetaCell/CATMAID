@@ -5,10 +5,11 @@ from __future__ import annotations
 import csv
 import gzip
 import io
+import json
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from .domain import PlannedBatch
+from .domain import PlannedBatch, iter_member_concept_ids
 from .errors import ImmutableStateError
 from .util import atomic_write_bytes, deterministic_gzip_bytes, sha256_file
 
@@ -21,6 +22,7 @@ MANIFEST_FIELDS = (
     "node_count",
     "name",
     "batch_index",
+    "annotations",
 )
 
 
@@ -117,20 +119,18 @@ def manifest_rows(
     batch: PlannedBatch,
     concept_ids: Sequence[int],
 ) -> list[dict[str, object]]:
-    if len(concept_ids) != batch.skeleton_count * 3:
-        raise ValueError("Concept ID count does not match batch skeleton count")
     rows: list[dict[str, object]] = []
-    for index, member in enumerate(batch.members):
-        neuron_id, skeleton_id, _link_id = concept_ids[index * 3 : index * 3 + 3]
+    for member, concepts in iter_member_concept_ids(batch, concept_ids):
         rows.append(
             {
                 "member_path": member.member_path,
                 "external_skeleton_id": member.external_skeleton_id or "",
-                "neuron_id": neuron_id,
-                "skeleton_id": skeleton_id,
+                "neuron_id": concepts.neuron_id,
+                "skeleton_id": concepts.skeleton_id,
                 "node_count": member.node_count,
                 "name": member.display_name,
                 "batch_index": batch.index,
+                "annotations": json.dumps(list(member.annotations)),
             }
         )
     return rows

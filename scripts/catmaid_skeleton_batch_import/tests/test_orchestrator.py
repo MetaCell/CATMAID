@@ -17,6 +17,7 @@ def _member(path: str, node_count: int) -> PlannedMember:
         crc32=node_count,
         display_name=Path(path).stem,
         cable_length_nm=float(node_count),
+        annotations=(Path(path).stem,),
     )
 
 
@@ -35,6 +36,8 @@ def test_final_database_verification_loads_then_validates_one_batch_at_a_time(
         neuron_class_id=31,
         skeleton_class_id=32,
         model_of_relation_id=41,
+        annotation_class_id=33,
+        annotated_with_relation_id=42,
     )
     events = []
 
@@ -88,6 +91,7 @@ def test_final_database_verification_loads_then_validates_one_batch_at_a_time(
                 "aggregate",
                 kwargs["expected_skeleton_count"],
                 kwargs["expected_node_count"],
+                kwargs["expected_annotation_count"],
             )
         )
         return aggregate
@@ -110,5 +114,5 @@ def test_final_database_verification_loads_then_validates_one_batch_at_a_time(
         ("validate", 1, 3),
         ("load", 3, 2),
         ("validate", 1, 2),
-        ("aggregate", 3, 7),
+        ("aggregate", 3, 7, 3),
     ]

@@ -316,20 +316,20 @@ def allocate_project_ids(connection: Any | None = None) -> dict[str, int]:
 
 
 def allocate_batch_ids(
-    skeleton_count: int,
+    concept_count: int,
     node_count: int,
     connection: Any | None = None,
 ) -> dict[str, tuple[int, ...]]:
     """Reserve exact concept and location IDs for one whole-skeleton batch."""
 
-    if isinstance(skeleton_count, bool) or skeleton_count <= 0:
-        raise ValueError("skeleton_count must be positive")
+    if isinstance(concept_count, bool) or concept_count <= 0:
+        raise ValueError("concept_count must be positive")
     if isinstance(node_count, bool) or node_count <= 0:
         raise ValueError("node_count must be positive")
     connection = _default_connection(connection)
     return {
         "concept_ids": allocate_sequence_ids(
-            "concept_id_seq", skeleton_count * 3, connection
+            "concept_id_seq", concept_count, connection
         ),
         "location_ids": allocate_sequence_ids(
             "location_id_seq", node_count, connection

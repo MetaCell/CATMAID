@@ -20,6 +20,7 @@ _EXPECTED_KEYS = (
     "name",
     "node_count",
     "cable_length_nm",
+    "annotations",
 )
 
 
@@ -68,6 +69,32 @@ def _normalize_expected_skeletons(
                 f"expected skeleton {index}.cable_length_nm must be finite and non-negative"
             )
         values["cable_length_nm"] = cable_length
+        annotations: list[dict[str, Any]] = []
+        for annotation in skeleton["annotations"]:
+            if not isinstance(annotation["name"], str) or not annotation["name"]:
+                raise ValueError(
+                    f"expected skeleton {index} has an empty annotation name"
+                )
+            for key in ("annotation_id", "link_id"):
+                identifier = annotation[key]
+                if (
+                    isinstance(identifier, bool)
+                    or not isinstance(identifier, int)
+                    or identifier <= 0
+                ):
+                    raise ValueError(
+                        f"expected skeleton {index} annotation {key} "
+                        "must be positive"
+                    )
+            annotations.append(
+                {
+                    "name": annotation["name"],
+                    "annotation_id": annotation["annotation_id"],
+                    "link_id": annotation["link_id"],
+                }
+            )
+            concept_ids.extend((annotation["annotation_id"], annotation["link_id"]))
+        values["annotations"] = tuple(annotations)
         normalized.append(values)
         concept_ids.extend(
             (values["neuron_id"], values["skeleton_id"], values["link_id"])
@@ -127,8 +154,9 @@ def _validate_class_instances(
     user_id: int,
     neuron_class_id: int,
     skeleton_class_id: int,
+    annotation_class_id: int | None,
 ) -> None:
-    expected: dict[int, tuple[int, str]] = {}
+    expected: dict[int, tuple[int | None, str]] = {}
     for skeleton in skeletons:
         expected[int(skeleton["neuron_id"])] = (
             neuron_class_id,
@@ -138,6 +166,11 @@ def _validate_class_instances(
             skeleton_class_id,
             str(skeleton["name"]),
         )
+        for annotation in skeleton["annotations"]:
+            expected[int(annotation["annotation_id"])] = (
+                annotation_class_id,
+                str(annotation["name"]),
+            )
     by_id = _rows_by_id(rows, tuple(expected), "class_instance")
     for row_id, row in by_id.items():
         _, actual_user, actual_project, actual_class, actual_name = row
@@ -167,21 +200,34 @@ def _validate_relationships(
     project_id: int,
     user_id: int,
     model_of_relation_id: int,
+    annotated_with_relation_id: int | None,
 ) -> None:
-    expected = {int(item["link_id"]): item for item in skeletons}
+    expected: dict[int, tuple[int | None, int, int]] = {}
+    for item in skeletons:
+        expected[int(item["link_id"])] = (
+            model_of_relation_id,
+            int(item["skeleton_id"]),
+            int(item["neuron_id"]),
+        )
+        for annotation in item["annotations"]:
+            expected[int(annotation["link_id"])] = (
+                annotated_with_relation_id,
+                int(item["neuron_id"]),
+                int(annotation["annotation_id"]),
+            )
     by_id = _rows_by_id(rows, tuple(expected), "class_instance_class_instance")
     for row_id, row in by_id.items():
         _, actual_user, actual_project, relation_id, class_a, class_b = row
-        item = expected[row_id]
+        expected_relation_id, expected_a, expected_b = expected[row_id]
         if (
             int(actual_user) != user_id
             or int(actual_project) != project_id
-            or int(relation_id) != model_of_relation_id
-            or int(class_a) != int(item["skeleton_id"])
-            or int(class_b) != int(item["neuron_id"])
+            or int(relation_id) != expected_relation_id
+            or int(class_a) != expected_a
+            or int(class_b) != expected_b
         ):
             _fail(
-                "model_of relationship ownership or endpoints do not match",
+                "relationship ownership or endpoints do not match",
                 id=row_id,
             )
 
@@ -316,6 +362,8 @@ def validate_batch(
     model_of_relation_id: int,
     skeletons: Sequence[Mapping[str, Any]],
     location_ids: Sequence[int],
+    annotation_class_id: int | None,
+    annotated_with_relation_id: int | None,
     connection: Any | None = None,
     cable_abs_tolerance_nm: float = DEFAULT_CABLE_ABS_TOLERANCE_NM,
     cable_rel_tolerance: float = DEFAULT_CABLE_REL_TOLERANCE,
@@ -328,14 +376,32 @@ def validate_batch(
     )
     if min(cable_abs_tolerance_nm, cable_rel_tolerance) < 0:
         raise ValueError("cable tolerances cannot be negative")
+    annotation_count = sum(len(item["annotations"]) for item in normalized)
+    if annotation_count and (
+        annotation_class_id is None or annotated_with_relation_id is None
+    ):
+        raise ValueError(
+            "annotation identifiers are required when annotations are expected"
+        )
 
     connection = _default_connection(connection)
     class_ids = tuple(
         identifier
         for item in normalized
-        for identifier in (item["neuron_id"], item["skeleton_id"])
+        for identifier in (
+            item["neuron_id"],
+            item["skeleton_id"],
+            *(annotation["annotation_id"] for annotation in item["annotations"]),
+        )
     )
-    link_ids = tuple(item["link_id"] for item in normalized)
+    link_ids = tuple(
+        identifier
+        for item in normalized
+        for identifier in (
+            item["link_id"],
+            *(annotation["link_id"] for annotation in item["annotations"]),
+        )
+    )
     skeleton_ids = tuple(item["skeleton_id"] for item in normalized)
 
     with connection.cursor() as cursor:
@@ -403,6 +469,7 @@ def validate_batch(
         user_id=user_id,
         neuron_class_id=neuron_class_id,
         skeleton_class_id=skeleton_class_id,
+        annotation_class_id=annotation_class_id,
     )
     _validate_relationships(
         relationship_rows,
@@ -410,6 +477,7 @@ def validate_batch(
         project_id=project_id,
         user_id=user_id,
         model_of_relation_id=model_of_relation_id,
+        annotated_with_relation_id=annotated_with_relation_id,
     )
     parents = _validate_treenodes(
         treenode_rows,
@@ -435,10 +503,12 @@ def validate_batch(
     skeleton_count = len(normalized)
     node_count = len(normalized_locations)
     return {
-        "class_instance_count": skeleton_count * 2,
+        "class_instance_count": skeleton_count * 2 + annotation_count,
         "neuron_count": skeleton_count,
         "skeleton_count": skeleton_count,
+        "annotation_count": annotation_count,
         "relationship_count": skeleton_count,
+        "annotation_relationship_count": annotation_count,
         "treenode_count": node_count,
         "edge_count": node_count,
         "summary_count": skeleton_count,
@@ -455,6 +525,8 @@ def materialize_and_verify_batch(
     skeletons: Sequence[Mapping[str, Any]] | None = None,
     expected_skeletons: Sequence[Mapping[str, Any]] | None = None,
     location_ids: Sequence[int],
+    annotation_class_id: int | None,
+    annotated_with_relation_id: int | None,
     connection: Any | None = None,
     cursor: Any | None = None,
     rebuild_edges: Any | None = None,
@@ -529,6 +601,8 @@ def materialize_and_verify_batch(
         model_of_relation_id=model_of_relation_id,
         skeletons=normalized,
         location_ids=location_ids,
+        annotation_class_id=annotation_class_id,
+        annotated_with_relation_id=annotated_with_relation_id,
         connection=connection,
         cable_abs_tolerance_nm=cable_abs_tolerance_nm,
         cable_rel_tolerance=cable_rel_tolerance,

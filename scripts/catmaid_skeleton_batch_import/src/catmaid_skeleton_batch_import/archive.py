@@ -263,6 +263,7 @@ def scan_archive(
                         crc32=info.CRC,
                         display_name=PurePosixPath(info.filename).stem[:255],
                         cable_length_nm=cable_length_nm,
+                        annotations=request.annotation_names(info.filename),
                     )
                 )
     except InvalidInputError:

@@ -56,13 +56,37 @@ The request schema is deliberately small:
   "stack": {
     "dimension": [17797, 30801, 10826],
     "resolution_nm": [350, 350, 1000]
-  }
+  },
+  "annotations": ["{stem}"]
 }
 ```
 
 `source.external_skeleton_id_map_path` may name a local CSV with exactly the
 columns `member_path,external_skeleton_id`. The mapping enriches the output
 manifest but never chooses CATMAID IDs.
+
+### Annotations
+
+`annotations` is an optional list of templates. Each template is rendered once
+per SWC member and the result becomes a CATMAID annotation on that member's
+neuron, so Neuroglancer can search for it as a segment property. The only
+placeholder is `{stem}`, the filename without its extension, verbatim:
+`191805/0000001.swc` renders `{stem}` as `0000001` and `swc:{stem}` as
+`swc:0000001`.
+
+Every template must contain `{stem}`, so each rendered name belongs to exactly
+one neuron; a constant template would create one duplicate annotation row per
+neuron. Format specifications, conversions, other placeholders, empty
+templates, and repeated templates are rejected. A rendered name longer than 255
+characters or equal to CATMAID's stable-join annotation `stable` aborts
+planning. When two members render the same name, for example `a/0000001.swc`
+and `b/0000001.swc`, planning aborts and the error names both members. Such
+archives imported cleanly before `annotations` existed; rename the files or
+split the archive to import them with annotations.
+
+The manifest gains an `annotations` column holding a JSON array of the rendered
+names. Manifests written before this column existed cannot be combined with new
+ones.
 
 Coordinates and non-sentinel radii use the same declared physical unit. An SWC
 radius of `-1` remains CATMAID's unknown-radius sentinel. Voxel and anisotropic
