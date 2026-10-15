@@ -2162,7 +2162,7 @@ def update_grid_cell(project_id, grid_id, w_i, h_i, d_i, cell_width,
     params['left'] = w_i * cell_width
     params['right'] = (w_i + 1) * cell_width
     params['top'] = h_i * cell_height
-    params['bottom'] = (h_i + 1) * cell_width
+    params['bottom'] = (h_i + 1) * cell_height
     params['z1'] = d_i * cell_depth
     params['z2'] = (d_i + 1) * cell_depth
 

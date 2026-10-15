@@ -4,7 +4,8 @@ This package provides non-interactive CATMAID SWC batch ingestion. It owns
 validation, deterministic
 batch planning, database ingestion, CATMAID materialization, cache creation,
 verification, and durable resume state. It does not download inputs, publish a
-project, or delete a failed project.
+project, or delete a failed project. Imports can append to an existing tracing
+project (including one that already has skeletons) or create a new hidden project.
 
 ## Interface
 
@@ -25,9 +26,11 @@ DJANGO_SETTINGS_MODULE=mysite.settings \
 catmaid-skeleton-import run --state-dir /staging/state
 ```
 
-After a successful import, `run` skips ingestion and cache creation but repeats
-bounded read-only verification. To cleanly rebuild the one importer-owned cache
-and then verify it again, use:
+After a successful import, `run` skips ingestion and repeats bounded verification.
+For an existing target it also refreshes and verifies the import's affected
+cache cells, recovering any interrupted refresh without duplicating skeletons.
+For a project created by this importer, cleanly
+rebuild its cache and verify it again with:
 
 ```bash
 catmaid-skeleton-import run \
@@ -44,7 +47,72 @@ and the unchanged local input files recorded there. Run the command from a
 CATMAID application environment where `mysite.settings` and the `catmaid`
 package are importable.
 
-The request schema is deliberately small:
+To append to an existing project, provide its numeric ID:
+
+```json
+{
+  "schema_version": 1,
+  "source": {
+    "archive_path": "/staging/skeletons.zip",
+    "coordinate_unit": "um"
+  },
+  "target": {
+    "project_id": 123
+  }
+}
+```
+
+The project does **not** need to be empty. Each SWC creates a new neuron and
+skeleton with fresh CATMAID IDs. Existing morphology, annotations, names,
+permissions, project visibility and stacks are retained. The target must
+already have CATMAID tracing setup; the importer does not repair its ontology.
+Coordinates must already use the project's physical coordinate frame. No
+translation, rotation or voxel-to-physical transformation is applied.
+
+`target` and `stack` are mutually exclusive. An existing-project request needs
+no stack geometry, creates no stack, and finishes with `status: "complete"`.
+Existing visibility remains in effect throughout the import, so users with
+access can see each batch after it commits. This is append-only: it does not
+replace or merge existing skeletons. A source-fragment identifier already in
+the target is rejected before any batch is loaded; use the original state
+directory to resume that import instead of starting it again. Imports using
+this tool serialize against other imports to the same target project.
+
+Append mode keeps CATMAID's normal database triggers enabled, maintaining
+edges, summaries and the normal cache invalidation workflow. After each batch
+commits, it synchronously refreshes only grid cells intersected by that batch's
+edges (including long edges and touched cell boundaries). Grid definitions,
+filters, LOD settings and enabled payload formats are retained. Each cell is
+recomputed from the whole project's current data, preserving existing skeletons
+in that cell; unrelated cells are untouched. Projects without grid caches need
+no cache work.
+
+Cell replacements use short individual transactions: readers can use the old
+payload until all replacement formats commit together. The project stays
+available for browsing and editing; new data can appear progressively as batches
+commit and their cells refresh. Database load can still slow other requests.
+Deploy the updated `catmaid_cache_update_worker` and restart existing worker
+processes before importing: it shares per-cell advisory locks with the importer,
+so worker refreshes cannot publish an older payload over a newer refresh.
+New invalidations received during a refresh are retained for another pass.
+
+Before recording `complete`, the importer verifies affected payload timestamps,
+formats/LOD counts and absence of pending dirty markers in one consistent,
+read-only database snapshot. It retries only cells
+that became stale; persistent invalidations or refresh failures leave the import
+incomplete and safe to resume with the same state directory. Resume rederives
+the affected scope from committed batches, so a crash between a database commit
+and its cache refresh cannot silently skip cache maintenance. Cache configuration
+changes during a run require a resume against the current configuration. Normal
+workers continue handling subsequent edits after verification.
+
+Final database checks cover this import's recorded
+IDs and exact node values, rather than expecting the entire project to contain
+only this import. `--rebuild-cache` is only supported for importer-created
+projects. Preserving normal triggers can make append mode slower than the
+dedicated-project bulk path.
+
+To create a new hidden project instead, omit `target` and supply `stack`:
 
 ```json
 {
@@ -206,9 +274,9 @@ again for each `run` and recorded with its metrics.
 ## Failure and resume contract
 
 Each skeleton stays inside one database batch. Core rows, the `model_of`
-relationship, fragment annotations and links, direct batch edge creation,
-canonical summary refresh, and validation commit
-or roll back together. A confirmed rollback is safe to retry with `run`, and
+relationship, fragment annotations and links, edges, summaries, and validation
+commit or roll back together. New projects use direct batch materialization;
+existing projects use normal CATMAID triggers. A confirmed rollback is safe to retry with `run`, and
 earlier committed batches remain untouched.
 
 The state is durably marked immediately before each COMMIT attempt. If the
@@ -217,8 +285,9 @@ Normal `run` calls then refuse every CATMAID mutation until an operator resolves
 the uncertainty. The importer does not guess, automatically reconcile, or
 automatically delete the project.
 
-The project remains hidden after successful verification. Publication is a
-separate caller/operator responsibility.
+A newly created project remains hidden after successful verification.
+Publication is a separate caller/operator responsibility. Existing targets
+retain their original visibility and permissions.
 
 ## Exit codes
 

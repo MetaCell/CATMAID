@@ -189,6 +189,7 @@ def preflight_database(
     *,
     executor_factory: Any | None = None,
     atomic_factory: Any | None = None,
+    require_replica_role: bool = True,
 ) -> dict[str, Any]:
     """Verify migrations, schema objects, functions, role, and target identity.
 
@@ -241,7 +242,14 @@ def preflight_database(
     except Exception as exc:
         raise DatabasePreflightError("CATMAID system user is unavailable") from exc
 
-    _check_replica_role(connection, atomic_factory)
+    if require_replica_role:
+        _check_replica_role(connection, atomic_factory)
+    else:
+        with connection.cursor() as cursor:
+            if _fetch_scalar(cursor, "SHOW session_replication_role") != "origin":
+                raise DatabasePreflightError(
+                    "Existing-project imports require enabled origin triggers"
+                )
     target = database_target_fingerprint(connection)
     try:
         from mysite.utils import get_version
@@ -258,7 +266,7 @@ def preflight_database(
         "objects": sorted(REQUIRED_TABLES + REQUIRED_SEQUENCES),
         "functions": sorted(REQUIRED_FUNCTIONS),
         "system_user_id": int(system_user.id),
-        "replica_role": True,
+        "replica_role": require_replica_role,
     }
 
 
@@ -387,3 +395,32 @@ def analyze_tables(
         for table in normalized:
             cursor.execute(f"ANALYZE {table}")
     return {"tables": list(normalized), "count": len(normalized)}
+
+
+@contextlib.contextmanager
+def existing_project_import_lock(project_id: int, connection: Any) -> Iterator[None]:
+    """Serialize cooperating importers for one target across batch commits."""
+    from .errors import RetryableError
+
+    lock_namespace = 0x4341544D  # CATM, a stable two-int advisory-lock namespace.
+    with connection.cursor() as cursor:
+        if not _fetch_scalar(
+            cursor, "SELECT pg_try_advisory_lock(%s, %s)", [lock_namespace, project_id]
+        ):
+            raise RetryableError(
+                f"Another skeleton import is using project {project_id}; retry later"
+            )
+    session = getattr(connection, "connection", connection)
+    try:
+        yield
+    finally:
+        # Do not reconnect just to unlock a lost session: PostgreSQL has already
+        # released that session's advisory locks. Never mask the import failure.
+        if getattr(connection, "connection", connection) is session:
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT pg_advisory_unlock(%s, %s)", [lock_namespace, project_id]
+                    )
+            except Exception:
+                connection.close()

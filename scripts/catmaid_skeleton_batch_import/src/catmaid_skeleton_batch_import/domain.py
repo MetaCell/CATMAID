@@ -12,9 +12,10 @@ class IngestionRequest:
     schema_version: int
     archive_path: Path
     coordinate_unit: str
-    dimension: tuple[int, int, int]
-    resolution_nm: tuple[float, float, float]
+    dimension: tuple[int, int, int] | None = None
+    resolution_nm: tuple[float, float, float] | None = None
     external_skeleton_id_map_path: Path | None = None
+    target_project_id: int | None = None
 
     @property
     def scale_nm(self) -> float:
@@ -22,6 +23,8 @@ class IngestionRequest:
 
     @property
     def max_nm(self) -> tuple[float, float, float]:
+        if self.dimension is None or self.resolution_nm is None:
+            raise ValueError("An existing-project request has no stack geometry")
         return tuple(
             float(dimension) * resolution
             for dimension, resolution in zip(self.dimension, self.resolution_nm)
@@ -36,14 +39,20 @@ class IngestionRequest:
             source["external_skeleton_id_map_path"] = str(
                 self.external_skeleton_id_map_path
             )
-        return {
+        result: dict[str, Any] = {
             "schema_version": self.schema_version,
             "source": source,
-            "stack": {
+        }
+        if self.target_project_id is not None:
+            result["target"] = {"project_id": self.target_project_id}
+        else:
+            if self.dimension is None or self.resolution_nm is None:
+                raise ValueError("A new-project request requires stack geometry")
+            result["stack"] = {
                 "dimension": list(self.dimension),
                 "resolution_nm": list(self.resolution_nm),
-            },
-        }
+            }
+        return result
 
 
 @dataclass(frozen=True)

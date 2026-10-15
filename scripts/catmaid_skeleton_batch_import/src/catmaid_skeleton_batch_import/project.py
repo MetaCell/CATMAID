@@ -196,3 +196,37 @@ def create_hidden_project(
         "annotated_with_relation_id": int(relation_map["annotated_with"]),
         "metadata": metadata,
     }
+
+
+def existing_project_context(
+    project_id: int, *, components: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve a configured tracing project without changing any of its data."""
+    components = components or _catmaid_components()
+    model = components["Project"]
+    if not model.objects.filter(pk=project_id).exists():
+        raise ProjectSetupError(f"Target project {project_id} does not exist")
+    if not components["check_tracing_setup"](project_id):
+        raise ProjectSetupError(f"Target project {project_id} has incomplete tracing setup")
+    classes = components["get_class_to_id_map"](
+        project_id, ("neuron", "skeleton", "annotation")
+    )
+    relations = components["get_relation_to_id_map"](
+        project_id, ("model_of", "annotated_with")
+    )
+    if not {"neuron", "skeleton", "annotation"}.issubset(classes) or not {
+        "model_of", "annotated_with"
+    }.issubset(relations):
+        raise ProjectSetupError(f"Target project {project_id} has incomplete tracing setup")
+    return {
+        "project_id": project_id,
+        "stack_id": None,
+        "project_stack_id": None,
+        "user_id": int(components["get_system_user"]().id),
+        "neuron_class_id": int(classes["neuron"]),
+        "skeleton_class_id": int(classes["skeleton"]),
+        "annotation_class_id": int(classes["annotation"]),
+        "model_of_relation_id": int(relations["model_of"]),
+        "annotated_with_relation_id": int(relations["annotated_with"]),
+        "existing_project": True,
+    }

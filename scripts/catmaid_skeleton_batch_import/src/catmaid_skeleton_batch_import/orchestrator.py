@@ -7,6 +7,7 @@ import math
 import sys
 import time
 import zipfile
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -27,6 +28,7 @@ from .config import (
 )
 from .domain import ImportSettings, IngestionRequest, PlannedBatch, PlannedMember, SwcNode
 from .errors import (
+    ImporterError,
     ImmutableStateError,
     InvalidInputError,
     OperatorAttentionError,
@@ -281,7 +283,9 @@ def _classified_runtime_error(
     return None
 
 
-def _database_context(store: StateStore, state: Mapping[str, Any]) -> tuple[Any, dict[str, Any]]:
+def _database_context(
+    store: StateStore, state: Mapping[str, Any], *, require_replica_role: bool = True,
+) -> tuple[Any, dict[str, Any]]:
     from .database import (
         DatabasePreflightError,
         bootstrap_django,
@@ -290,7 +294,10 @@ def _database_context(store: StateStore, state: Mapping[str, Any]) -> tuple[Any,
 
     try:
         connection = bootstrap_django()
-        current = {"schema_version": 1, **preflight_database(connection)}
+        current = {
+            "schema_version": 1,
+            **preflight_database(connection, require_replica_role=require_replica_role),
+        }
     except DatabasePreflightError as exc:
         raise InvalidInputError(f"CATMAID database preflight failed: {exc}") from exc
     except Exception as exc:
@@ -371,6 +378,8 @@ def _ensure_project(
     connection: Any,
     metrics: MetricsStore,
 ) -> ProjectContext:
+    if request.target_project_id is not None:
+        return _ensure_existing_project(store, request.target_project_id, metrics)
     project_status = state["project"]["status"]
     reservation = _project_reservation(store, state, connection, request)
 
@@ -471,6 +480,68 @@ def _ensure_project(
         row_counts={"project": 1, "stack": 1, "project_stack": 1},
     )
     return ProjectContext.from_dict(context_value)
+
+
+def _ensure_existing_project(
+    store: StateStore, project_id: int, metrics: MetricsStore,
+) -> ProjectContext:
+    from .project import ProjectSetupError, existing_project_context
+
+    try:
+        context = existing_project_context(project_id)
+    except ProjectSetupError as exc:
+        raise InvalidInputError(str(exc)) from exc
+    except Exception as exc:
+        classified = _classified_runtime_error(exc, context="existing project selection")
+        if classified is not None:
+            raise classified from exc
+        raise
+    state = store.load()
+    _write_registered_json(
+        store, "project_context", PROJECT_CONTEXT_FILENAME,
+        {"schema_version": 1, **context},
+    )
+    store.select_existing_project(project_id)
+    if state["project"]["status"] != "committed":
+        metrics.record_phase("existing_project_selection", duration_seconds=0.0)
+    return ProjectContext.from_dict(context)
+
+
+def _check_existing_fragment_conflicts(
+    store: StateStore, plan: ImportPlan, project: ProjectContext, connection: Any,
+) -> None:
+    """Reject provenance collisions before loading any batch; allow our resume IDs."""
+    from .fragments import fragment_annotation_name
+
+    state = store.load()
+    for batch in plan.batches:
+        batch_state = _batch_state(state, batch.index)
+        expected = {}
+        if batch_state["status"] == "committed":
+            ids = read_id_artifact(
+                store.state_dir, batch_state["artifacts"]["concept_ids"],
+                expected_count=batch.skeleton_count * 5,
+            )
+            expected = {
+                fragment_annotation_name(member.fragment_id): ids[i * 5 + 3]
+                for i, member in enumerate(batch.members)
+            }
+        names = [fragment_annotation_name(member.fragment_id) for member in batch.members]
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT id, name FROM class_instance WHERE project_id = %s "
+                "AND class_id = %s AND name = ANY(%s::text[])",
+                [project.project_id, project.annotation_class_id, names],
+            )
+            conflicts = [
+                name for identifier, name in cursor.fetchall()
+                if expected.get(name) != int(identifier)
+            ]
+        if conflicts:
+            raise InvalidInputError(
+                f"Source fragment identifiers already exist in project {project.project_id}: "
+                + ", ".join(sorted(set(conflicts))[:10])
+            )
 
 
 def _batch_state(state: Mapping[str, Any], index: int) -> Mapping[str, Any]:
@@ -975,6 +1046,7 @@ def _verify_database_by_batch(
     connection: Any,
     load_nodes: Callable[[PlannedMember], Sequence[SwcNode]],
     scale_nm: float,
+    request: IngestionRequest | None = None,
 ) -> dict[str, int]:
     """Verify exact rows with memory bounded by the planned batch size."""
 
@@ -984,6 +1056,7 @@ def _verify_database_by_batch(
     validated_batches = 0
     validated_skeletons = 0
     validated_nodes = 0
+    imported_counts: dict[str, int] = {}
     for batch in plan.batches:
         _progress(
             f"Verifying batch {batch.index}/{plan.batch_count}: "
@@ -1004,6 +1077,20 @@ def _verify_database_by_batch(
             location_ids=location_ids,
             connection=connection,
         )
+        if request is not None:
+            from .loader import verify_exact_treenodes
+            batch_state = _batch_state(state, batch.index)
+            concept_ids = read_id_artifact(
+                store.state_dir, batch_state["artifacts"]["concept_ids"],
+                expected_count=batch.skeleton_count * 5,
+            )
+            with prepare_copy_rows(
+                batch, request, project, concept_ids, location_ids, load_nodes
+            ) as prepared:
+                with connection.cursor() as cursor:
+                    verify_exact_treenodes(cursor, prepared)
+        for key, value in counts.items():
+            imported_counts[key] = imported_counts.get(key, 0) + value
         if (
             counts["skeleton_count"] != batch.skeleton_count
             or counts["treenode_count"] != batch.node_count
@@ -1030,6 +1117,10 @@ def _verify_database_by_batch(
             },
         )
 
+    if project.existing_project:
+        # Other skeletons, annotations and stacks belong to the target project,
+        # not this ingestion. Only our recorded IDs are authoritative here.
+        return imported_counts
     return verify_project_aggregate_counts(
         project_id=project.project_id,
         neuron_class_id=project.neuron_class_id,
@@ -1049,10 +1140,12 @@ def run_ingestion(
     rebuild_cache: bool = False,
 ) -> dict[str, object]:
     store = StateStore(state_dir)
-    with store.lock():
+    with store.lock(), ExitStack() as resources:
         state = store.block_on_uncertain_commit()
         state = store.verify_immutable()
         request = load_request(store.request_path)
+        if request.target_project_id is not None and rebuild_cache:
+            raise InvalidInputError("--rebuild-cache is only available for importer-created projects")
         operational_settings = load_operational_settings()
         settings = settings_from_state(state["settings"], operational_settings)
         plan_path = _artifact_path(store, state, "plan")
@@ -1084,11 +1177,29 @@ def run_ingestion(
         )
         _reconcile_completed_progress(metrics, state)
         metrics.set_status("in_progress")
-        connection, _preflight = _database_context(store, state)
+        connection, _preflight = _database_context(
+            store, state, require_replica_role=request.target_project_id is None,
+        )
+        if request.target_project_id is not None:
+            from .database import existing_project_import_lock
+            resources.enter_context(
+                existing_project_import_lock(request.target_project_id, connection)
+            )
         state = store.load()
         project = _ensure_project(
             store, state, request, settings, connection, metrics
         )
+        if project.existing_project:
+            _check_existing_fragment_conflicts(store, plan, project, connection)
+        append_cache = None
+        if project.existing_project:
+            from .append_cache import AppendCacheRefresh
+            store.prepare_append_cache_refresh()
+            append_cache = AppendCacheRefresh(
+                project.project_id, connection,
+                lock_timeout_ms=settings.lock_timeout_ms,
+                statement_timeout_ms=settings.statement_timeout_ms,
+            )
 
         with _RunArchive(request, settings) as archive:
             for batch in plan.batches:
@@ -1102,6 +1213,39 @@ def run_ingestion(
                     archive,
                     metrics,
                 )
+                if append_cache is not None:
+                    # Outside the batch transaction: cache failures never make a
+                    # committed batch eligible for reimport. Resume also visits
+                    # committed batches to recover interrupted cache refreshes.
+                    batch_state = _batch_state(store.load(), batch.index)
+                    location_ids = read_id_artifact(
+                        store.state_dir, batch_state["artifacts"]["location_ids"],
+                        expected_count=batch.node_count,
+                    )
+                    _progress(f"Refreshing affected cache cells for batch {batch.index}")
+                    cache_started = time.monotonic()
+                    try:
+                        append_cache.refresh_batch(list(location_ids))
+                    except BaseException as exc:
+                        metrics.record_phase(
+                            f"batch_{batch.index:06d}_cache",
+                            duration_seconds=time.monotonic() - cache_started,
+                            status="retryable", error=str(exc), batch_index=batch.index,
+                        )
+                        metrics.set_status("failed")
+                        if isinstance(exc, KeyboardInterrupt):
+                            raise RetryableError("Cache refresh interrupted; resume the committed batch") from exc
+                        if isinstance(exc, ImporterError):
+                            raise
+                        classified = _classified_runtime_error(exc, context="cache refresh")
+                        if classified is not None:
+                            raise classified from exc
+                        raise
+                    metrics.record_phase(
+                        f"batch_{batch.index:06d}_cache",
+                        duration_seconds=time.monotonic() - cache_started,
+                        batch_index=batch.index,
+                    )
 
         state = store.load()
         _combine_manifest(store, state)
@@ -1119,11 +1263,10 @@ def run_ingestion(
         if rebuild_cache:
             _progress("Invalidating cache and verification checkpoints")
             store.prepare_cache_rebuild()
-        _run_phase(
-            store,
-            metrics,
-            "cache",
-            lambda: build_grid_cache(
+        def build_cache() -> Mapping[str, Any]:
+            if append_cache is not None:
+                return append_cache.verify()
+            return build_grid_cache(
                 project_id=project.project_id,
                 dimension=request.dimension,
                 resolution_nm=request.resolution_nm,
@@ -1133,23 +1276,41 @@ def run_ingestion(
                 lod_strategy=settings.lod_strategy,
                 connection=connection,
                 log=_progress,
-            ),
+            )
+
+        _run_phase(
+            store,
+            metrics,
+            "cache",
+            build_cache,
         )
 
         state = store.load()
 
         def verify() -> Mapping[str, Any]:
-            project_result = verify_project_stack(
-                project_id=project.project_id,
-                stack_id=project.stack_id,
-                project_stack_id=project.project_stack_id,
-                system_user_id=project.user_id,
-                title=_project_title(state, request),
-                dimension=request.dimension,
-                resolution_nm=request.resolution_nm,
-                cache_cell_size_nm=settings.cache_cell_size_nm,
-                connection=connection,
-            )
+            if project.existing_project:
+                from .project import ProjectSetupError, existing_project_context
+                try:
+                    current_project = ProjectContext.from_dict(
+                        existing_project_context(project.project_id)
+                    )
+                except ProjectSetupError as exc:
+                    raise VerificationError(str(exc)) from exc
+                if current_project != project:
+                    raise VerificationError("Existing project tracing context changed during import")
+                project_result = {"project_id": project.project_id, "existing_project": True}
+            else:
+                project_result = verify_project_stack(
+                    project_id=project.project_id,
+                    stack_id=project.stack_id,
+                    project_stack_id=project.project_stack_id,
+                    system_user_id=project.user_id,
+                    title=_project_title(state, request),
+                    dimension=request.dimension,
+                    resolution_nm=request.resolution_nm,
+                    cache_cell_size_nm=settings.cache_cell_size_nm,
+                    connection=connection,
+                )
             with _RunArchive(request, settings) as verification_archive:
                 database_result = _verify_database_by_batch(
                     store,
@@ -1159,18 +1320,22 @@ def run_ingestion(
                     connection,
                     verification_archive.load,
                     request.scale_nm,
+                    request=request,
                 )
-            cache_result = verify_cache(
-                project_id=project.project_id,
-                dimension=request.dimension,
-                resolution_nm=request.resolution_nm,
-                expected_node_count=plan.total_nodes,
-                cache_cell_size_nm=settings.cache_cell_size_nm,
-                lod_levels=settings.lod_levels,
-                lod_bucket_size=settings.lod_bucket_size,
-                lod_strategy=settings.lod_strategy,
-                connection=connection,
-            )
+            if append_cache is not None:
+                cache_result = append_cache.verify()
+            else:
+                cache_result = verify_cache(
+                    project_id=project.project_id,
+                    dimension=request.dimension,
+                    resolution_nm=request.resolution_nm,
+                    expected_node_count=plan.total_nodes,
+                    cache_cell_size_nm=settings.cache_cell_size_nm,
+                    lod_levels=settings.lod_levels,
+                    lod_bucket_size=settings.lod_bucket_size,
+                    lod_strategy=settings.lod_strategy,
+                    connection=connection,
+                )
             result = {
                 "project": project_result,
                 "database": database_result,
@@ -1183,11 +1348,13 @@ def run_ingestion(
                 VERIFICATION_FILENAME,
                 verification_value,
             )
-            return {
+            counts = {
                 "skeletons": plan.member_count,
                 "nodes": plan.total_nodes,
-                "cache_cells": result["cache"]["cell_count"],
             }
+            if not project.existing_project:
+                counts["cache_cells"] = result["cache"]["cell_count"]
+            return counts
 
         _run_phase(
             store,
@@ -1205,6 +1372,7 @@ def run_ingestion(
             status=state["status"],
             project_id=project.project_id,
             stack_id=project.stack_id,
+            existing_project=project.existing_project,
             batches=plan.batch_count,
             skeletons=plan.member_count,
             nodes=plan.total_nodes,

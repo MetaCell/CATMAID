@@ -432,10 +432,10 @@ def validate_batch(
             """
             SELECT id, project_id, user_id, editor_id, skeleton_id, parent_id
             FROM treenode
-            WHERE id = ANY(%s::bigint[])
+            WHERE id = ANY(%s::bigint[]) OR skeleton_id = ANY(%s::bigint[])
             ORDER BY id
             """,
-            (list(normalized_locations),),
+            (list(normalized_locations), list(skeleton_ids)),
         )
         treenode_rows = cursor.fetchall()
 

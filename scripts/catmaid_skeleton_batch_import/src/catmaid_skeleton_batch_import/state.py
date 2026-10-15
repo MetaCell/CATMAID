@@ -639,6 +639,23 @@ class StateStore:
     def mark_project_committed(self) -> dict[str, Any]:
         return self.transition_project("committed")
 
+    def select_existing_project(self, project_id: int) -> dict[str, Any]:
+        """Checkpoint a read-only project selection, without a COMMIT window."""
+        request = load_json(self.request_path)
+        if request.get("target", {}).get("project_id") != project_id:
+            raise ImmutableStateError("Existing project does not match the planned target")
+
+        def mutate(state: dict[str, Any]) -> None:
+            project = state["project"]
+            if project["status"] not in {"planned", "committed"}:
+                raise ImmutableStateError("Cannot replace a project creation in progress")
+            self._set_immutable_id(project, "project_id", project_id)
+            project["mode"] = "existing"
+            project["status"] = "committed"
+            self._derive_status(state)
+
+        return self._mutate(mutate)
+
     def mark_project_retryable(
         self, reason: str, *, confirmed_rollback: bool = False
     ) -> dict[str, Any]:
@@ -768,6 +785,18 @@ class StateStore:
 
     def mark_phase_retryable(self, phase: str, reason: str) -> dict[str, Any]:
         return self.transition_phase(phase, "retryable", reason=reason)
+
+    def prepare_append_cache_refresh(self) -> dict[str, Any]:
+        """Recheck a live project's cache on every run, including completed resumes."""
+        def mutate(state: dict[str, Any]) -> None:
+            if state["project"].get("mode") != "existing":
+                raise ImmutableStateError("Incremental refresh requires an existing project")
+            state["phases"]["cache"] = {"status": "pending"}
+            state["phases"]["verification"] = {"status": "pending"}
+            state["artifacts"].pop("verification", None)
+            self._derive_status(state)
+
+        return self._mutate(mutate)
 
     def prepare_cache_rebuild(self) -> dict[str, Any]:
         """Invalidate only cache/verification checkpoints for an explicit rebuild."""
@@ -1130,7 +1159,10 @@ class StateStore:
             return
         state["status"] = "cache_complete"
         if state["phases"]["verification"]["status"] == "complete":
-            state["status"] = "ready_for_publication"
+            state["status"] = (
+                "complete" if state["project"].get("mode") == "existing"
+                else "ready_for_publication"
+            )
 
 
 @contextlib.contextmanager

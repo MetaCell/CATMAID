@@ -90,13 +90,36 @@ def load_request(path: Path) -> IngestionRequest:
 
     if not isinstance(raw, dict):
         raise InvalidInputError("request must be a JSON object")
-    _expect_keys(raw, {"schema_version", "source", "stack"}, "request")
+    if "target" in raw:
+        _expect_keys(raw, {"schema_version", "source", "target"}, "request")
+        target = raw["target"]
+        if not isinstance(target, dict):
+            raise InvalidInputError("request.target must be an object")
+        _expect_keys(target, {"project_id"}, "request.target")
+        project_id = target["project_id"]
+        if (isinstance(project_id, bool) or not isinstance(project_id, int)
+                or not 0 < project_id <= 2_147_483_647):
+            raise InvalidInputError(
+                "request.target.project_id must be a positive integer no greater than 2147483647"
+            )
+        dimension = None
+        resolution_nm = None
+    else:
+        _expect_keys(raw, {"schema_version", "source", "stack"}, "request")
+        project_id = None
+        if not isinstance(raw["stack"], dict):
+            raise InvalidInputError("request.stack must be an object")
+        _expect_keys(raw["stack"], {"dimension", "resolution_nm"}, "request.stack")
+        dimension = _positive_int_tuple(
+            raw["stack"]["dimension"], "request.stack.dimension"
+        )
+        resolution_nm = _positive_number_tuple(
+            raw["stack"]["resolution_nm"], "request.stack.resolution_nm"
+        )
     if raw["schema_version"] != 1:
         raise InvalidInputError("request.schema_version must be 1")
     if not isinstance(raw["source"], dict):
         raise InvalidInputError("request.source must be an object")
-    if not isinstance(raw["stack"], dict):
-        raise InvalidInputError("request.stack must be an object")
 
     source = raw["source"]
     required_source = {"archive_path", "coordinate_unit"}
@@ -113,7 +136,6 @@ def load_request(path: Path) -> IngestionRequest:
             "request.source is missing required fields: "
             + ", ".join(sorted(missing_source))
         )
-    _expect_keys(raw["stack"], {"dimension", "resolution_nm"}, "request.stack")
 
     archive_value = source["archive_path"]
     if not isinstance(archive_value, str) or not archive_value.strip():
@@ -137,11 +159,10 @@ def load_request(path: Path) -> IngestionRequest:
         schema_version=1,
         archive_path=archive_path,
         coordinate_unit=unit,
-        dimension=_positive_int_tuple(raw["stack"]["dimension"], "request.stack.dimension"),
-        resolution_nm=_positive_number_tuple(
-            raw["stack"]["resolution_nm"], "request.stack.resolution_nm"
-        ),
+        dimension=dimension,
+        resolution_nm=resolution_nm,
         external_skeleton_id_map_path=mapping_path,
+        target_project_id=project_id,
     )
 
 

@@ -18,22 +18,27 @@ from .fragments import fragment_annotation_name
 @dataclass(frozen=True)
 class ProjectContext:
     project_id: int
-    stack_id: int
-    project_stack_id: int
+    stack_id: int | None
+    project_stack_id: int | None
     user_id: int
     neuron_class_id: int
     skeleton_class_id: int
     model_of_relation_id: int
     annotation_class_id: int
     annotated_with_relation_id: int
+    existing_project: bool = False
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> "ProjectContext":
-        return cls(**{field: int(value[field]) for field in cls.__dataclass_fields__})
+        fields = {
+            field: None if value[field] is None else int(value[field])
+            for field in cls.__dataclass_fields__ if field != "existing_project"
+        }
+        return cls(**fields, existing_project=bool(value.get("existing_project", False)))
 
-    def to_dict(self) -> dict[str, int]:
+    def to_dict(self) -> dict[str, int | bool | None]:
         return {
-            field: int(getattr(self, field))
+            field: getattr(self, field)
             for field in self.__dataclass_fields__
         }
 
@@ -417,7 +422,7 @@ def execute_batch_transaction(
     """
     from django.db import connection, transaction
 
-    from .materialization import materialize_and_verify_batch
+    from .materialization import materialize_and_verify_batch, validate_batch
 
     timings = record_timing or (lambda _name, _duration, _counts: None)
     counts = {
@@ -435,7 +440,14 @@ def execute_batch_transaction(
                 "set_config('lock_timeout', %s, true)",
                 [str(settings.statement_timeout_ms), str(settings.lock_timeout_ms)],
             )
-            cursor.execute("SET LOCAL session_replication_role = replica")
+            if project.existing_project:
+                # Append through CATMAID's normal triggers. They maintain all
+                # configured caches, edges, summaries and other shared state.
+                cursor.execute(
+                    "SELECT set_config('catmaid.user_id', %s, true)", [str(project.user_id)]
+                )
+            else:
+                cursor.execute("SET LOCAL session_replication_role = replica")
             copy_start = time.monotonic()
             _copy_file(
                 cursor,
@@ -461,10 +473,10 @@ def execute_batch_transaction(
                 prepared.treenode_file,
             )
             timings("copy", time.monotonic() - copy_start, counts)
-            cursor.execute("SET LOCAL session_replication_role = origin")
+            if not project.existing_project:
+                cursor.execute("SET LOCAL session_replication_role = origin")
 
-            materialized = materialize_and_verify_batch(
-                cursor=cursor,
+            validation_arguments = dict(
                 project_id=project.project_id,
                 user_id=project.user_id,
                 neuron_class_id=project.neuron_class_id,
@@ -472,16 +484,21 @@ def execute_batch_transaction(
                 model_of_relation_id=project.model_of_relation_id,
                 annotation_class_id=project.annotation_class_id,
                 annotated_with_relation_id=project.annotated_with_relation_id,
-                expected_skeletons=[
+                skeletons=[
                     expected.to_validation_dict()
                     for expected in prepared.expected_skeletons
                 ],
                 location_ids=list(prepared.location_ids),
-                treenode_file=prepared.treenode_file,
-                record_timing=lambda name, duration: timings(
-                    name, duration, counts
-                ),
             )
+            if project.existing_project:
+                materialized = validate_batch(connection=connection, **validation_arguments)
+            else:
+                materialized = materialize_and_verify_batch(
+                    cursor=cursor,
+                    treenode_file=prepared.treenode_file,
+                    record_timing=lambda name, duration: timings(name, duration, counts),
+                    **validation_arguments,
+                )
             exact_validation_start = time.monotonic()
             verify_exact_treenodes(cursor, prepared)
             timings(
