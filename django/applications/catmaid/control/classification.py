@@ -24,6 +24,10 @@ from catmaid.control.common import get_class_to_id_map, \
 from catmaid.control.ontology import get_class_links_qs, get_features
 from catmaid.control.authentication import requires_user_role
 from catmaid.control.roi import link_roi_to_class_instance
+from catmaid.source_fragments import (
+    reject_reserved_annotation_names, reject_reserved_annotations,
+    reject_reserved_annotation_rename,
+)
 from catmaid.models import Class, ClassClass, ClassInstance, \
         ClassInstanceClassInstance, Relation, UserRole, Project, Restriction, \
         CardinalityRestriction, RegionOfInterestClassInstance, ProjectStack
@@ -379,6 +383,8 @@ def remove_classification_graph(request:HttpRequest, workspace_pid, project_id=N
         relation__relation_name='is_a', class_b__class_name='classification_root')
     if root_links_q.count() == 0:
         raise Exception("The link provided doesn't refer to a 'classification_root' derived instance.")
+
+    _reject_reserved_classification_subtree(graph_ci.id)
 
     # Collect some statistics
     num_removed_links = 0
@@ -822,6 +828,21 @@ def list_classification_graph(request:HttpRequest, workspace_pid, project_id=Non
     except Exception as e:
         raise Exception(response_on_error + ':' + str(e))
 
+def _reject_reserved_classification_subtree(root_id):
+    """Preflight the complete manual subtree deletion before deleting any node."""
+    visited = set()
+    pending = {root_id}
+    while pending:
+        nodes = list(ClassInstance.objects.select_related('class_column').filter(
+                id__in=pending))
+        for node in nodes:
+            reject_reserved_annotation_rename(node, node.name)
+        visited.update(pending)
+        pending = set(ClassInstanceClassInstance.objects.filter(
+                class_instance_b_id__in=pending).values_list(
+                    'class_instance_a_id', flat=True)) - visited
+
+
 @requires_user_role(UserRole.Annotate)
 def classification_instance_operation(request:HttpRequest, workspace_pid=None, project_id=None) -> JsonResponse:
     workspace_pid = int(workspace_pid)
@@ -841,6 +862,24 @@ def classification_instance_operation(request:HttpRequest, workspace_pid=None, p
     # We avoid many try/except clauses by setting this string to be the
     # response we return if an exception is thrown.
     classification_instance_operation.res_on_err = ''
+
+    # Validate reserved annotation objects before the dispatcher can write or
+    # wrap permission failures in its generic error response.
+    if params['operation'] == 'create_node':
+        node_class = Class.objects.filter(pk=params['classid']).first()
+        if node_class and node_class.class_name == 'annotation':
+            reject_reserved_annotation_names([params['objname']])
+        reject_reserved_annotations(workspace_pid, [params['parentid']])
+    elif params['operation'] in ('rename_node', 'remove_node'):
+        node = ClassInstance.objects.select_related('class_column').filter(
+                pk=params['id']).first()
+        if node:
+            if params['operation'] == 'rename_node':
+                reject_reserved_annotation_rename(node, params['title'])
+            elif params['rel'] == 'element':
+                _reject_reserved_classification_subtree(node.id)
+            else:
+                reject_reserved_annotation_rename(node, node.name)
 
     def create_node() -> JsonResponse:
         """ Creates a new node.

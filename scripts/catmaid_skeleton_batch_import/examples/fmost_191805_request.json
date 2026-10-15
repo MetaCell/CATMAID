@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "source": {
+    "archive_path": "/staging/191805.zip",
+    "coordinate_unit": "um"
+  },
+  "stack": {
+    "dimension": [17797, 30801, 10826],
+    "resolution_nm": [350, 350, 1000]
+  }
+}
