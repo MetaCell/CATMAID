@@ -20,6 +20,8 @@ from catmaid.control.common import insert_into_log, get_request_list, \
 from catmaid.models import UserRole, Project, Class, ClassInstance, \
         ClassInstanceClassInstance, Relation, Treenode
 
+from catmaid.source_fragments import reject_reserved_annotation_rename
+
 from rest_framework.decorators import api_view
 
 User = get_user_model()
@@ -156,6 +158,10 @@ def delete_neuron(request:HttpRequest, project_id=None, neuron_id=None) -> JsonR
 
 
 def _delete_neuron_as_user(user, project_id, neuron_id):
+    candidate = get_object_or_404(ClassInstance.objects.select_related('class_column'),
+            pk=neuron_id)
+    # This generic endpoint must not delete a reserved annotation passed as a neuron.
+    reject_reserved_annotation_rename(candidate, candidate.name)
     # Make sure the user can edit the neuron in general
     can_edit_class_instance_or_fail(user, neuron_id, 'neuron')
 
@@ -339,6 +345,7 @@ def rename_neuron(request:HttpRequest, project_id=None, neuron_id=None) -> JsonR
 
     # Update neuron name
     neuron = ClassInstance.objects.get(id=neuron_id)
+    reject_reserved_annotation_rename(neuron, new_name)
     old_name = neuron.name
     neuron.name=new_name
     neuron.save()
@@ -388,6 +395,11 @@ def rename_neurons(request:HttpRequest, project_id=None) -> JsonResponse:
         raise ValueError('Need at least one neuron ID / name mapping')
     neuron_ids = [int(k) for k, _ in neuron_name_pairs]
     neuron_names = [v for _, v in neuron_name_pairs]
+    candidates = ClassInstance.objects.select_related('class_column').in_bulk(neuron_ids)
+    for neuron_id, new_name in zip(neuron_ids, neuron_names):
+        candidate = candidates.get(neuron_id)
+        if candidate is not None:
+            reject_reserved_annotation_rename(candidate, new_name)
 
     # Make sure the user can edit the neuron
     can_edit_all_or_fail(request.user, neuron_ids, 'class_instance')

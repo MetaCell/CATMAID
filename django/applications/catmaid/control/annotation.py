@@ -15,6 +15,10 @@ from rest_framework.decorators import api_view
 from catmaid.models import UserRole, Project, Class, ClassInstance, \
         ClassInstanceClassInstance, Relation, ReviewerWhitelist
 from catmaid.control.authentication import requires_user_role, can_edit_or_fail
+from catmaid.source_fragments import (
+    SOURCE_FRAGMENT_ANNOTATION_PREFIX, is_source_fragment_annotation_name,
+    reject_reserved_annotation_names, reject_reserved_annotations,
+)
 from catmaid.control.common import (get_relation_to_id_map,
         get_class_to_id_map, get_request_bool, get_request_list)
 
@@ -68,10 +72,12 @@ def get_annotated_entities(project_id:Union[int,str], params, relations=None, cl
     annotation_sets_to_expand:Set[FrozenSet] = set()
 
     # Get name, annotator and time constraints, if available
-    name = params.get('name', "").strip()
+    raw_name = params.get('name', "")
     name_not = get_request_bool(params, 'name_not', False)
     name_exact = get_request_bool(params, 'name_exact', False)
     name_case_sensitive = get_request_bool(params, 'name_case_sensitive', False)
+    literal_name = name_exact and name_case_sensitive
+    name = raw_name if literal_name else raw_name.strip()
     try:
         annotator_ids = set(map(int, params.getlist('annotated_by')))
     except AttributeError as e:
@@ -148,26 +154,32 @@ def get_annotated_entities(project_id:Union[int,str], params, relations=None, cl
     # if possible. This is mainly useful for exact name queries, both
     # case-sensitive and case insensitive as well as regex and normal.
     if name:
-        is_regex = name.startswith('/')
-        if is_regex:
-            op = '~' if name_case_sensitive else '~*'
-            upper_name_op = '~'
-            params["name"] = name[1:]
-        else:
-            op = '~~' if name_case_sensitive else '~~*'
-            upper_name_op = '~~'
-            # LIKE (~~) and ILIKE (~~*) treat _ and % as wildcards, therefore
-            # they need to be escaped in the input.
-            name = name.replace('_', '\\_').replace('%', '\\%')
-
-            params["name"] = name if name_exact else ('%' + name + '%')
-
-        if name_not:
-            filters.append(f"ci.name !{op} %(name)s")
-            filters.append(f"upper(ci.name) !{upper_name_op} upper(%(name)s)")
-        else:
+        if literal_name:
+            # Exact lookup treats whitespace and LIKE/regex syntax as literal data.
+            params["name"] = name
+            op = '<>' if name_not else '='
             filters.append(f"ci.name {op} %(name)s")
-            filters.append(f"upper(ci.name) {upper_name_op} upper(%(name)s)")
+        else:
+            is_regex = name.startswith('/')
+            if is_regex:
+                op = '~' if name_case_sensitive else '~*'
+                upper_name_op = '~'
+                params["name"] = name[1:]
+            else:
+                op = '~~' if name_case_sensitive else '~~*'
+                upper_name_op = '~~'
+                # LIKE (~~) and ILIKE (~~*) treat _ and % as wildcards, therefore
+                # they need to be escaped in the input.
+                name = name.replace('_', '\\_').replace('%', '\\%')
+
+                params["name"] = name if name_exact else ('%' + name + '%')
+
+            if name_not:
+                filters.append(f"ci.name !{op} %(name)s")
+                filters.append(f"upper(ci.name) !{upper_name_op} upper(%(name)s)")
+            else:
+                filters.append(f"ci.name {op} %(name)s")
+                filters.append(f"upper(ci.name) {upper_name_op} upper(%(name)s)")
 
     # Map annotation sets to their expanded sub-annotations
     sub_annotation_ids = get_sub_annotation_ids(project_id, annotation_sets_to_expand,
@@ -477,7 +489,8 @@ def query_annotated_classinstances(request:HttpRequest, project_id:Optional[Unio
       - name: name_exact
         description: |
             Whether the name has to match exactly or can be a part of the result
-            name. This is typically faster than using a regular expression.
+            name. With name_case_sensitive enabled this is a literal equality
+            comparison, including whitespace and any pattern characters.
             False by default.
         type: bool
         paramType: form
@@ -675,7 +688,8 @@ def query_annotated_classinstances(request:HttpRequest, project_id:Optional[Unio
 
 
 def _update_neuron_annotations(project_id:Union[int,str], neuron_id,
-        annotation_map:Dict[str,Any], losing_neuron_id=None) -> None:
+        annotation_map:Dict[str,Any], losing_neuron_id=None,
+        allow_reserved=False) -> None:
     """ Ensure that the neuron is annotated_with only the annotations given.
     These annotations are expected to come as dictionary of annotation name
     versus annotator ID.
@@ -683,7 +697,18 @@ def _update_neuron_annotations(project_id:Union[int,str], neuron_id,
     If losing_neuron_id is provided, annotations missing on the neuron that
     exist for the losing neuron will be updated to refer to neuon_id, rather
     than created from scratch. This preserves provenance such as creation times.
+    allow_reserved is private to trusted structural operations, not request data.
     """
+    if not allow_reserved:
+        reject_reserved_annotation_names(annotation_map)
+        reject_reserved_annotations(project_id, [neuron_id])
+        existing_reserved = ClassInstanceClassInstance.objects.filter(
+            project_id=project_id, class_instance_a_id=neuron_id,
+            relation__relation_name='annotated_with',
+            class_instance_b__class_column__class_name='annotation',
+            class_instance_b__name__startswith=SOURCE_FRAGMENT_ANNOTATION_PREFIX,
+        ).values_list('class_instance_b__name', flat=True)
+        reject_reserved_annotation_names(existing_reserved)
     annotated_with = Relation.objects.get(project_id=project_id,
             relation_name='annotated_with')
 
@@ -726,7 +751,8 @@ def _update_neuron_annotations(project_id:Union[int,str], neuron_id,
             missing = missing - losing_missing
 
     missing_map = {k:v for k,v in annotation_map.items() if k in missing}
-    _annotate_entities(project_id, [neuron_id], missing_map)
+    _annotate_entities(project_id, [neuron_id], missing_map,
+            allow_reserved=allow_reserved)
 
     to_delete = existing - update
     to_delete_ids = tuple(link['annotation_id'] for name, link in existing_annotations.items() \
@@ -786,7 +812,7 @@ def delete_annotation_if_unused(project, annotation, relation) -> Tuple[bool, in
         return True, 0
 
 def _annotate_entities(project_id:Union[int,str], entity_ids, annotation_map:Dict[str,Any],
-        update_existing=False) -> Tuple[Dict,Set,Set]:
+        update_existing=False, allow_reserved=False) -> Tuple[Dict,Set,Set]:
     """ Annotate the entities with the given <entity_ids> with the given
     annotations. These annotations are expected to come as dictionary of
     annotation name versus an object with at least the field 'user_id'
@@ -794,8 +820,13 @@ def _annotate_entities(project_id:Union[int,str], entity_ids, annotation_map:Dic
     available, they will be used for the respective columns. A listof all
     annotation class instances that have been used is returned. Annotation
     names can contain the counting pattern {nX} with X being a number. This
-    will add an incrementing number starting from X for each entity.
+    will add an incrementing number starting from X for each entity. Reserved
+    source-fragment names remain literal. allow_reserved is only for trusted
+    structural operations transferring server-derived provenance.
     """
+    if not allow_reserved:
+        reject_reserved_annotation_names(annotation_map)
+        reject_reserved_annotations(project_id, entity_ids)
     new_annotations = set()
     existing_annotations = set()
     r = Relation.objects.get(project_id = project_id,
@@ -809,11 +840,13 @@ def _annotate_entities(project_id:Union[int,str], entity_ids, annotation_map:Dic
     counting_pattern = re.compile(r"(\{n(\d+)\})")
     for annotation, meta in annotation_map.items():
         # Look for patterns, replace all {n} with {n1} to normalize
-        annotation = annotation.replace("{n}", "{n1}")
+        reserved = is_source_fragment_annotation_name(annotation)
+        if not reserved:
+            annotation = annotation.replace("{n}", "{n1}")
         # Find all {nX} in the annotation name
         expanded_annotations = {}
 
-        if counting_pattern.search(annotation):
+        if not reserved and counting_pattern.search(annotation):
             # Create annotation names based on the counting patterns found, for
             # each entitiy.
             for i, eid in enumerate(entity_ids):
@@ -872,6 +905,11 @@ def _annotate_entities(project_id:Union[int,str], entity_ids, annotation_map:Dic
     return annotation_objects, new_annotations, existing_annotations
 
 def _annotate_entities_with_name(project_id:Union[int,str], user_id, entity_ids) -> Tuple[List[List[Any]], List[List[Any]]]:
+    reject_reserved_annotations(project_id, entity_ids)
+    entity_name_map = dict(ClassInstance.objects.filter(
+            project_id=project_id, pk__in=entity_ids).values_list('id', 'name'))
+    entity_names = set(entity_name_map.values())
+    reject_reserved_annotation_names(entity_names)
     cursor = connection.cursor()
 
     annotated_with = Relation.objects.get(project_id=project_id,
@@ -884,10 +922,6 @@ def _annotate_entities_with_name(project_id:Union[int,str], user_id, entity_ids)
                 class_column=annotation_class, name='Name', defaults={
                     'user_id': user_id,
                 })
-
-    entity_name_map = dict(ClassInstance.objects.filter(
-            pk__in=entity_ids).values_list('id', 'name'))
-    entity_names = set(entity_name_map.values())
 
     existing_name_annotations = dict(ClassInstance.objects.filter(
             project_id=project_id, class_column=annotation_class,
@@ -976,6 +1010,7 @@ def annotate_entities(request:HttpRequest, project_id = None) -> JsonResponse:
 
     annotations = get_request_list(request.POST, 'annotations', [])
     meta_annotations = get_request_list(request.POST, 'meta_annotations', [])
+    reject_reserved_annotation_names(annotations + meta_annotations)
     entity_ids = get_request_list(request.POST, 'entity_ids', [], map_fn=int)
     skeleton_ids = get_request_list(request.POST, 'skeleton_ids', [], map_fn=int)
 
@@ -1084,6 +1119,9 @@ def remove_annotations(request:HttpRequest, project_id=None) -> JsonResponse:
     if not entity_ids:
         raise ValueError("No entity IDs provided")
 
+    reject_reserved_annotations(project_id, annotation_ids)
+    reject_reserved_annotations(project_id, entity_ids)
+
     # Remove individual annotations
     deleted_annotations = {}
     deleted_links = []
@@ -1151,6 +1189,8 @@ def _remove_annotation(user, project_id:Union[int,str], entity_ids, annotation_i
     (because it wasn't used anymore) and how many uses of this annotation are
     left.
     """
+    reject_reserved_annotations(project_id, [annotation_id])
+    reject_reserved_annotations(project_id, entity_ids)
     p = get_object_or_404(Project, pk=project_id)
     relations = dict(Relation.objects.filter(
         project_id=project_id).values_list('relation_name', 'id'))
@@ -1196,6 +1236,8 @@ def replace_annotations(request:HttpRequest, project_id=None) -> JsonResponse:
     to_remove = set(get_request_list(request.POST, 'to_remove', []))
     to_add = set(get_request_list(request.POST, 'to_add', []))
     target_ids = get_request_list(request.POST, 'target_ids', [], map_fn=int)
+    reject_reserved_annotation_names(to_remove.union(to_add))
+    reject_reserved_annotations(project_id, target_ids)
 
     cursor = connection.cursor()
     classes = get_class_to_id_map(project_id, ('annotation',), cursor)
@@ -1864,7 +1906,7 @@ def annotations_for_skeleton(project_id:Union[int,str], skeleton_id, relations=N
 
 
 def clear_annotations(project_id:Union[int,str], skeleton_id, relations=None, classes=None) -> List[int]:
-    """Remove all annotations from a skeleton.
+    """Remove editable annotations from a skeleton, retaining source provenance.
     """
     if not relations:
         relations = get_relation_to_id_map(project_id)
@@ -1882,6 +1924,7 @@ def clear_annotations(project_id:Union[int,str], skeleton_id, relations=None, cl
             AND skeleton.id = skeleton_neuron.class_instance_a
             AND cici.project_id = %(project_id)s
             AND a.class_id = %(annotation_class)s
+            AND a.name NOT LIKE %(source_fragment_pattern)s
             AND cici.relation_id = %(annotated_with_rel)s
             AND neuron.class_id = %(neuron_class)s
             AND skeleton_neuron.relation_id =  %(model_of_rel)s
@@ -1890,6 +1933,7 @@ def clear_annotations(project_id:Union[int,str], skeleton_id, relations=None, cl
     """, {
         'project_id': project_id,
         'annotation_class': classes['annotation'],
+        'source_fragment_pattern': SOURCE_FRAGMENT_ANNOTATION_PREFIX + '%',
         'annotated_with_rel': relations['annotated_with'],
         'neuron_class': classes['neuron'],
         'model_of_rel': relations['model_of'],

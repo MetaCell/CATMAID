@@ -6,3 +6,10 @@ sphinx-doc/build/*
 .vagrant/
 data/
 temp/
+
+# Local importer build and test artifacts are not runtime inputs.
+**/__pycache__/
+**/.pytest_cache/
+.hypothesis/
+scripts/catmaid_skeleton_batch_import/build/
+scripts/catmaid_skeleton_batch_import/src/*.egg-info/
