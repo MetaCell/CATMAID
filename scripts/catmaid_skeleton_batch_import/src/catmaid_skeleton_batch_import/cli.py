@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--rebuild-cache",
         action="store_true",
-        help="rebuild the cache of an importer-created project and rerun verification",
+        help="rebuild the target project's grid payloads and rerun verification (layer must be inactive)",
     )
     return parser
 

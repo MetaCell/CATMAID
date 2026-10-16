@@ -313,39 +313,6 @@ def test_batch_validation_detects_edge_parent_mismatch():
         )
 
 
-@pytest.mark.parametrize("lod_options", [{}, {"lod_levels": 7}])
-def test_grid_cache_is_clean_single_xy_msgpack_and_outside_atomic(lod_options):
-    calls = []
-    connection = ScriptedConnection(in_atomic_block=False)
-    result = cache.build_grid_cache(
-        project_id=1,
-        dimension=(10, 20, 30),
-        resolution_nm=(4, 5, 6),
-        connection=connection,
-        update_grid=lambda *args, **kwargs: calls.append((args, kwargs)),
-        **lod_options,
-    )
-
-    args, kwargs = calls[0]
-    assert args == (1, "msgpack", ["xy"])
-    assert kwargs["delete"] is True
-    assert kwargs["node_limit"] is None
-    assert kwargs["lod_levels"] == lod_options.get("lod_levels", 1)
-    assert kwargs["bb_limits"] == [[0.0, 0.0, 0.0], [40.0, 100.0, 180.0]]
-    assert result["node_limit"] == 0
-    assert result["lod_levels"] == lod_options.get("lod_levels", 1)
-
-    connection.in_atomic_block = True
-    with pytest.raises(RuntimeError, match="outside"):
-        cache.build_grid_cache(
-            project_id=1,
-            dimension=(10, 20, 30),
-            resolution_nm=(4, 5, 6),
-            connection=connection,
-            update_grid=lambda *_args, **_kwargs: None,
-        )
-
-
 def test_final_project_stack_verification_checks_hidden_one_profile_project():
     metadata = project.build_stack_metadata()
     connection = ScriptedConnection(

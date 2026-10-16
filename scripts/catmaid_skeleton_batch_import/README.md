@@ -6,6 +6,13 @@ batch planning, database ingestion, CATMAID materialization, cache creation,
 verification, and durable resume state. It does not download inputs, publish a
 project, or delete a failed project. Imports can append to an existing tracing
 project (including one that already has skeletons) or create a new hidden project.
+Both use the same offline bulk ingestion path. Before running an import, make the
+managed layer **inactive in Neuroglass** and keep it inactive until all data and
+cache verification succeeds. Layer activation is an operator action; this script
+does not call Neuroglass or change CATMAID permissions. The CATMAID web service
+can remain running, but no other client, administrator or background job may edit
+the target project's morphology or cache configuration during the import.
+Deactivating one viewer's layer alone does not block other writers.
 
 ## Interface
 
@@ -26,11 +33,10 @@ DJANGO_SETTINGS_MODULE=mysite.settings \
 catmaid-skeleton-import run --state-dir /staging/state
 ```
 
-After a successful import, `run` skips ingestion and repeats bounded verification.
-For an existing target it also refreshes and verifies the import's affected
-cache cells, recovering any interrupted refresh without duplicating skeletons.
-For a project created by this importer, cleanly
-rebuild its cache and verify it again with:
+After a successful import, `run` skips committed batches and cache rebuilding,
+and repeats verification against the saved rebuild receipt. To rebuild the target
+project's grid payloads and verify them again (for either target mode), keep the
+managed layer inactive and run:
 
 ```bash
 catmaid-skeleton-import run \
@@ -71,46 +77,57 @@ translation, rotation or voxel-to-physical transformation is applied.
 
 `target` and `stack` are mutually exclusive. An existing-project request needs
 no stack geometry, creates no stack, and finishes with `status: "complete"`.
-Existing visibility remains in effect throughout the import, so users with
-access can see each batch after it commits. This is append-only: it does not
-replace or merge existing skeletons. A source-fragment identifier already in
-the target is rejected before any batch is loaded; use the original state
-directory to resume that import instead of starting it again. Imports using
+It adds new skeletons without replacing or merging existing skeletons, neurons,
+annotations, connectors, stacks or permissions. A source-fragment identifier
+already in the target is rejected before any batch is loaded; use the original
+state directory to resume that import instead of starting it again. Imports using
 this tool serialize against other imports to the same target project.
 
-Append mode keeps CATMAID's normal database triggers enabled, maintaining
-edges, summaries and the normal cache invalidation workflow. After each batch
-commits, it synchronously refreshes only grid cells intersected by that batch's
-edges (including long edges and touched cell boundaries). Grid definitions,
-filters, LOD settings and enabled payload formats are retained. Each cell is
-recomputed from the whole project's current data, preserving existing skeletons
-in that cell; unrelated cells are untouched. Projects without grid caches need
-no cache work.
+### Offline import and cache rebuild
 
-Cell replacements use short individual transactions: readers can use the old
-payload until all replacement formats commit together. The project stays
-available for browsing and editing; new data can appear progressively as batches
-commit and their cells refresh. Database load can still slow other requests.
-Deploy the updated `catmaid_cache_update_worker` and restart existing worker
-processes before importing: it shares per-cell advisory locks with the importer,
-so worker refreshes cannot publish an older payload over a newer refresh.
-New invalidations received during a refresh are retained for another pass.
+1. Make the target managed layer inactive in Neuroglass and stop other writes to
+   that project. No CATMAID service shutdown is required.
+2. Run or resume the import. Every atomic batch uses bulk `COPY` with ordinary
+   triggers bypassed only in the importer transaction, then explicitly creates
+   and validates edges and summaries for that batch's new skeleton IDs. Existing
+   skeletons and their derived data are not rematerialized or overwritten.
+3. After **all** batches commit, rebuild each configured node grid cache once
+   from the whole project's existing and imported data, including connectors.
+   There are no per-batch cache refreshes or per-edge spatial notifications from
+   the bulk load. A project with no grids requires no cache generation.
+4. Verify imported IDs and exact node values, unchanged grid definitions, payload
+   formats, LOD counts, rebuild timestamps and absence of dirty cache markers.
+   Reactivate the Neuroglass layer only after successful completion.
 
-Before recording `complete`, the importer verifies affected payload timestamps,
-formats/LOD counts and absence of pending dirty markers in one consistent,
-read-only database snapshot. It retries only cells
-that became stale; persistent invalidations or refresh failures leave the import
-incomplete and safe to resume with the same state directory. Resume rederives
-the affected scope from committed batches, so a crash between a database commit
-and its cache refresh cannot silently skip cache maintenance. Cache configuration
-changes during a run require a resume against the current configuration. Normal
-workers continue handling subsequent edits after verification.
+For existing targets, grid IDs, dimensions, orientation, filters, ordering, LOD,
+JSON/JSON-text/MessagePack format flags, `allow_empty` and enabled/disabled state
+are preserved. Only payload cells are replaced, including those of disabled grids.
+Existing grids retain the normal worker's `NODE_LIST_MAXIMUM_COUNT` query limit;
+new importer-owned grids retain their unlimited-query policy.
+Bounds cover all project nodes and connectors, including negative coordinates
+and long edges. Intentionally cached empty coverage is retained for grids with
+`allow_empty`. New projects receive the configured default XY MessagePack grid
+and then use the same rebuild engine.
 
-Final database checks cover this import's recorded
-IDs and exact node values, rather than expecting the entire project to contain
-only this import. `--rebuild-cache` is only supported for importer-created
-projects. Preserving normal triggers can make append mode slower than the
-dedicated-project bulk path.
+Cache payloads can be absent or partially rebuilt during import. The script does
+not promise browsing or editing availability for the target layer. Other projects
+and the CATMAID service can remain available, although database load may slow
+requests. The importer does not automatically deactivate or reactivate a layer.
+
+A failed rebuild leaves committed skeleton batches intact. The saved cache plan
+preserves grid settings and coverage across interruptions; resume restarts the
+cache rebuild without importing those batches again. Keep the layer inactive on
+any failure or uncertain commit. If completed payload verification later fails,
+use `run --rebuild-cache` with the same state directory. A full rebuild can cost
+more than targeted refreshes for a small append into a very large project, but
+avoids repeated refreshes of overlapping cells while loading batches.
+
+The database role must be able to use `session_replication_role=replica` for both
+new and existing targets. This also bypasses foreign-key triggers, so the importer
+explicitly validates ownership, classes, relations, parent membership and exact
+node values before committing. Bulk imports use their source manifest as the
+audit record; they do not reproduce ordinary per-node history, spatial events or
+per-SWC API import transaction metadata.
 
 To create a new hidden project instead, omit `target` and supply `stack`:
 
@@ -262,7 +279,7 @@ variable, then its module default:
 | `CATMAID_BATCH_IMPORT_STATEMENT_TIMEOUT_MS` | `0` |
 | `CATMAID_BATCH_IMPORT_LOCK_TIMEOUT_MS` | `30000` |
 
-The default cache is one 1.5 mm XY MessagePack grid with a single LOD bucket.
+For newly created projects, the default cache is one 1.5 mm XY MessagePack grid with a single LOD bucket.
 The viewer requests the sole spatial profile at 100% LOD, so the bucket contains
 all entries without progressive subdivision. Bucket size and strategy remain
 configurable for explicit multi-level overrides.
@@ -275,8 +292,8 @@ again for each `run` and recorded with its metrics.
 
 Each skeleton stays inside one database batch. Core rows, the `model_of`
 relationship, fragment annotations and links, edges, summaries, and validation
-commit or roll back together. New projects use direct batch materialization;
-existing projects use normal CATMAID triggers. A confirmed rollback is safe to retry with `run`, and
+commit or roll back together. Both target modes use direct batch materialization.
+A confirmed rollback is safe to retry with `run`, and
 earlier committed batches remain untouched.
 
 The state is durably marked immediately before each COMMIT attempt. If the
@@ -287,7 +304,9 @@ automatically delete the project.
 
 A newly created project remains hidden after successful verification.
 Publication is a separate caller/operator responsibility. Existing targets
-retain their original visibility and permissions.
+retain their original visibility and permissions. Keep their Neuroglass managed
+layer inactive until the import completes; the importer does not enforce access
+restrictions on other CATMAID clients.
 
 ## Exit codes
 

@@ -1144,8 +1144,6 @@ def run_ingestion(
         state = store.block_on_uncertain_commit()
         state = store.verify_immutable()
         request = load_request(store.request_path)
-        if request.target_project_id is not None and rebuild_cache:
-            raise InvalidInputError("--rebuild-cache is only available for importer-created projects")
         operational_settings = load_operational_settings()
         settings = settings_from_state(state["settings"], operational_settings)
         plan_path = _artifact_path(store, state, "plan")
@@ -1178,7 +1176,7 @@ def run_ingestion(
         _reconcile_completed_progress(metrics, state)
         metrics.set_status("in_progress")
         connection, _preflight = _database_context(
-            store, state, require_replica_role=request.target_project_id is None,
+            store, state, require_replica_role=True,
         )
         if request.target_project_id is not None:
             from .database import existing_project_import_lock
@@ -1191,15 +1189,20 @@ def run_ingestion(
         )
         if project.existing_project:
             _check_existing_fragment_conflicts(store, plan, project, connection)
-        append_cache = None
-        if project.existing_project:
-            from .append_cache import AppendCacheRefresh
-            store.prepare_append_cache_refresh()
-            append_cache = AppendCacheRefresh(
-                project.project_id, connection,
-                lock_timeout_ms=settings.lock_timeout_ms,
-                statement_timeout_ms=settings.statement_timeout_ms,
+        from .offline_cache import OfflineGridCache
+        from django.conf import settings as django_settings
+        grid_cache = OfflineGridCache(
+            project.project_id, connection,
+            lock_timeout_ms=settings.lock_timeout_ms,
+            statement_timeout_ms=settings.statement_timeout_ms,
+            node_limit=django_settings.NODE_LIST_MAXIMUM_COUNT if project.existing_project else None,
+        )
+        if not project.existing_project:
+            grid_cache.ensure_import_grid(
+                cell_size_nm=settings.cache_cell_size_nm, lod_levels=settings.lod_levels,
+                lod_bucket_size=settings.lod_bucket_size, lod_strategy=settings.lod_strategy,
             )
+        _progress("Offline import: keep the Neuroglass managed layer inactive until verification succeeds")
 
         with _RunArchive(request, settings) as archive:
             for batch in plan.batches:
@@ -1213,46 +1216,12 @@ def run_ingestion(
                     archive,
                     metrics,
                 )
-                if append_cache is not None:
-                    # Outside the batch transaction: cache failures never make a
-                    # committed batch eligible for reimport. Resume also visits
-                    # committed batches to recover interrupted cache refreshes.
-                    batch_state = _batch_state(store.load(), batch.index)
-                    location_ids = read_id_artifact(
-                        store.state_dir, batch_state["artifacts"]["location_ids"],
-                        expected_count=batch.node_count,
-                    )
-                    _progress(f"Refreshing affected cache cells for batch {batch.index}")
-                    cache_started = time.monotonic()
-                    try:
-                        append_cache.refresh_batch(list(location_ids))
-                    except BaseException as exc:
-                        metrics.record_phase(
-                            f"batch_{batch.index:06d}_cache",
-                            duration_seconds=time.monotonic() - cache_started,
-                            status="retryable", error=str(exc), batch_index=batch.index,
-                        )
-                        metrics.set_status("failed")
-                        if isinstance(exc, KeyboardInterrupt):
-                            raise RetryableError("Cache refresh interrupted; resume the committed batch") from exc
-                        if isinstance(exc, ImporterError):
-                            raise
-                        classified = _classified_runtime_error(exc, context="cache refresh")
-                        if classified is not None:
-                            raise classified from exc
-                        raise
-                    metrics.record_phase(
-                        f"batch_{batch.index:06d}_cache",
-                        duration_seconds=time.monotonic() - cache_started,
-                        batch_index=batch.index,
-                    )
 
         state = store.load()
         _combine_manifest(store, state)
 
-        from .cache import build_grid_cache
         from .database import analyze_tables
-        from .verification import verify_cache, verify_project_stack
+        from .verification import verify_project_stack
 
         _run_phase(
             store,
@@ -1260,23 +1229,24 @@ def run_ingestion(
             "database_maintenance",
             lambda: analyze_tables(connection),
         )
-        if rebuild_cache:
+        # Older runs used incremental cache refreshes and have no full rebuild
+        # receipt. Upgrade their cache checkpoint without reimporting any rows.
+        cache_state = store.load()
+        if (rebuild_cache or cache_state["phases"]["cache"]["status"] != "complete"
+                or "cache_rebuild" not in cache_state["artifacts"]):
             _progress("Invalidating cache and verification checkpoints")
-            store.prepare_cache_rebuild()
+            store.prepare_cache_rebuild(reset_plan=rebuild_cache)
         def build_cache() -> Mapping[str, Any]:
-            if append_cache is not None:
-                return append_cache.verify()
-            return build_grid_cache(
-                project_id=project.project_id,
-                dimension=request.dimension,
-                resolution_nm=request.resolution_nm,
-                cache_cell_size_nm=settings.cache_cell_size_nm,
-                lod_levels=settings.lod_levels,
-                lod_bucket_size=settings.lod_bucket_size,
-                lod_strategy=settings.lod_strategy,
-                connection=connection,
-                log=_progress,
+            state = store.load()
+            if "cache_plan" not in state["artifacts"]:
+                _write_registered_json(store, "cache_plan", "cache-plan.json", grid_cache.plan())
+            cache_plan = load_json(_artifact_path(store, store.load(), "cache_plan"))
+            receipt = grid_cache.rebuild(log=_progress, plan=cache_plan)
+            _write_registered_json(
+                store, "cache_rebuild", "cache-rebuild.json", receipt,
             )
+            return {"grid_count": len(receipt["grids"]),
+                    "cell_count": sum(grid["cell_count"] for grid in receipt["grids"])}
 
         _run_phase(
             store,
@@ -1322,20 +1292,9 @@ def run_ingestion(
                     request.scale_nm,
                     request=request,
                 )
-            if append_cache is not None:
-                cache_result = append_cache.verify()
-            else:
-                cache_result = verify_cache(
-                    project_id=project.project_id,
-                    dimension=request.dimension,
-                    resolution_nm=request.resolution_nm,
-                    expected_node_count=plan.total_nodes,
-                    cache_cell_size_nm=settings.cache_cell_size_nm,
-                    lod_levels=settings.lod_levels,
-                    lod_bucket_size=settings.lod_bucket_size,
-                    lod_strategy=settings.lod_strategy,
-                    connection=connection,
-                )
+            cache_result = grid_cache.verify(
+                load_json(_artifact_path(store, store.load(), "cache_rebuild"))
+            )
             result = {
                 "project": project_result,
                 "database": database_result,
@@ -1352,8 +1311,7 @@ def run_ingestion(
                 "skeletons": plan.member_count,
                 "nodes": plan.total_nodes,
             }
-            if not project.existing_project:
-                counts["cache_cells"] = result["cache"]["cell_count"]
+            counts["cache_cells"] = result["cache"]["cell_count"]
             return counts
 
         _run_phase(

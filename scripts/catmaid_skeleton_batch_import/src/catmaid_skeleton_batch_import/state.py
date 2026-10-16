@@ -786,19 +786,7 @@ class StateStore:
     def mark_phase_retryable(self, phase: str, reason: str) -> dict[str, Any]:
         return self.transition_phase(phase, "retryable", reason=reason)
 
-    def prepare_append_cache_refresh(self) -> dict[str, Any]:
-        """Recheck a live project's cache on every run, including completed resumes."""
-        def mutate(state: dict[str, Any]) -> None:
-            if state["project"].get("mode") != "existing":
-                raise ImmutableStateError("Incremental refresh requires an existing project")
-            state["phases"]["cache"] = {"status": "pending"}
-            state["phases"]["verification"] = {"status": "pending"}
-            state["artifacts"].pop("verification", None)
-            self._derive_status(state)
-
-        return self._mutate(mutate)
-
-    def prepare_cache_rebuild(self) -> dict[str, Any]:
+    def prepare_cache_rebuild(self, *, reset_plan: bool = False) -> dict[str, Any]:
         """Invalidate only cache/verification checkpoints for an explicit rebuild."""
 
         def mutate(state: dict[str, Any]) -> None:
@@ -815,6 +803,9 @@ class StateStore:
             state["phases"]["cache"] = {"status": "pending"}
             state["phases"]["verification"] = {"status": "pending"}
             state["artifacts"].pop("verification", None)
+            state["artifacts"].pop("cache_rebuild", None)
+            if reset_plan:
+                state["artifacts"].pop("cache_plan", None)
             self._derive_status(state)
 
         return self._mutate(mutate)

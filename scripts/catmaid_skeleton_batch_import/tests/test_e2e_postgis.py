@@ -97,7 +97,6 @@ def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_c
     from guardian.models import UserObjectPermission, GroupObjectPermission
     from catmaid.models import Project
     from django.contrib.contenttypes.models import ContentType
-    from catmaid.control import node as node_control
     import msgpack
     import psycopg2
 
@@ -123,8 +122,12 @@ def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_c
     with connection.cursor() as cursor:
         cursor.execute("SELECT id FROM node_grid_cache WHERE project_id=%s", [pid])
         grid_id = cursor.fetchone()[0]
-        # A valid empty cache cell far from the imported geometry is a sentinel
-        # for accidental project-wide regeneration or deletion.
+        # Non-default definitions must survive the full payload rebuild.
+        cursor.execute("""
+            UPDATE node_grid_cache SET has_json_data=true, has_json_text_data=true,
+                n_lod_levels=2, lod_strategy='linear', enabled=false WHERE id=%s
+        """, [grid_id])
+        # Obsolete payloads are removed, rather than treated as configuration.
         cursor.execute("""
             INSERT INTO node_grid_cache_cell
                 (grid_id,x_index,y_index,z_index,msgpack_data)
@@ -139,24 +142,6 @@ def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_c
             return {(x, y, z): (updated, [None if value is None else bytes(value) for value in data])
                     for x, y, z, updated, data in cursor.fetchall()}
     cells_before = cache_cells()
-    visible_during_refresh = []
-    original_update = node_control.update_grid_cell
-    # A second DB session must be able to browse the old payload while the
-    # importer has already written (but not yet committed) the replacement.
-    observer = psycopg2.connect(**connection.get_connection_params())
-    observer.autocommit = True
-    def observe_update(*args, **kwargs):
-        result = original_update(*args, **kwargs)
-        if args[1:5] == (grid_id, 0, 0, 0):
-            with observer.cursor() as cursor:
-                cursor.execute("SET statement_timeout='2s'")
-                cursor.execute("""
-                    SELECT msgpack_data FROM node_grid_cache_cell
-                    WHERE grid_id=%s AND x_index=0 AND y_index=0 AND z_index=0
-                """, [grid_id])
-                payload = [None if value is None else bytes(value) for value in cursor.fetchone()[0]]
-            visible_during_refresh.append(payload)
-        return result
     content_type = ContentType.objects.get_for_model(Project)
     def snapshot():
         with connection.cursor() as cursor:
@@ -174,25 +159,31 @@ def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_c
         return project_row, stacks, grids, nodes, users, groups
 
     before = snapshot()
+    old_node_ids = [row[0] for row in before[3]]
+    def old_derived_rows():
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT * FROM treenode_edge WHERE id=ANY(%s::bigint[]) ORDER BY id", [old_node_ids])
+            edges = cursor.fetchall()
+            cursor.execute("""
+                SELECT * FROM catmaid_skeleton_summary WHERE skeleton_id IN (
+                    SELECT skeleton_id FROM treenode WHERE id=ANY(%s::bigint[])) ORDER BY skeleton_id
+            """, [old_node_ids])
+            return edges, cursor.fetchall()
+    old_derived = old_derived_rows()
     append_state = request(tmp_path / "append", "new-fragment", pid)
-    monkeypatch.setattr(node_control, "update_grid_cell", observe_update)
-    try:
-        result = run_ingestion(append_state)
-    finally:
-        observer.close()
-        monkeypatch.setattr(node_control, "update_grid_cell", original_update)
+    result = run_ingestion(append_state)
     after = snapshot()
     assert result["status"] == "complete"
     assert result["project_id"] == pid
     assert result["stack_id"] is None
     assert after[:3] == before[:3]
     assert after[4:] == before[4:]
+    assert old_derived_rows() == old_derived
     assert after[3][:len(before[3])] == before[3]
     assert len(after[3]) == len(before[3]) + 2
     cells_after = cache_cells()
-    assert cells_after[(99, 99, 99)] == cells_before[(99, 99, 99)]
+    assert (99, 99, 99) not in cells_after
     assert cells_after[(0, 0, 0)][0] > cells_before[(0, 0, 0)][0]
-    assert visible_during_refresh == [cells_before[(0, 0, 0)][1]]
     cached_ids = {
         row[0] for bucket in cells_after[(0, 0, 0)][1] if bucket is not None
         for row in msgpack.unpackb(bucket, strict_map_key=False)[0]
@@ -201,7 +192,17 @@ def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_c
     report = json.loads(Path(result["verification"]).read_text())
     assert report["cache"]["verified"] is True
     assert report["cache"]["cell_count"] == 1
+    assert report["cache"]["strategy"] == "offline_full_grid_rebuild"
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            SELECT cardinality(json_data), cardinality(json_text_data), cardinality(msgpack_data)
+            FROM node_grid_cache_cell WHERE grid_id=%s AND x_index=0 AND y_index=0 AND z_index=0
+        """, [grid_id])
+        assert cursor.fetchone() == (2, 2, 2)
     assert run_ingestion(append_state) == result
+    assert cache_cells() == cells_after  # Verification does not regenerate payloads.
+    assert snapshot() == after
+    assert run_ingestion(append_state, rebuild_cache=True) == result
     assert snapshot() == after
 
     # A fresh workspace must not duplicate an earlier import's source IDs.

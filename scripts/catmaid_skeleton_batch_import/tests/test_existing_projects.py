@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from catmaid_skeleton_batch_import import append_cache, cache, database, loader, materialization, orchestrator, project, verification
+from catmaid_skeleton_batch_import import database, loader, materialization, offline_cache, orchestrator, project, verification
 from catmaid_skeleton_batch_import.config import load_request, load_settings
 from catmaid_skeleton_batch_import.artifacts import read_id_artifact
 from catmaid_skeleton_batch_import.errors import ImmutableStateError, InvalidInputError, RetryableError
@@ -45,7 +45,7 @@ def request_file(tmp_path, *, target=123):
 
 
 def forbidden(*_args, **_kwargs):
-    raise AssertionError("An append must not create a project, rebuild caches, or validate unrelated data")
+    raise AssertionError("An append must not create a project, replace cache definitions, or validate unrelated data")
 
 
 class Cursor:
@@ -83,6 +83,7 @@ class Connection:
         self.statements = []
         self.annotations = annotations
         self.available = available
+        self.in_atomic_block = False
 
     def cursor(self):
         return Cursor(self)
@@ -146,7 +147,8 @@ def test_existing_project_lock_is_released_on_failure_and_busy_is_retryable():
             forbidden()
 
 
-def test_append_loader_keeps_normal_triggers_and_does_not_insert_edges_twice(monkeypatch):
+@pytest.mark.parametrize("existing", [False, True])
+def test_both_target_modes_use_bulk_materialization_in_one_atomic_batch(monkeypatch, existing):
     connection = Connection()
     monkeypatch.setitem(sys.modules, "django.db", SimpleNamespace(
         connection=connection, transaction=SimpleNamespace(atomic=lambda **_kwargs: nullcontext())))
@@ -154,33 +156,40 @@ def test_append_loader_keeps_normal_triggers_and_does_not_insert_edges_twice(mon
     events = []
     monkeypatch.setattr(loader, "_copy_file", lambda _cursor, sql, _source: copied.append(sql))
     monkeypatch.setattr(loader, "verify_exact_treenodes", lambda *_args: events.append("exact"))
-    monkeypatch.setattr(materialization, "materialize_and_verify_batch", forbidden)
-    monkeypatch.setattr(materialization, "validate_batch", lambda **_kwargs: dict(COUNTS))
+    def materialize(**_kwargs):
+        assert connection.statements[-1][0] == "SET LOCAL session_replication_role = origin"
+        events.append("materialize")
+        return dict(COUNTS)
+    monkeypatch.setattr(materialization, "materialize_and_verify_batch", materialize)
+    monkeypatch.setattr(materialization, "validate_batch", forbidden)
     prepared = SimpleNamespace(
         batch=SimpleNamespace(index=1, skeleton_count=1, node_count=3),
         class_file=None, relationship_file=None, treenode_file=None,
         expected_skeletons=[SimpleNamespace(to_validation_dict=lambda: {})],
         location_ids=(100, 101, 102),
     )
-    loader.execute_batch_transaction(prepared, ProjectContext.from_dict(CONTEXT),
+    context = CONTEXT | {"existing_project": existing}
+    loader.execute_batch_transaction(prepared, ProjectContext.from_dict(context),
                                      load_settings(), lambda: events.append("commit"))
     assert len(copied) == 3
-    assert not any("session_replication_role" in sql for sql, _params in connection.statements)
-    assert events == ["exact", "commit"]
+    assert [sql for sql, _params in connection.statements if "session_replication_role" in sql] == [
+        "SET LOCAL session_replication_role = replica", "SET LOCAL session_replication_role = origin"]
+    assert events == ["materialize", "exact", "commit"]
 
 
 def configure_run(monkeypatch, connection):
     monkeypatch.delenv("DJANGO_SETTINGS_MODULE", raising=False)
+    monkeypatch.setitem(sys.modules, "django.conf", SimpleNamespace(
+        settings=SimpleNamespace(NODE_LIST_MAXIMUM_COUNT=None)))
     monkeypatch.setattr(project, "existing_project_context", lambda _pid: dict(CONTEXT))
     monkeypatch.setattr(project, "create_hidden_project", forbidden)
     monkeypatch.setattr(database, "allocate_project_ids", forbidden)
-    monkeypatch.setattr(cache, "build_grid_cache", forbidden)
     monkeypatch.setattr(verification, "verify_project_stack", forbidden)
     monkeypatch.setattr(verification, "verify_cache", forbidden)
     monkeypatch.setattr(verification, "verify_project_aggregate_counts", forbidden)
     monkeypatch.setattr(database, "analyze_tables", lambda *_args: {"count": 5})
     def database_context(_store, _state, *, require_replica_role):
-        assert require_replica_role is False
+        assert require_replica_role is True
         return connection, {}
     monkeypatch.setattr(orchestrator, "_database_context", database_context)
     monkeypatch.setattr(materialization, "validate_batch", lambda **_kwargs: dict(COUNTS))
@@ -217,8 +226,7 @@ def test_complete_append_and_resume_are_scoped_and_preserve_target_configuration
     assert len(exact_checks) == 2  # Coordinates/radii are checked on every run.
     result = json.loads((state_dir / "verification.json").read_text())
     assert result["cache"] == {
-        "managed_by": "catmaid", "rebuilt": False,
-        "strategy": "affected_grid_cells", "verified": True,
+        "rebuilt": True, "strategy": "offline_full_grid_rebuild", "verified": True,
         "grid_count": 0, "cell_count": 0,
     }
     assert result["database"]["skeleton_count"] == 1
@@ -252,25 +260,26 @@ def test_interrupted_cache_refresh_resumes_committed_batch_and_requires_final_ve
     monkeypatch.setattr(orchestrator, "execute_batch_transaction", commit)
     monkeypatch.setattr(loader, "verify_exact_treenodes", lambda *_args: events.append("database_verification"))
     failure = ["refresh"]
-    def refresh(self, location_ids):
-        assert len(location_ids) == 3
+    def rebuild(self, **_kwargs):
         assert StateStore(state_dir).load()["batches"][0]["status"] == "committed"
         events.append("refresh")
         if failure == ["refresh"]:
             raise RetryableError("injected cache interruption")
-    def verify(self):
+        return {"schema_version": 1, "project_id": 123, "grids": [],
+                "strategy": "offline_full_grid_rebuild"}
+    def verify(self, _receipt):
         events.append("cache_verification")
         if failure == ["verification"] and events[-2] == "database_verification":
             raise RetryableError("injected final cache invalidation")
         return {"verified": True, "cell_count": 1}
-    monkeypatch.setattr(append_cache.AppendCacheRefresh, "refresh_batch", refresh)
-    monkeypatch.setattr(append_cache.AppendCacheRefresh, "verify", verify)
+    monkeypatch.setattr(offline_cache.OfflineGridCache, "rebuild", rebuild)
+    monkeypatch.setattr(offline_cache.OfflineGridCache, "verify", verify)
     with pytest.raises(RetryableError, match="cache interruption"):
         orchestrator.run_ingestion(state_dir)
     state = StateStore(state_dir).load()
     assert state["batches"][0]["status"] == "committed"
     assert state["status"] != "complete"
-    assert state["phases"]["cache"]["status"] == "pending"
+    assert state["phases"]["cache"]["status"] == "retryable"
 
     failure[:] = ["verification"]
     with pytest.raises(RetryableError, match="final cache invalidation"):
@@ -281,11 +290,11 @@ def test_interrupted_cache_refresh_resumes_committed_batch_and_requires_final_ve
     failure.clear()
     assert orchestrator.run_ingestion(state_dir)["status"] == "complete"
     assert events.count("commit") == 1
-    assert events.count("refresh") == 3
+    assert events.count("refresh") == 2  # Completed cache stage is verified, not rebuilt again.
     assert events[-2:] == ["database_verification", "cache_verification"]
 
 
-def test_each_batch_cache_is_refreshed_before_loading_the_next_batch(tmp_path, monkeypatch):
+def test_cache_is_rebuilt_once_after_all_batches(tmp_path, monkeypatch):
     connection = Connection()
     configure_run(monkeypatch, connection)
     monkeypatch.setenv("CATMAID_BATCH_IMPORT_MAX_NODES_PER_BATCH", "3")
@@ -301,19 +310,17 @@ def test_each_batch_cache_is_refreshed_before_loading_the_next_batch(tmp_path, m
         return dict(COUNTS)
     monkeypatch.setattr(orchestrator, "execute_batch_transaction", commit)
     monkeypatch.setattr(loader, "verify_exact_treenodes", lambda *_args: None)
-    monkeypatch.setattr(append_cache.AppendCacheRefresh, "refresh_batch",
-                        lambda self, ids: events.append("cache"))
+    original = offline_cache.OfflineGridCache.rebuild
+    def rebuild(self, **kwargs):
+        events.append("cache")
+        return original(self, **kwargs) | {"rebuild_serial": events.count("cache")}
+    monkeypatch.setattr(offline_cache.OfflineGridCache, "rebuild", rebuild)
     assert orchestrator.run_ingestion(state_dir)["status"] == "complete"
-    assert events == ["commit_1", "cache", "commit_2", "cache"]
-
-
-def test_existing_cache_rebuild_is_rejected_before_database_access(tmp_path, monkeypatch):
-    monkeypatch.delenv("DJANGO_SETTINGS_MODULE", raising=False)
-    state_dir = tmp_path / "state"
-    orchestrator.plan_ingestion(request_file(tmp_path), state_dir)
-    monkeypatch.setattr(orchestrator, "_database_context", forbidden)
-    with pytest.raises(InvalidInputError, match="importer-created"):
-        orchestrator.run_ingestion(state_dir, rebuild_cache=True)
+    assert events == ["commit_1", "commit_2", "cache"]
+    assert orchestrator.run_ingestion(state_dir)["status"] == "complete"
+    assert events == ["commit_1", "commit_2", "cache"]
+    assert orchestrator.run_ingestion(state_dir, rebuild_cache=True)["status"] == "complete"
+    assert events == ["commit_1", "commit_2", "cache", "cache"]
 
 
 def test_old_project_contexts_remain_readable():

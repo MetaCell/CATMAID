@@ -422,7 +422,7 @@ def execute_batch_transaction(
     """
     from django.db import connection, transaction
 
-    from .materialization import materialize_and_verify_batch, validate_batch
+    from .materialization import materialize_and_verify_batch
 
     timings = record_timing or (lambda _name, _duration, _counts: None)
     counts = {
@@ -440,14 +440,9 @@ def execute_batch_transaction(
                 "set_config('lock_timeout', %s, true)",
                 [str(settings.statement_timeout_ms), str(settings.lock_timeout_ms)],
             )
-            if project.existing_project:
-                # Append through CATMAID's normal triggers. They maintain all
-                # configured caches, edges, summaries and other shared state.
-                cursor.execute(
-                    "SELECT set_config('catmaid.user_id', %s, true)", [str(project.user_id)]
-                )
-            else:
-                cursor.execute("SET LOCAL session_replication_role = replica")
+            # Both target modes use the same offline bulk path. Only this
+            # transaction bypasses triggers; other database sessions are unchanged.
+            cursor.execute("SET LOCAL session_replication_role = replica")
             copy_start = time.monotonic()
             _copy_file(
                 cursor,
@@ -473,8 +468,7 @@ def execute_batch_transaction(
                 prepared.treenode_file,
             )
             timings("copy", time.monotonic() - copy_start, counts)
-            if not project.existing_project:
-                cursor.execute("SET LOCAL session_replication_role = origin")
+            cursor.execute("SET LOCAL session_replication_role = origin")
 
             validation_arguments = dict(
                 project_id=project.project_id,
@@ -490,15 +484,12 @@ def execute_batch_transaction(
                 ],
                 location_ids=list(prepared.location_ids),
             )
-            if project.existing_project:
-                materialized = validate_batch(connection=connection, **validation_arguments)
-            else:
-                materialized = materialize_and_verify_batch(
-                    cursor=cursor,
-                    treenode_file=prepared.treenode_file,
-                    record_timing=lambda name, duration: timings(name, duration, counts),
-                    **validation_arguments,
-                )
+            materialized = materialize_and_verify_batch(
+                cursor=cursor,
+                treenode_file=prepared.treenode_file,
+                record_timing=lambda name, duration: timings(name, duration, counts),
+                **validation_arguments,
+            )
             exact_validation_start = time.monotonic()
             verify_exact_treenodes(cursor, prepared)
             timings(
