@@ -77,9 +77,6 @@ def _archive_metadata(scan: ArchiveScan) -> ArchiveMetadata:
         path=scan.archive_path,
         size_bytes=scan.archive_bytes,
         sha256=scan.archive_sha256,
-        mapping_path=scan.mapping_path,
-        mapping_size_bytes=scan.mapping_bytes,
-        mapping_sha256=scan.mapping_sha256,
     )
 
 
@@ -138,7 +135,7 @@ def plan_ingestion(request_path: Path, state_dir: Path) -> dict[str, object]:
             settings,
             plan.batches,
             plan_digest=plan_digest,
-            planner_version=2,
+            planner_version=plan.schema_version,
         )
         store.register_artifact(
             "plan",

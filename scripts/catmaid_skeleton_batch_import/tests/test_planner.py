@@ -16,7 +16,7 @@ from catmaid_skeleton_batch_import.planner import (
 )
 
 
-def member(path: str, nodes: int, external_id: str | None = None) -> PlannedMember:
+def member(path: str, nodes: int) -> PlannedMember:
     return PlannedMember(
         member_path=path,
         node_count=nodes,
@@ -25,7 +25,6 @@ def member(path: str, nodes: int, external_id: str | None = None) -> PlannedMemb
         display_name=Path(path).stem,
         fragment_id=Path(path).stem,
         cable_length_nm=float(nodes),
-        external_skeleton_id=external_id,
     )
 
 
@@ -48,15 +47,11 @@ def test_rejects_oversized_and_duplicate_members() -> None:
         build_plan([member("large.swc", 11)], 10)
     with pytest.raises(InvalidInputError, match="duplicate member path"):
         build_plan([member("same.swc", 2), member("same.swc", 2)], 10)
-    with pytest.raises(InvalidInputError, match="duplicate external skeleton ID"):
-        build_plan(
-            [member("a.swc", 2, "same"), member("b.swc", 2, "same")], 10
-        )
 
 
 def test_gzip_jsonl_is_deterministic_and_round_trips(tmp_path: Path) -> None:
     plan = build_plan(
-        [member("b.swc", 3, "external-b"), member("a.swc", 2, "external-a")],
+        [member("b.swc", 3), member("a.swc", 2)],
         4,
     )
     first = serialize_plan(plan)

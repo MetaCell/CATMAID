@@ -125,31 +125,28 @@ def test_posix_state_lock_is_exclusive_and_reentrant(tmp_path: Path) -> None:
         pass
 
 
-def test_archive_and_mapping_are_verified_on_resume(tmp_path: Path) -> None:
+def test_archive_is_verified_on_resume(tmp_path: Path) -> None:
     archive = tmp_path / "source.zip"
-    mapping = tmp_path / "mapping.csv"
     archive.write_bytes(b"archive")
-    mapping.write_text("member_path,external_skeleton_id\na.swc,a\n")
     store = StateStore(tmp_path / "state")
     request = {
         "schema_version": 1,
         "source": {
             "archive_path": str(archive.resolve()),
             "coordinate_unit": "nm",
-            "external_skeleton_id_map_path": str(mapping.resolve()),
         },
         "stack": {"dimension": [1, 1, 1], "resolution_nm": [1, 1, 1]},
     }
     store.initialize_plan(
         request,
-        ArchiveMetadata.from_paths(archive, mapping),
+        ArchiveMetadata.from_paths(archive),
         {},
         [],
     )
     store.verify_immutable()
 
-    mapping.write_text("member_path,external_skeleton_id\na.swc,changed\n")
-    with pytest.raises(ImmutableStateError, match="mapping"):
+    archive.write_bytes(b"changed")
+    with pytest.raises(ImmutableStateError, match="archive digest changed"):
         store.verify_immutable()
 
 

@@ -14,7 +14,6 @@ class IngestionRequest:
     coordinate_unit: str
     dimension: tuple[int, int, int] | None = None
     resolution_nm: tuple[float, float, float] | None = None
-    external_skeleton_id_map_path: Path | None = None
     target_project_id: int | None = None
 
     @property
@@ -35,10 +34,6 @@ class IngestionRequest:
             "archive_path": str(self.archive_path),
             "coordinate_unit": self.coordinate_unit,
         }
-        if self.external_skeleton_id_map_path is not None:
-            source["external_skeleton_id_map_path"] = str(
-                self.external_skeleton_id_map_path
-            )
         result: dict[str, Any] = {
             "schema_version": self.schema_version,
             "source": source,
@@ -116,7 +111,6 @@ class PlannedMember:
     display_name: str
     cable_length_nm: float
     fragment_id: str
-    external_skeleton_id: str | None = None
     batch_index: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -129,8 +123,6 @@ class PlannedMember:
             "cable_length_nm": self.cable_length_nm,
             "fragment_id": self.fragment_id,
         }
-        if self.external_skeleton_id is not None:
-            result["external_skeleton_id"] = self.external_skeleton_id
         if self.batch_index is not None:
             result["batch_index"] = self.batch_index
         return result
@@ -145,11 +137,6 @@ class PlannedMember:
             display_name=str(value["display_name"]),
             cable_length_nm=float(value["cable_length_nm"]),
             fragment_id=str(value["fragment_id"]),
-            external_skeleton_id=(
-                str(value["external_skeleton_id"])
-                if value.get("external_skeleton_id") is not None
-                else None
-            ),
             batch_index=(
                 int(value["batch_index"])
                 if value.get("batch_index") is not None

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import hashlib
 import stat
 import struct
@@ -18,14 +17,13 @@ from catmaid_skeleton_batch_import.errors import InvalidInputError
 VALID_SWC = b"1 1 0 0 0 -1 -1\n2 3 3 4 0 2 1\n"
 
 
-def request(archive: Path, mapping: Path | None = None) -> IngestionRequest:
+def request(archive: Path) -> IngestionRequest:
     return IngestionRequest(
         schema_version=1,
         archive_path=archive,
         coordinate_unit="um",
         dimension=(1, 1, 1),
         resolution_nm=(1.0, 1.0, 1.0),
-        external_skeleton_id_map_path=mapping,
     )
 
 
@@ -53,31 +51,16 @@ def write_zip(path: Path, members: list[tuple[str | zipfile.ZipInfo, bytes]]) ->
             archive.writestr(name, content)
 
 
-def write_mapping(path: Path, rows: list[tuple[str, str]]) -> None:
-    with path.open("w", encoding="utf-8", newline="") as target:
-        writer = csv.writer(target)
-        writer.writerow(["member_path", "external_skeleton_id"])
-        writer.writerows(rows)
-
-
-def test_scan_archive_hashes_parses_and_maps_exact_member_paths(tmp_path: Path) -> None:
+def test_scan_archive_hashes_parses_and_preserves_exact_member_paths(tmp_path: Path) -> None:
     archive = tmp_path / "cells.zip"
     write_zip(
         archive,
         [("z/cell.swc", VALID_SWC), ("notes.txt", b"ignored"), ("a.swc", VALID_SWC)],
     )
-    mapping = tmp_path / "mapping.csv"
-    write_mapping(mapping, [("a.swc", "external-a"), ("z/cell.swc", "external-z")])
-
-    scanned = scan_archive(request(archive, mapping), settings())
+    scanned = scan_archive(request(archive), settings())
 
     assert scanned.archive_sha256 == hashlib.sha256(archive.read_bytes()).hexdigest()
-    assert scanned.mapping_sha256 == hashlib.sha256(mapping.read_bytes()).hexdigest()
     assert [member.member_path for member in scanned.members] == ["a.swc", "z/cell.swc"]
-    assert [member.external_skeleton_id for member in scanned.members] == [
-        "external-a",
-        "external-z",
-    ]
     assert scanned.total_nodes == 4
     assert scanned.members[0].cable_length_nm == 5000
     assert scanned.members[0].display_name == "a"
@@ -144,42 +127,6 @@ def test_enforces_deployment_limits(
     write_zip(archive, [("a.swc", VALID_SWC), ("b.swc", VALID_SWC)])
     with pytest.raises(InvalidInputError, match=message):
         scan_archive(request(archive), settings(**overrides))
-
-
-@pytest.mark.parametrize(
-    ("rows", "message"),
-    [
-        ([("a.swc", "one")], "missing mapping"),
-        (
-            [("a.swc", "one"), ("b.swc", "two"), ("unknown.swc", "three")],
-            "unknown archive member",
-        ),
-        ([("a.swc", "same"), ("b.swc", "same")], "duplicate external_skeleton_id"),
-        ([("a.swc", "one"), ("a.swc", "two")], "duplicate member_path"),
-    ],
-)
-def test_mapping_must_be_complete_exact_and_one_to_one(
-    tmp_path: Path, rows: list[tuple[str, str]], message: str
-) -> None:
-    archive = tmp_path / "mapping.zip"
-    write_zip(archive, [("a.swc", VALID_SWC), ("b.swc", VALID_SWC)])
-    mapping = tmp_path / "mapping.csv"
-    write_mapping(mapping, rows)
-    with pytest.raises(InvalidInputError, match=message):
-        scan_archive(request(archive, mapping), settings())
-
-
-def test_mapping_rejects_extra_row_columns(tmp_path: Path) -> None:
-    archive = tmp_path / "mapping.zip"
-    write_zip(archive, [("a.swc", VALID_SWC)])
-    mapping = tmp_path / "mapping.csv"
-    mapping.write_text(
-        "member_path,external_skeleton_id\na.swc,source-a,unexpected\n",
-        encoding="utf-8",
-    )
-
-    with pytest.raises(InvalidInputError, match="exactly two columns"):
-        scan_archive(request(archive, mapping), settings())
 
 
 def test_archive_ignores_directories_and_non_swc_files(tmp_path: Path) -> None:

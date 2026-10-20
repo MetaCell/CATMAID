@@ -59,26 +59,32 @@ def test_new_plan_and_manifest_preserve_identifier_and_five_id_layout(tmp_path):
     path = tmp_path / "plan.jsonl.gz"
     write_plan(path, plan)
     loaded = read_plan(path)
-    assert loaded.schema_version == 2
+    assert loaded.schema_version == 3
     assert loaded.members[0].fragment_id == "0021814"
     rows = manifest_rows(loaded.batches[0], [10, 11, 12, 13, 14])
     assert rows[0]["fragment_id"] == "0021814"
     assert rows[0]["neuron_id"] == 10 and rows[0]["skeleton_id"] == 11
     manifest = tmp_path / "manifest.csv.gz"
     write_manifest(manifest, rows)
-    assert read_manifest(manifest)[0]["fragment_id"] == "0021814"
+    assert read_manifest(manifest) == [{
+        "member_path": "191805/0021814.swc", "fragment_id": "0021814",
+        "neuron_id": "10", "skeleton_id": "11", "node_count": "2",
+        "name": "0021814", "batch_index": "1",
+    }]
 
 
-def test_rejects_old_development_plan_before_reading_old_member_layout(tmp_path):
+@pytest.mark.parametrize("schema_version", [1, 2])
+def test_rejects_old_development_plan_before_reading_old_member_layout(tmp_path, schema_version):
     path = tmp_path / "old.jsonl.gz"
     with gzip.open(path, "wt") as target:
-        target.write(json.dumps({"record_type": "header", "schema_version": 1}) + "\n")
+        target.write(json.dumps({"record_type": "header", "schema_version": schema_version}) + "\n")
     with pytest.raises(InvalidInputError, match="old development workspaces cannot be resumed"):
         read_plan(path)
 
 
-def test_rejects_old_development_state_with_clear_recovery_message(tmp_path):
-    (tmp_path / "state.json").write_text(json.dumps({"schema_version": 1}))
+@pytest.mark.parametrize("schema_version", [1, 2])
+def test_rejects_old_development_state_with_clear_recovery_message(tmp_path, schema_version):
+    (tmp_path / "state.json").write_text(json.dumps({"schema_version": schema_version}))
     with pytest.raises(ImmutableStateError, match="start a new state directory"):
         StateStore(tmp_path).load()
 

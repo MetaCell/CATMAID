@@ -1,13 +1,12 @@
-"""Immutable local ZIP scanning and optional external-ID mapping."""
+"""Immutable local ZIP scanning."""
 
 from __future__ import annotations
 
-import csv
 import math
 import os
 import stat
 import zipfile
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -27,10 +26,6 @@ class ArchiveScan:
     archive_sha256: str
     archive_mtime_ns: int
     members: tuple[PlannedMember, ...]
-    mapping_path: Path | None = None
-    mapping_bytes: int | None = None
-    mapping_sha256: str | None = None
-    mapping_mtime_ns: int | None = None
 
     @property
     def swc_count(self) -> int:
@@ -49,15 +44,6 @@ class ArchiveScan:
             "swc_count": self.swc_count,
             "total_nodes": self.total_nodes,
         }
-        if self.mapping_path is not None:
-            result.update(
-                {
-                    "mapping_path": str(self.mapping_path),
-                    "mapping_bytes": self.mapping_bytes,
-                    "mapping_sha256": self.mapping_sha256,
-                    "mapping_mtime_ns": self.mapping_mtime_ns,
-                }
-            )
         return result
 
 
@@ -115,57 +101,6 @@ def _is_regular_zip_member(info: zipfile.ZipInfo) -> bool:
     file_type = stat.S_IFMT(mode)
     # Many ZIP writers record Unix permissions without recording a file type.
     return file_type == 0 or stat.S_ISREG(mode)
-
-
-def _read_mapping(path: Path) -> tuple[dict[str, str], int, str, int]:
-    before = _regular_file_stat(path, "external skeleton-ID mapping")
-    digest = _sha256_file(path, "external skeleton-ID mapping")
-    mapping: dict[str, str] = {}
-    external_ids: set[str] = set()
-    try:
-        with path.open("r", encoding="utf-8", errors="strict", newline="") as source:
-            reader = csv.DictReader(source)
-            expected = ["member_path", "external_skeleton_id"]
-            if reader.fieldnames != expected:
-                raise InvalidInputError(
-                    f"{path}: mapping header must be exactly "
-                    "member_path,external_skeleton_id"
-                )
-            for row in reader:
-                line_number = reader.line_num
-                if None in row:
-                    raise InvalidInputError(
-                        f"{path}:{line_number}: mapping rows must have exactly "
-                        "two columns"
-                    )
-                member_path = row.get("member_path")
-                external_id_value = row.get("external_skeleton_id")
-                if member_path is None or not member_path:
-                    raise InvalidInputError(
-                        f"{path}:{line_number}: member_path must be non-empty"
-                    )
-                if external_id_value is None or not external_id_value.strip():
-                    raise InvalidInputError(
-                        f"{path}:{line_number}: external_skeleton_id must be non-empty"
-                    )
-                external_id = external_id_value.strip()
-                if member_path in mapping:
-                    raise InvalidInputError(
-                        f"{path}:{line_number}: duplicate member_path {member_path!r}"
-                    )
-                if external_id in external_ids:
-                    raise InvalidInputError(
-                        f"{path}:{line_number}: duplicate external_skeleton_id "
-                        f"{external_id!r}"
-                    )
-                mapping[member_path] = external_id
-                external_ids.add(external_id)
-    except InvalidInputError:
-        raise
-    except (OSError, UnicodeError, csv.Error) as exc:
-        raise InvalidInputError(f"Could not read mapping {path}: {exc}") from exc
-    _reject_if_changed(path, before, "external skeleton-ID mapping")
-    return mapping, before.st_size, digest, before.st_mtime_ns
 
 
 def _collect_swc_infos(
@@ -275,40 +210,10 @@ def scan_archive(
         ) from exc
     _reject_if_changed(archive_path, before, "SWC archive")
 
-    mapping_path = request.external_skeleton_id_map_path
-    mapping_bytes = None
-    mapping_digest = None
-    mapping_mtime_ns = None
-    if mapping_path is not None:
-        mapping, mapping_bytes, mapping_digest, mapping_mtime_ns = _read_mapping(
-            mapping_path
-        )
-        member_paths = {member.member_path for member in members}
-        mapping_paths = set(mapping)
-        missing = sorted(member_paths - mapping_paths)
-        unknown = sorted(mapping_paths - member_paths)
-        if missing:
-            raise InvalidInputError(
-                f"{mapping_path}: missing mapping for archive member {missing[0]!r}"
-            )
-        if unknown:
-            raise InvalidInputError(
-                f"{mapping_path}: mapping references unknown archive member "
-                f"{unknown[0]!r}"
-            )
-        members = [
-            replace(member, external_skeleton_id=mapping[member.member_path])
-            for member in members
-        ]
-
     return ArchiveScan(
         archive_path=archive_path,
         archive_bytes=before.st_size,
         archive_sha256=archive_digest,
         archive_mtime_ns=before.st_mtime_ns,
         members=tuple(members),
-        mapping_path=mapping_path,
-        mapping_bytes=mapping_bytes,
-        mapping_sha256=mapping_digest,
-        mapping_mtime_ns=mapping_mtime_ns,
     )

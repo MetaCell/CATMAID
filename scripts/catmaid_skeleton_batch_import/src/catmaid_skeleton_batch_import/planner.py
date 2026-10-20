@@ -21,7 +21,7 @@ from .util import (
 )
 
 
-PLAN_SCHEMA_VERSION = 2
+PLAN_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -81,13 +81,6 @@ def _validate_member(member: PlannedMember) -> None:
         raise InvalidInputError(
             f"Planned member {member.member_path!r} has invalid cable length"
         )
-    if (
-        member.external_skeleton_id is not None
-        and not member.external_skeleton_id.strip()
-    ):
-        raise InvalidInputError(
-            f"Planned member {member.member_path!r} has an empty external ID"
-        )
 
 
 def build_plan(
@@ -104,7 +97,6 @@ def build_plan(
 
     seen_paths: set[str] = set()
     seen_fragment_ids: set[str] = set()
-    seen_external_ids: set[str] = set()
     for member in ordered:
         _validate_member(member)
         if member.member_path in seen_paths:
@@ -115,13 +107,6 @@ def build_plan(
         if member.fragment_id in seen_fragment_ids:
             raise InvalidInputError(f"Plan contains duplicate fragment identifier {member.fragment_id!r} at {member.member_path!r}")
         seen_fragment_ids.add(member.fragment_id)
-        if member.external_skeleton_id is not None:
-            if member.external_skeleton_id in seen_external_ids:
-                raise InvalidInputError(
-                    f"Plan contains duplicate external skeleton ID "
-                    f"{member.external_skeleton_id!r}"
-                )
-            seen_external_ids.add(member.external_skeleton_id)
         if member.node_count > max_nodes_per_batch:
             raise InvalidInputError(
                 f"SWC member {member.member_path!r} has {member.node_count} nodes; "
@@ -234,8 +219,7 @@ def _member_from_record(
         "cable_length_nm",
         "batch_index",
     }
-    allowed = required | {"external_skeleton_id"}
-    unknown = set(record) - allowed
+    unknown = set(record) - required
     missing = required - set(record)
     if unknown or missing or record.get("record_type") != "member":
         parts = []
@@ -252,11 +236,6 @@ def _member_from_record(
         raise InvalidInputError(
             f"{path}:{line_number}: cable_length_nm must be numeric"
         )
-    external_id = record.get("external_skeleton_id")
-    if external_id is not None and not isinstance(external_id, str):
-        raise InvalidInputError(
-            f"{path}:{line_number}: external_skeleton_id must be a string"
-        )
     member = PlannedMember(
         member_path=_record_string(record, "member_path", path, line_number),
         fragment_id=_record_string(record, "fragment_id", path, line_number),
@@ -267,7 +246,6 @@ def _member_from_record(
         crc32=_record_int(record, "crc32", path, line_number),
         display_name=_record_string(record, "display_name", path, line_number),
         cable_length_nm=float(cable_length),
-        external_skeleton_id=external_id,
         batch_index=_record_int(record, "batch_index", path, line_number),
     )
     _validate_member(member)

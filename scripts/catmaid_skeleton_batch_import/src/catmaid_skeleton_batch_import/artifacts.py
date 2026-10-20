@@ -16,7 +16,6 @@ from .util import atomic_write_bytes, deterministic_gzip_bytes, sha256_file
 MANIFEST_FIELDS = (
     "member_path",
     "fragment_id",
-    "external_skeleton_id",
     "neuron_id",
     "skeleton_id",
     "node_count",
@@ -127,7 +126,6 @@ def manifest_rows(
             {
                 "member_path": member.member_path,
                 "fragment_id": member.fragment_id,
-                "external_skeleton_id": member.external_skeleton_id or "",
                 "neuron_id": neuron_id,
                 "skeleton_id": skeleton_id,
                 "node_count": member.node_count,

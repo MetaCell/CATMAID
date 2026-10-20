@@ -37,7 +37,7 @@ from .util import (
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 METADATA_SCHEMA_VERSION = 1
 REQUEST_FILENAME = "request.json"
 ARCHIVE_FILENAME = "archive.json"
@@ -101,38 +101,17 @@ class ArchiveMetadata:
     path: Path
     size_bytes: int
     sha256: str
-    mapping_path: Path | None = None
-    mapping_size_bytes: int | None = None
-    mapping_sha256: str | None = None
 
     @classmethod
-    def from_paths(
-        cls, archive_path: Path, mapping_path: Path | None = None
-    ) -> "ArchiveMetadata":
+    def from_paths(cls, archive_path: Path) -> "ArchiveMetadata":
         archive_path = archive_path.resolve()
         if not archive_path.is_file():
             raise InvalidInputError(f"Archive is not a readable regular file: {archive_path}")
-
-        resolved_mapping: Path | None = None
-        mapping_size: int | None = None
-        mapping_digest: str | None = None
-        if mapping_path is not None:
-            resolved_mapping = mapping_path.resolve()
-            if not resolved_mapping.is_file():
-                raise InvalidInputError(
-                    f"External skeleton identifier mapping is not a readable regular file: "
-                    f"{resolved_mapping}"
-                )
-            mapping_size = resolved_mapping.stat().st_size
-            mapping_digest = sha256_file(resolved_mapping)
 
         return cls(
             path=archive_path,
             size_bytes=archive_path.stat().st_size,
             sha256=sha256_file(archive_path),
-            mapping_path=resolved_mapping,
-            mapping_size_bytes=mapping_size,
-            mapping_sha256=mapping_digest,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -142,47 +121,16 @@ class ArchiveMetadata:
             "size_bytes": _non_negative_int(self.size_bytes, "archive size"),
             "sha256": _validate_sha256(self.sha256, "archive digest"),
         }
-        mapping_values = (
-            self.mapping_path,
-            self.mapping_size_bytes,
-            self.mapping_sha256,
-        )
-        if any(value is not None for value in mapping_values):
-            if not all(value is not None for value in mapping_values):
-                raise InvalidInputError(
-                    "Mapping path, size, and SHA-256 must either all be set or all be omitted"
-                )
-            result["mapping"] = {
-                "path": str(self.mapping_path.resolve()),  # type: ignore[union-attr]
-                "size_bytes": _non_negative_int(
-                    self.mapping_size_bytes, "mapping size"
-                ),
-                "sha256": _validate_sha256(
-                    str(self.mapping_sha256), "mapping digest"
-                ),
-            }
         return result
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ArchiveMetadata":
         if int(value.get("schema_version", -1)) != METADATA_SCHEMA_VERSION:
             raise ImmutableStateError("Unsupported archive metadata schema")
-        mapping = value.get("mapping")
         return cls(
             path=Path(str(value["path"])),
             size_bytes=_non_negative_int(value["size_bytes"], "archive size"),
             sha256=_validate_sha256(str(value["sha256"]), "archive digest"),
-            mapping_path=(Path(str(mapping["path"])) if mapping is not None else None),
-            mapping_size_bytes=(
-                _non_negative_int(mapping["size_bytes"], "mapping size")
-                if mapping is not None
-                else None
-            ),
-            mapping_sha256=(
-                _validate_sha256(str(mapping["sha256"]), "mapping digest")
-                if mapping is not None
-                else None
-            ),
         )
 
 
@@ -332,9 +280,9 @@ class StateStore:
         batches: Sequence[PlannedBatch | Mapping[str, Any]],
         *,
         plan_digest: str | None = None,
-        planner_version: int = 2,
+        planner_version: int = 3,
     ) -> dict[str, Any]:
-        """Create schema-v2 state, or prove an existing plan is identical.
+        """Create schema-v3 state, or prove an existing plan is identical.
 
         Initialization is deliberately idempotent.  It never resets progress;
         any immutable difference requires a new state directory.
@@ -348,13 +296,6 @@ class StateStore:
             archive_identity.sha256,
             "archive",
         )
-        if archive_identity.mapping_path is not None:
-            self._verify_source_file(
-                archive_identity.mapping_path,
-                int(archive_identity.mapping_size_bytes),  # type: ignore[arg-type]
-                str(archive_identity.mapping_sha256),
-                "external skeleton identifier mapping",
-            )
         settings_value = self._normalize_settings(settings)
         batch_plan = self._normalize_batches(batches)
         planner_version = _non_negative_int(planner_version, "planner version")
@@ -396,10 +337,6 @@ class StateStore:
             "settings": settings_value,
             "plan": plan_value,
         }
-        if archive_value.get("mapping") is not None:
-            immutable["archive"]["mapping_sha256"] = archive_value["mapping"][
-                "sha256"
-            ]
 
         with self._mutation_lock():
             if self.state_path.exists():
@@ -489,13 +426,6 @@ class StateStore:
         self._verify_source_file(
             archive.path, archive.size_bytes, archive.sha256, "archive"
         )
-        if archive.mapping_path is not None:
-            self._verify_source_file(
-                archive.mapping_path,
-                int(archive.mapping_size_bytes),  # type: ignore[arg-type]
-                str(archive.mapping_sha256),
-                "external skeleton identifier mapping",
-            )
 
         plan = state["plan"]
         if plan.get("digest_kind") == "canonical_batches":

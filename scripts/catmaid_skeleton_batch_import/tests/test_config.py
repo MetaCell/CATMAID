@@ -37,20 +37,25 @@ def write_request(path: Path, **source_overrides: object) -> None:
 
 def test_request_is_strict_and_normalized(tmp_path: Path) -> None:
     request_path = tmp_path / "request.json"
-    write_request(request_path, external_skeleton_id_map_path="mapping.csv")
+    write_request(request_path)
 
     request = load_request(request_path)
 
     assert request.archive_path == (tmp_path / "input.zip").resolve()
-    assert request.external_skeleton_id_map_path == Path("mapping.csv").resolve()
     assert request.coordinate_unit == "um"
     assert request.scale_nm == 1000
     assert request.max_nm == (40.0, 110.0, 180.0)
 
 
-def test_request_rejects_unknown_input_policy(tmp_path: Path) -> None:
+@pytest.mark.parametrize("source_overrides", [
+    {"coordinate_scale_nm": [1, 1, 1]},
+    {"external_skeleton_id_map_path": "mapping.csv"},
+])
+def test_request_rejects_unknown_input_policy(
+    tmp_path: Path, source_overrides: dict[str, object],
+) -> None:
     request_path = tmp_path / "request.json"
-    write_request(request_path, coordinate_scale_nm=[1, 1, 1])
+    write_request(request_path, **source_overrides)
 
     with pytest.raises(InvalidInputError, match="unknown fields"):
         load_request(request_path)

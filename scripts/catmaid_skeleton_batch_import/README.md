@@ -56,9 +56,8 @@ package are importable.
 ## Input contract
 
 An ingestion consists of a **request JSON file plus a local ZIP containing SWC
-files**. An external-ID CSV is optional and lives outside the ZIP. There is no
-required manifest inside the ZIP. The archive and optional CSV must remain
-unchanged and readable by both `plan` and `run`.
+files**. No input CSV or manifest is required. The archive must remain unchanged
+and readable by both `plan` and `run`.
 
 ### Request JSON
 
@@ -98,7 +97,6 @@ Create a new hidden project instead: replace `target` with `stack`:
 | `schema_version` | Always | Literal `1`. |
 | `source.archive_path` | Always | Non-empty local ZIP path, visible in the importer's runtime/container. Prefer an absolute path; relative paths resolve against the process working directory. URLs are not supported. |
 | `source.coordinate_unit` | Always | Exactly `"um"` or `"nm"`; applies to every SWC's XYZ coordinates and all known radii. No automatic detection or per-file unit override. |
-| `source.external_skeleton_id_map_path` | Optional | Local path to the external-ID CSV described below; add this field inside `source`. |
 | `target.project_id` | Existing project only | Positive integer, at most 2147483647. The project must exist and have complete tracing setup. |
 | `stack.dimension` | New project only | `[size_x, size_y, size_z]`, three positive integer voxel counts. |
 | `stack.resolution_nm` | New project only | `[nm_per_voxel_x, nm_per_voxel_y, nm_per_voxel_z]`, three positive finite numbers. Used to configure the new stack; does not scale SWC coordinates. |
@@ -151,7 +149,6 @@ Example files visible to the importer:
 /staging/
   request.json
   skeletons.zip
-  external-ids.csv       # optional
   state/                 # created by plan; use the same directory for resume
 ```
 
@@ -207,26 +204,6 @@ local topology references, not CATMAID IDs. There must be at least two nodes,
 exactly one root (`parent_id=-1`), valid parent references, and one connected
 acyclic tree. A radius must be non-negative or exactly `-1` for unknown.
 The sample root becomes `(10000, 20000, 30000)` nm with radius `2000` nm.
-
-### Optional external-ID CSV
-
-Add `"external_skeleton_id_map_path": "/staging/external-ids.csv"` inside
-`source` only when this mapping is needed. For the example ZIP, its complete
-content could be:
-
-```csv
-member_path,external_skeleton_id
-root-cell.swc,external-root
-specimen-01/0021814.swc,external-0021814
-specimen-02/1054599727.23.SWC,external-1054599727.23
-```
-
-The UTF-8 CSV header must be exactly `member_path,external_skeleton_id`, in that
-order, with two columns per row. Provide exactly one row for **every** SWC,
-matching its full, case-sensitive ZIP member path (including folders). Missing
-or unknown paths, duplicate paths, and duplicate or empty external IDs are
-rejected. External IDs are strings recorded in the output manifest; they do not
-choose CATMAID IDs or replace filename-derived fragment identifiers.
 
 ## Offline import and cache rebuild
 
@@ -298,6 +275,15 @@ per identifier, not a combined limit on the number or total length of a
 segment's contributing identifiers. Visible neuron and skeleton names keep
 CATMAID's normal behavior and are not the source of truth for these values.
 
+For an existing target, `run` rejects incoming fragment IDs that already have a
+`source-fragment:` annotation in that project, before loading any batch. It does
+not automatically skip, overwrite or merge them. This also applies to provenance
+retained after a merge or split. To resume the same import, reuse its state
+directory: the importer recognizes its own committed annotation IDs. For a new
+import, exclude already-imported fragments; folder names do not provide a dataset
+namespace, so different datasets with overlapping IDs require distinct source
+identifiers before ingestion.
+
 The merge and split inheritance rules are implemented in the **CATMAID backend**
 in this branch, in the normal `POST /{project_id}/skeleton/join` and
 `POST /{project_id}/skeleton/split` operations. Deploy this backend version; clients
@@ -320,10 +306,12 @@ preserve literal identifiers. Native SWC annotation replacement keeps existing
 source identifiers, but native SWC uploads do not start generating them. Whole
 neuron, skeleton and project deletion still work normally.
 
-The source-to-CATMAID manifest includes `fragment_id` independently of
-`external_skeleton_id` and display `name`. Annotation rows and links commit or
-roll back in the same atomic batch as morphology, and final verification checks
-the exact values and ownership.
+The importer generates a compressed source-to-CATMAID CSV manifest with exactly
+`member_path,fragment_id,neuron_id,skeleton_id,node_count,name,batch_index`.
+This is an output audit artifact, not an input requirement. The filename-derived
+`fragment_id` is recorded separately from display `name` and the allocated
+CATMAID IDs. Annotation rows and links commit or roll back in the same atomic
+batch as morphology, and final verification checks the exact values and ownership.
 
 ### Search and audit API contract
 
@@ -365,11 +353,16 @@ add viewer code or append all identifiers to visible labels.
 
 ### Development workspace format
 
-Version 0.3.0 uses new internal plan/state formats and five reserved concept IDs
-per fragment: neuron, skeleton, model link, annotation and annotation link.
-Older development workspaces are rejected; create a new workspace instead of
-rewriting existing state. No legacy reader or backfill is provided. Public
-request and wrapper-result schemas remain version 1.
+Version 0.5.0 removes the optional external-ID input CSV and its output column.
+`source` now accepts only `archive_path` and `coordinate_unit`; requests with the
+removed option are rejected as unknown fields. Internal plan and state formats
+are version 3, so older development workspaces are rejected before database writes
+instead of mixing manifest formats. If an older workspace has committed batches,
+finish or recover it with its original importer version; do not discard its state
+and reimport the archive. Otherwise, create a new state directory. No legacy
+reader or backfill is provided. Public request and wrapper-result schemas remain
+version 1. Each fragment still reserves five concept IDs: neuron, skeleton, model
+link, annotation and annotation link.
 
 ## Container ingestion entry point
 
@@ -450,7 +443,7 @@ restrictions on other CATMAID clients.
 | Code | Meaning |
 |---:|---|
 | `0` | Command completed successfully |
-| `2` | Invalid request, archive, mapping, setting, or deployment precondition |
+| `2` | Invalid request, archive, setting, or deployment precondition |
 | `3` | Definite failure that is safe to retry with `run` |
 | `4` | Immutable request/archive/plan/database target mismatch |
 | `5` | Uncertain outcome requiring operator attention |

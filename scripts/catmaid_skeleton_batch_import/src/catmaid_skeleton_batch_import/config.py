@@ -122,20 +122,7 @@ def load_request(path: Path) -> IngestionRequest:
         raise InvalidInputError("request.source must be an object")
 
     source = raw["source"]
-    required_source = {"archive_path", "coordinate_unit"}
-    allowed_source = required_source | {"external_skeleton_id_map_path"}
-    unknown_source = set(source) - allowed_source
-    missing_source = required_source - set(source)
-    if unknown_source:
-        raise InvalidInputError(
-            "request.source contains unknown fields: "
-            + ", ".join(sorted(unknown_source))
-        )
-    if missing_source:
-        raise InvalidInputError(
-            "request.source is missing required fields: "
-            + ", ".join(sorted(missing_source))
-        )
+    _expect_keys(source, {"archive_path", "coordinate_unit"}, "request.source")
 
     archive_value = source["archive_path"]
     if not isinstance(archive_value, str) or not archive_value.strip():
@@ -146,22 +133,12 @@ def load_request(path: Path) -> IngestionRequest:
     if unit not in {"nm", "um"}:
         raise InvalidInputError("request.source.coordinate_unit must be 'nm' or 'um'")
 
-    mapping_path = None
-    if "external_skeleton_id_map_path" in source:
-        mapping_value = source["external_skeleton_id_map_path"]
-        if not isinstance(mapping_value, str) or not mapping_value.strip():
-            raise InvalidInputError(
-                "request.source.external_skeleton_id_map_path must be a non-empty string"
-            )
-        mapping_path = Path(mapping_value).expanduser().resolve(strict=False)
-
     return IngestionRequest(
         schema_version=1,
         archive_path=archive_path,
         coordinate_unit=unit,
         dimension=dimension,
         resolution_nm=resolution_nm,
-        external_skeleton_id_map_path=mapping_path,
         target_project_id=project_id,
     )
 
