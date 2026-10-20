@@ -208,12 +208,18 @@ def test_rebuild_passes_original_formats_lod_filters_and_grid_id(monkeypatch):
                   hidden_last_editor_id=7, ordering="cable-desc")
     cache = tracker(Connection([config]))
     calls = []
+    provider = object()
+    provider_creations = []
+    def make_provider():
+        provider_creations.append(provider)
+        return provider
     @contextmanager
     def locked(*args, **kwargs):
         calls.append((args, kwargs))
         yield "cursor", {}
     monkeypatch.setitem(sys.modules, "catmaid.control.grid_cache", SimpleNamespace(locked_grid_cell=locked))
     monkeypatch.setitem(sys.modules, "catmaid.control.node", SimpleNamespace(
+        Postgis3dNodeProvider=make_provider,
         update_grid_cell=lambda *args, **kwargs: calls.append((args, kwargs)) or True))
     cache._refresh(config, (-1, 2, 3))
     assert calls[0][0] == (11, -1, 2, 3)
@@ -224,7 +230,10 @@ def test_rebuild_passes_original_formats_lod_filters_and_grid_id(monkeypatch):
                        "n_largest_skeletons_limit": 5, "n_last_edited_skeletons_limit": 2,
                        "hidden_last_editor_id": 7}
     assert args[9:] == (True, 2, 500, "quadratic", True, False, True)
-    assert kwargs == {"cursor": "cursor", "delete_empty": True}
+    assert kwargs == {"provider": provider, "cursor": "cursor", "delete_empty": True}
+    cache._refresh(config, (0, 2, 3))
+    assert provider_creations == [provider]
+    assert calls[3][1]["provider"] is provider
 
 
 def test_invalid_grid_is_rejected_before_loading_any_batches():

@@ -333,50 +333,6 @@ def allocate_batch_ids(
     }
 
 
-def set_local_timeouts(
-    statement_timeout_ms: int,
-    lock_timeout_ms: int,
-    connection: Any | None = None,
-) -> None:
-    """Set the two operational timeouts for the current transaction."""
-
-    if min(statement_timeout_ms, lock_timeout_ms) < 0:
-        raise ValueError("database timeouts cannot be negative")
-    connection = _default_connection(connection)
-    if not getattr(connection, "in_atomic_block", False):
-        raise RuntimeError("SET LOCAL timeouts require an active transaction")
-    with connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT set_config('statement_timeout', %s, true), "
-            "set_config('lock_timeout', %s, true)",
-            (str(statement_timeout_ms), str(lock_timeout_ms)),
-        )
-
-
-@contextlib.contextmanager
-def replica_load(connection: Any | None = None) -> Iterator[None]:
-    """Temporarily disable ordinary triggers for COPY in an outer transaction.
-
-    On a successful body the role is restored before materialization.  On an
-    exception the surrounding transaction must roll back; attempting another
-    statement in an aborted transaction would only mask the original error.
-    ``SET LOCAL`` guarantees rollback restores ``origin``.
-    """
-
-    connection = _default_connection(connection)
-    if not getattr(connection, "in_atomic_block", False):
-        raise RuntimeError("replica_load requires an active outer transaction")
-    with connection.cursor() as cursor:
-        cursor.execute("SET LOCAL session_replication_role = replica")
-    try:
-        yield
-    except BaseException:
-        raise
-    else:
-        with connection.cursor() as cursor:
-            cursor.execute("SET LOCAL session_replication_role = origin")
-
-
 def analyze_tables(
     connection: Any | None = None,
     *,

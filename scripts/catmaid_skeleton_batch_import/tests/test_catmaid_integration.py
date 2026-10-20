@@ -65,22 +65,6 @@ def test_sequence_allocation_uses_allowlist_and_returns_exact_values():
         database.allocate_sequence_ids("unsafe; DROP TABLE project", 1, connection)
 
 
-def test_replica_load_restores_origin_only_after_success():
-    connection = ScriptedConnection(in_atomic_block=True)
-    with database.replica_load(connection):
-        pass
-    assert [execution[0] for execution in connection.executions] == [
-        "SET LOCAL session_replication_role = replica",
-        "SET LOCAL session_replication_role = origin",
-    ]
-
-    failed = ScriptedConnection(in_atomic_block=True)
-    with pytest.raises(RuntimeError, match="copy failed"):
-        with database.replica_load(failed):
-            raise RuntimeError("copy failed")
-    assert len(failed.executions) == 1
-
-
 def test_database_fingerprint_contains_no_password():
     connection = ScriptedConnection(
         [[("catmaid", "importer", "160004", "cluster-1")]],

@@ -129,7 +129,7 @@ def manifest_rows(
                 "neuron_id": neuron_id,
                 "skeleton_id": skeleton_id,
                 "node_count": member.node_count,
-                "name": member.display_name,
+                "name": member.import_name,
                 "batch_index": batch.index,
             }
         )

@@ -271,8 +271,11 @@ trimmed (including Unicode whitespace). For example,
 `191805/0021814.swc` yields `0021814`, and `1054599727.23.SWC` yields
 `1054599727.23`. `folder/ 0021814 .swc` also yields `0021814`. Values remain
 strings: leading zeros, case, dots, internal whitespace, Unicode characters and
-template-looking text such as `{n}` are preserved. Original ZIP member paths and
-display names are retained in the manifest.
+template-looking text such as `{n}` are preserved. Original ZIP member paths are
+retained in the manifest. Display names normally retain the filename stem; the
+exact display value `\N` is sanitized to `_N` so PostgreSQL COPY cannot interpret
+it as NULL. This affects neuron/skeleton labels and the manifest's `name` field;
+the source fragment ID and its annotation remain literal and unchanged.
 
 Planning rejects empty identifiers, duplicate identifiers anywhere in the
 archive after trimming, and identifiers longer than 239 characters after trimming.
@@ -393,8 +396,11 @@ failed ingestion automatically.
 
 `CATMAID_PROJECTS_DIRECTORY` defaults to `/home/django/projects`, and
 `CATMAID_INGESTION_MEDIA_ROOT` defaults to
-`/tmp/catmaid-skeleton-ingestion-media`. A failed child command records its result
-in `state/run-wrapper-result.json`. Input downloads, workflow submission,
+`/tmp/catmaid-skeleton-ingestion-media`. Each `run` clears the previous wrapper
+failure marker before checking readiness or starting the child. A failed child
+records a fresh result in `state/run-wrapper-result.json`; a successful retry
+leaves that failure marker absent and reports success through `result.json`.
+Input downloads, workflow submission,
 publication and failure cleanup remain the caller's responsibility.
 
 ## Deployment settings

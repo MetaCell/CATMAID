@@ -238,7 +238,7 @@ def prepare_copy_rows(
                     project.user_id,
                     project.project_id,
                     project.neuron_class_id,
-                    member.display_name,
+                    member.import_name,
                 ]
             )
             class_writer.writerow(
@@ -247,7 +247,7 @@ def prepare_copy_rows(
                     project.user_id,
                     project.project_id,
                     project.skeleton_class_id,
-                    member.display_name,
+                    member.import_name,
                 ]
             )
             relationship_writer.writerow(
@@ -301,7 +301,7 @@ def prepare_copy_rows(
                     annotation_id=int(annotation_id),
                     annotation_link_id=int(annotation_link_id),
                     fragment_id=member.fragment_id,
-                    name=member.display_name,
+                    name=member.import_name,
                     node_count=len(nodes),
                     cable_length_nm=_stored_cable_nm(nodes, request.scale_nm),
                 )

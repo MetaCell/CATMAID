@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import csv
+import io
+import zipfile
 from pathlib import Path
 
+import pytest
+
+from catmaid_skeleton_batch_import.archive import scan_archive
+from catmaid_skeleton_batch_import.artifacts import manifest_rows, read_manifest, write_manifest
+from catmaid_skeleton_batch_import.config import DEFAULTS
 from catmaid_skeleton_batch_import.domain import (
     IngestionRequest,
+    ImportSettings,
     PlannedBatch,
     PlannedMember,
     SwcNode,
@@ -14,6 +22,48 @@ from catmaid_skeleton_batch_import.loader import (
     _treenode_row_matches,
     prepare_copy_rows,
 )
+from catmaid_skeleton_batch_import.planner import plan_archive, read_plan, write_plan
+from catmaid_skeleton_batch_import.swc import parse_swc
+
+
+@pytest.mark.parametrize(("source_name", "import_name"), [
+    (r"\N", "_N"), (r"prefix\N", r"prefix\N"), ("cell", "cell"),
+])
+def test_display_name_sanitization_matches_copy_expectations_and_manifest(
+    tmp_path: Path, source_name: str, import_name: str,
+) -> None:
+    content = b"1 1 0 0 0 1 -1\n2 3 1 0 0 1 1\n"
+    archive = tmp_path / "cells.zip"
+    member_path = f"folder/{source_name}.swc"
+    with zipfile.ZipFile(archive, "w") as target:
+        target.writestr(member_path, content)
+    request = IngestionRequest(schema_version=1, archive_path=archive,
+                               coordinate_unit="nm", target_project_id=5)
+    settings = ImportSettings(**DEFAULTS)
+    plan = plan_archive(scan_archive(request, settings), settings)
+    plan_path = tmp_path / "plan.jsonl.gz"
+    write_plan(plan_path, plan)
+    batch = read_plan(plan_path).batches[0]
+    assert batch.members[0].display_name == source_name
+    project = ProjectContext(project_id=5, stack_id=None, project_stack_id=None,
+                             user_id=1, neuron_class_id=8, skeleton_class_id=9,
+                             model_of_relation_id=10, annotation_class_id=11,
+                             annotated_with_relation_id=12, existing_project=True)
+    concept_ids = [100, 101, 102, 103, 104]
+    nodes = parse_swc(io.BytesIO(content), member_path).nodes
+    with prepare_copy_rows(batch, request, project, concept_ids, [200, 201],
+                           lambda _member: nodes) as prepared:
+        rows = list(csv.reader(prepared.class_file))
+        assert [row[4] for row in rows] == [
+            import_name, import_name, f"source-fragment:{source_name}",
+        ]
+        assert prepared.expected_skeletons[0].name == import_name
+    manifest = tmp_path / "manifest.csv.gz"
+    write_manifest(manifest, manifest_rows(batch, concept_ids))
+    record = read_manifest(manifest)[0]
+    assert record["name"] == import_name
+    assert record["fragment_id"] == source_name
+    assert record["member_path"] == member_path
 
 
 def test_copy_rows_scale_coordinates_and_preserve_unknown_radius(

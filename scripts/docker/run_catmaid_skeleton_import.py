@@ -149,6 +149,19 @@ def _write_terminal_marker(
         temporary.unlink(missing_ok=True)
 
 
+def _clear_terminal_marker(state_directory: Path) -> None:
+    """A new invocation must not inherit the previous wrapper's failure."""
+    try:
+        (state_directory / RUN_RESULT_FILENAME).unlink()
+        _fsync_directory(state_directory)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise EntrypointError(
+            f"Could not reset the previous CATMAID wrapper result: {exc}", EX_NOINPUT
+        ) from exc
+
+
 def _plan(workspace: Path, importer: str, environ: Mapping[str, str]) -> int:
     request = workspace / REQUEST_FILENAME
     if not request.is_file():
@@ -216,6 +229,7 @@ def _wait_for_database(
 
 
 def _run(workspace: Path, importer: str, environ: Mapping[str, str]) -> int:
+    _clear_terminal_marker(workspace / STATE_DIRECTORY)
     database_host = _required_environment_value(environ, "DB_HOST")
     database_name = _required_environment_value(environ, "DB_NAME")
     database_user = _required_environment_value(environ, "DB_USER")

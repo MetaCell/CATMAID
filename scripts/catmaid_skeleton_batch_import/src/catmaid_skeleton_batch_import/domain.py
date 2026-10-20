@@ -113,6 +113,11 @@ class PlannedMember:
     fragment_id: str
     batch_index: int | None = None
 
+    @property
+    def import_name(self) -> str:
+        """Sanitize the COPY NULL marker in labels without changing source IDs."""
+        return "_N" if self.display_name == r"\N" else self.display_name
+
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
             "member_path": self.member_path,

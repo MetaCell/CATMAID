@@ -31,6 +31,7 @@ class OfflineGridCache:
         self.connection = connection
         self.lock_timeout_ms = lock_timeout_ms
         self.statement_timeout_ms = statement_timeout_ms
+        self._provider = None
         self.grids = self._read_grids()
 
     def _read_grids(self):
@@ -97,8 +98,10 @@ class OfflineGridCache:
 
     def _refresh(self, grid, cell):
         from catmaid.control.grid_cache import locked_grid_cell
-        from catmaid.control.node import update_grid_cell
+        from catmaid.control.node import Postgis3dNodeProvider, update_grid_cell
 
+        if self._provider is None:
+            self._provider = Postgis3dNodeProvider()
         params = {"project_id": self.project_id, "limit": None, "ordering": grid["ordering"]}
         for name in ("n_largest_skeletons_limit", "n_last_edited_skeletons_limit",
                      "hidden_last_editor_id"):
@@ -113,7 +116,7 @@ class OfflineGridCache:
                 grid["cell_depth"], params, grid["allow_empty"], grid["n_lod_levels"],
                 grid["lod_min_bucket_size"], grid["lod_strategy"], grid["has_json_data"],
                 grid["has_json_text_data"], grid["has_msgpack_data"],
-                cursor=cursor, delete_empty=True,
+                provider=self._provider, cursor=cursor, delete_empty=True,
             ):
                 raise RetryableError(f"Grid {grid['id']} cell {cell} could not be rebuilt")
 

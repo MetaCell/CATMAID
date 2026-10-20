@@ -160,6 +160,37 @@ Path(os.environ["PYTHON_PATH_FILE"]).write_text(
     ]
 
 
+def test_successful_retry_clears_previous_failure_before_starting_child(tmp_path: Path) -> None:
+    importer = tmp_path / "importer"
+    _write_executable(importer, f"""#!{sys.executable}
+import os
+import sys
+from pathlib import Path
+state_dir = Path(sys.argv[sys.argv.index('--state-dir') + 1])
+if (state_dir / 'run-wrapper-result.json').exists():
+    sys.exit(99)
+sys.exit(int(os.environ['TEST_IMPORTER_EXIT']))
+""")
+    environment = _base_environment(tmp_path, importer)
+    state_dir = Path(environment["SKELETON_INGESTION_WORKSPACE"]) / "state"
+    state_dir.mkdir()
+    checkpoint = state_dir / "state.json"
+    checkpoint.write_text('{"checkpoint":"keep"}', encoding="utf-8")
+    marker = state_dir / "run-wrapper-result.json"
+    command = [sys.executable, str(WRAPPER), "run"]
+
+    failed = subprocess.run(command, env=environment | {"TEST_IMPORTER_EXIT": "3"},
+                            text=True, capture_output=True, check=False)
+    assert failed.returncode == 3, failed.stderr
+    assert json.loads(marker.read_text())["importer_exit_code"] == 3
+
+    succeeded = subprocess.run(command, env=environment | {"TEST_IMPORTER_EXIT": "0"},
+                               text=True, capture_output=True, check=False)
+    assert succeeded.returncode == 0, succeeded.stderr
+    assert not marker.exists()
+    assert json.loads(checkpoint.read_text()) == {"checkpoint": "keep"}
+
+
 def test_run_does_not_retry_operator_attention_exit(tmp_path: Path) -> None:
     calls = tmp_path / "calls"
     importer = tmp_path / "importer"
