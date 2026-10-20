@@ -53,7 +53,16 @@ and the unchanged local input files recorded there. Run the command from a
 CATMAID application environment where `mysite.settings` and the `catmaid`
 package are importable.
 
-To append to an existing project, provide its numeric ID:
+## Input contract
+
+An ingestion consists of a **request JSON file plus a local ZIP containing SWC
+files**. An external-ID CSV is optional and lives outside the ZIP. There is no
+required manifest inside the ZIP. The archive and optional CSV must remain
+unchanged and readable by both `plan` and `run`.
+
+### Request JSON
+
+Append to an existing tracing project (the common case):
 
 ```json
 {
@@ -68,22 +77,158 @@ To append to an existing project, provide its numeric ID:
 }
 ```
 
-The project does **not** need to be empty. Each SWC creates a new neuron and
-skeleton with fresh CATMAID IDs. Existing morphology, annotations, names,
-permissions, project visibility and stacks are retained. The target must
-already have CATMAID tracing setup; the importer does not repair its ontology.
-Coordinates must already use the project's physical coordinate frame. No
-translation, rotation or voxel-to-physical transformation is applied.
+Create a new hidden project instead: replace `target` with `stack`:
 
-`target` and `stack` are mutually exclusive. An existing-project request needs
-no stack geometry, creates no stack, and finishes with `status: "complete"`.
-It adds new skeletons without replacing or merging existing skeletons, neurons,
-annotations, connectors, stacks or permissions. A source-fragment identifier
-already in the target is rejected before any batch is loaded; use the original
-state directory to resume that import instead of starting it again. Imports using
-this tool serialize against other imports to the same target project.
+```json
+{
+  "schema_version": 1,
+  "source": {
+    "archive_path": "/staging/skeletons.zip",
+    "coordinate_unit": "um"
+  },
+  "stack": {
+    "dimension": [17797, 30801, 10826],
+    "resolution_nm": [350, 350, 1000]
+  }
+}
+```
 
-### Offline import and cache rebuild
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `schema_version` | Always | Literal `1`. |
+| `source.archive_path` | Always | Non-empty local ZIP path, visible in the importer's runtime/container. Prefer an absolute path; relative paths resolve against the process working directory. URLs are not supported. |
+| `source.coordinate_unit` | Always | Exactly `"um"` or `"nm"`; applies to every SWC's XYZ coordinates and all known radii. No automatic detection or per-file unit override. |
+| `source.external_skeleton_id_map_path` | Optional | Local path to the external-ID CSV described below; add this field inside `source`. |
+| `target.project_id` | Existing project only | Positive integer, at most 2147483647. The project must exist and have complete tracing setup. |
+| `stack.dimension` | New project only | `[size_x, size_y, size_z]`, three positive integer voxel counts. |
+| `stack.resolution_nm` | New project only | `[nm_per_voxel_x, nm_per_voxel_y, nm_per_voxel_z]`, three positive finite numbers. Used to configure the new stack; does not scale SWC coordinates. |
+
+Supply exactly one of `target` and `stack`. Unknown JSON fields are rejected;
+there are no request fields for arbitrary annotations or cache overrides. Cache
+and batch defaults are deployment settings documented below.
+
+An existing project does **not** need to be empty. Each SWC creates a new neuron
+and skeleton with fresh CATMAID IDs. Existing morphology, names, provenance,
+connectors, permissions, project visibility and stacks are retained. The importer
+does not merge incoming SWCs with existing skeletons or repair tracing setup.
+Source-fragment IDs already present in the project are rejected before loading;
+use the original state directory to resume an earlier import. Existing targets
+finish with `status: "complete"`; new hidden projects finish with
+`status: "ready_for_publication"`.
+
+### How source units are determined
+
+**The caller must establish the units from the source dataset documentation,
+exporter settings, or a reliable header/metadata statement before planning.**
+The [SWC specification](https://swc-specification.readthedocs.io/en/latest/swc.html)
+describes XYZ coordinates and radius in micrometres, but a `.swc` filename alone
+does not prove that an exporter followed that convention. Do not infer units
+from coordinate magnitudes alone. If the units are unknown, establish them with
+the dataset provider before ingestion.
+
+The importer treats the request's `source.coordinate_unit` as authoritative. It
+ignores `#` comment lines, including any unit, scale or offset declarations; it
+does not read image metadata or automatically detect a mismatch between the
+request and the actual data.
+
+| Declared value | Conversion to CATMAID nanometres |
+| --- | --- |
+| `"um"` | Multiply X, Y, Z and known radii by 1000. For example, X=12.5 becomes 12500 nm. |
+| `"nm"` | Keep X, Y, Z and known radii unchanged. For example, X=12500 stays 12500 nm. |
+| Radius `-1` | Remains `-1` (unknown radius), regardless of the declared unit. |
+
+All SWCs in a ZIP must already share the declared physical unit and the target
+project's coordinate frame. Mixed-unit archives and raw voxel/pixel coordinates
+must be converted before ingestion. `stack.resolution_nm` does not perform that
+conversion; translation, axis reordering, rotation and registration are also the
+caller's responsibility.
+
+### Files on disk and ZIP structure
+
+Example files visible to the importer:
+
+```text
+/staging/
+  request.json
+  skeletons.zip
+  external-ids.csv       # optional
+  state/                 # created by plan; use the same directory for resume
+```
+
+Example members **inside** `skeletons.zip`:
+
+```text
+root-cell.swc
+specimen-01/
+  0021814.swc
+specimen-02/
+  1054599727.23.SWC
+```
+
+- SWCs may be at the ZIP root or in nested directories. Directory names have no
+  special meaning; no particular top-level folder is required. Use `/` in member
+  paths. The importer reads members directly without extracting them.
+- Every regular file ending in `.swc` (case-insensitively) is imported as one
+  skeleton. Other files are ignored; nested ZIPs are not recursively imported.
+  The archive must contain at least one SWC. Encrypted members and duplicate
+  archive-member paths are rejected; SWC symlinks/special files are rejected.
+- The filename without its final extension becomes the source fragment ID:
+  `specimen-01/0021814.swc` creates `source-fragment:0021814`.
+  Identifiers must be non-empty, at most 239 characters, and unique across the
+  whole archive. `a/123.swc` and `b/123.swc` conflict despite different folders.
+  Leading zeros, case and dots are preserved as literal strings.
+- Each SWC must fit within one batch's node limit (250,000 nodes by default).
+  A large SWC is rejected rather than split automatically. Other archive/file
+  size and count limits are listed under deployment settings.
+
+### Content of each SWC
+
+An SWC is UTF-8 text. Blank lines and full lines beginning with `#` are ignored.
+Every other line must have exactly seven whitespace-separated columns:
+
+```text
+id  type  x  y  z  radius  parent_id
+```
+
+That heading describes the columns; do not put it into the file as an
+uncommented row. Example file, with physical values expressed in micrometres and
+`source.coordinate_unit` set to `"um"`:
+
+```swc
+# id type x y z radius parent_id
+1 1 10 20 30 2 -1
+2 3 11 20 30 0.5 1
+3 3 12 21 30 -1 2
+```
+
+`id`, `type` and `parent_id` are integers; XYZ and radius are finite numbers.
+Node IDs are unique within a file and may be reused in other files: they are
+local topology references, not CATMAID IDs. There must be at least two nodes,
+exactly one root (`parent_id=-1`), valid parent references, and one connected
+acyclic tree. A radius must be non-negative or exactly `-1` for unknown.
+The sample root becomes `(10000, 20000, 30000)` nm with radius `2000` nm.
+
+### Optional external-ID CSV
+
+Add `"external_skeleton_id_map_path": "/staging/external-ids.csv"` inside
+`source` only when this mapping is needed. For the example ZIP, its complete
+content could be:
+
+```csv
+member_path,external_skeleton_id
+root-cell.swc,external-root
+specimen-01/0021814.swc,external-0021814
+specimen-02/1054599727.23.SWC,external-1054599727.23
+```
+
+The UTF-8 CSV header must be exactly `member_path,external_skeleton_id`, in that
+order, with two columns per row. Provide exactly one row for **every** SWC,
+matching its full, case-sensitive ZIP member path (including folders). Missing
+or unknown paths, duplicate paths, and duplicate or empty external IDs are
+rejected. External IDs are strings recorded in the output manifest; they do not
+choose CATMAID IDs or replace filename-derived fragment identifiers.
+
+## Offline import and cache rebuild
 
 1. Make the target managed layer inactive in Neuroglass and stop other writes to
    that project. No CATMAID service shutdown is required.
@@ -118,9 +263,17 @@ A failed rebuild leaves committed skeleton batches intact. The saved cache plan
 preserves grid settings and coverage across interruptions; resume restarts the
 cache rebuild without importing those batches again. Keep the layer inactive on
 any failure or uncertain commit. If completed payload verification later fails,
-use `run --rebuild-cache` with the same state directory. A full rebuild can cost
-more than targeted refreshes for a small append into a very large project, but
-avoids repeated refreshes of overlapping cells while loading batches.
+use `run --rebuild-cache` with the same state directory.
+
+**There is one full rebuild after the last batch commits.** No cache rebuild runs
+between batches. "Full" means regenerating payloads across every configured grid's
+project coverage using both old and new data, while retaining grid definitions.
+For example, appending a few skeletons that affect 3 cells to a project with
+100,000 populated cells still rebuilds the full grid coverage once. That costs
+more than refreshing just those 3 cells. The previous live-import approach could
+refresh an overlapping cell again after each batch; that approach has been
+removed. The current tradeoff is one final full pass and a simpler offline
+consistency model, rather than a rebuild per batch.
 
 The database role must be able to use `session_replication_role=replica` for both
 new and existing targets. This also bypasses foreign-key triggers, so the importer
@@ -128,30 +281,6 @@ explicitly validates ownership, classes, relations, parent membership and exact
 node values before committing. Bulk imports use their source manifest as the
 audit record; they do not reproduce ordinary per-node history, spatial events or
 per-SWC API import transaction metadata.
-
-To create a new hidden project instead, omit `target` and supply `stack`:
-
-```json
-{
-  "schema_version": 1,
-  "source": {
-    "archive_path": "/staging/191805.zip",
-    "coordinate_unit": "um"
-  },
-  "stack": {
-    "dimension": [17797, 30801, 10826],
-    "resolution_nm": [350, 350, 1000]
-  }
-}
-```
-
-`source.external_skeleton_id_map_path` may name a local CSV with exactly the
-columns `member_path,external_skeleton_id`. The mapping enriches the output
-manifest but never chooses CATMAID IDs.
-
-Coordinates and non-sentinel radii use the same declared physical unit. An SWC
-radius of `-1` remains CATMAID's unknown-radius sentinel. Voxel and anisotropic
-source coordinates are not supported.
 
 ## Source fragment identifiers
 
@@ -168,6 +297,14 @@ for the 16-character prefix in CATMAID's 255-character annotation field. It is
 per identifier, not a combined limit on the number or total length of a
 segment's contributing identifiers. Visible neuron and skeleton names keep
 CATMAID's normal behavior and are not the source of truth for these values.
+
+The merge and split inheritance rules are implemented in the **CATMAID backend**
+in this branch, in the normal `POST /{project_id}/skeleton/join` and
+`POST /{project_id}/skeleton/split` operations. Deploy this backend version; clients
+using these endpoints do not need to calculate or submit provenance unions or
+copies. After a successful operation the client should reload annotations/source
+metadata to update its display. A custom direct-database editing path bypasses
+these API rules. No Neuroglass UI changes are included here.
 
 Merges retain the union of both source-identifier sets, including with an empty
 client annotation selection. Splits copy the entire set to both results,
