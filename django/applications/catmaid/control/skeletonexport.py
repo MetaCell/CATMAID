@@ -65,6 +65,11 @@ def get_treenodes_qs(project_id=None, skeleton_id=None, with_labels:bool=True) -
     return treenode_qs, labels_qs, labelconnector_qs
 
 
+def validate_skeleton_in_project(project_id:int, skeleton_id:int) -> None:
+    if not ClassInstance.objects.filter(pk=skeleton_id, project_id=project_id).exists():
+        raise Http404(f"Skeleton #{skeleton_id} doesn't exist")
+
+
 def get_swc_string(project_id, skeleton_id, treenodes_qs:QuerySet, linearize_ids:bool=False,
         soma_markers:List[str]=None, get_extra_cols=None) -> str:
     """
@@ -346,6 +351,8 @@ def compact_skeleton_detail(request:HttpRequest, project_id=None, skeleton_id=No
     with_edition_times = get_request_bool(request.GET, "with_edition_times", False)
     return_format = request.GET.get('format', 'json')
     ordered = get_request_bool(request.GET, "ordered", False)
+
+    validate_skeleton_in_project(project_id, skeleton_id)
 
     result = _compact_skeleton(project_id, skeleton_id, with_connectors,
                                with_tags, with_history, with_merge_history,
