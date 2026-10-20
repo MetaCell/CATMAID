@@ -189,18 +189,18 @@ class SourceFragmentAnnotationApiTests(CatmaidApiTestCase):
                 '1 1 0 0 0 1 -1\n', annotations=['ordinary', 'source-fragment:forged'])
         self.assertEqual((Treenode.objects.count(), ClassInstance.objects.count()), before)
 
-    def test_exact_case_sensitive_lookup_is_literal_and_resolves_current_skeleton(self):
+    def test_normalized_fragment_lookup_resolves_current_skeleton(self):
         names = [
             'source-fragment:000000900719925474099312345',
             'source-fragment:part,001', 'source-fragment:Test_100%',
-            r'source-fragment:path\name', 'source-fragment:雪{n} ',
-            '/literal[0-9].*', ' leading-and-trailing ',
+            r'source-fragment:path\name', 'source-fragment:雪{n}',
+            'source-fragment:internal spaces',
         ]
         ids = self.seed(*names)
         for name in names:
             with self.subTest(name=name):
                 response = self.client.post(f'/{self.test_project_id}/annotations/query-targets', {
-                    'types[0]': 'annotation', 'name': name,
+                    'types[0]': 'annotation', 'name': name.replace('\\', '\\\\'),
                     'name_exact': True, 'name_case_sensitive': True})
                 self.assertEqual(response.status_code, 200, response.content)
                 self.assertEqual([(item['id'], item['name']) for item in response.json()['entities']],
@@ -216,11 +216,16 @@ class SourceFragmentAnnotationApiTests(CatmaidApiTestCase):
 
     def test_existing_partial_case_insensitive_and_regex_search_modes_remain(self):
         ids = self.seed('ordinary-alpha', 'ordinary-beta')
-        for query in ({'name': 'ALPHA'}, {'name': '/ordinary-(alpha|beta)$', 'name_case_sensitive': True}):
+        for query in (
+            {'name': 'ALPHA'},
+            {'name': ' ordinary-alpha ', 'name_exact': True, 'name_case_sensitive': True},
+            {'name': '/ordinary-(alpha|beta)$', 'name_case_sensitive': True},
+            {'name': ' /ordinary-(alpha|beta)$ ', 'name_exact': True, 'name_case_sensitive': True},
+        ):
             response = self.client.post(f'/{self.test_project_id}/annotations/query-targets',
                 {'types[0]': 'annotation', **query})
             self.assertEqual(response.status_code, 200, response.content)
-            expected = {ids['ordinary-alpha']} if query['name'] == 'ALPHA' else set(ids.values())
+            expected = set(ids.values()) if query['name'].strip().startswith('/') else {ids['ordinary-alpha']}
             self.assertEqual({item['id'] for item in response.json()['entities']}, expected)
 
     def test_audit_batch_returns_unmodified_identifiers_and_read_permissions_hold(self):

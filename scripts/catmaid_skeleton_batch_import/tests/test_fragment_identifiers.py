@@ -14,7 +14,7 @@ from catmaid_skeleton_batch_import.fragments import (
     MAX_FRAGMENT_ID_LENGTH, SOURCE_FRAGMENT_ANNOTATION_PREFIX,
     fragment_annotation_name, fragment_id_from_member_path,
 )
-from catmaid_skeleton_batch_import.planner import build_plan, read_plan, write_plan
+from catmaid_skeleton_batch_import.planner import build_plan, read_plan, serialize_plan, write_plan
 from catmaid_skeleton_batch_import.state import StateStore
 from test_planner import member
 
@@ -24,10 +24,12 @@ from test_planner import member
     ("1470096546.0.swc", "1470096546.0"),
     ("nested/1054599727.23.SWC", "1054599727.23"),
     ("900719925474099312345678901234567890.swc", "900719925474099312345678901234567890"),
-    ("Case {n} {n123} .swc", "Case {n} {n123} "),
+    ("Case {n} {n123} .swc", "Case {n} {n123}"),
+    ("nested/ \t0021814 \u2003.SWC", "0021814"),
+    ("nested/\u2003 internal spaces \t.swc", "internal spaces"),
     ("nested/a.b.swc.swc", "a.b.swc"),
 ])
-def test_exact_filename_fragment_identifier(filename, expected):
+def test_normalized_filename_fragment_identifier(filename, expected):
     assert fragment_id_from_member_path(filename) == expected
     assert fragment_annotation_name(expected) == "source-fragment:" + expected
 
@@ -35,15 +37,24 @@ def test_exact_filename_fragment_identifier(filename, expected):
 def test_annotation_length_boundary_and_no_silent_truncation():
     assert MAX_FRAGMENT_ID_LENGTH == 239
     assert len(fragment_annotation_name(fragment_id_from_member_path("é" * 239 + ".swc"))) == 255
+    assert fragment_id_from_member_path(" \t" + "é" * 239 + " \u2003.swc") == "é" * 239
     with pytest.raises(InvalidInputError, match="239 characters"):
         fragment_id_from_member_path("a" * 240 + ".swc")
-    with pytest.raises(InvalidInputError, match="empty fragment identifier"):
-        fragment_id_from_member_path("folder/.swc")
+    for path in ("folder/.swc", "folder/ \t\u2003.swc"):
+        with pytest.raises(InvalidInputError, match="empty fragment identifier"):
+            fragment_id_from_member_path(path)
+
+
+def test_annotation_names_require_normalized_identifiers():
+    with pytest.raises(ValueError, match="surrounding whitespace"):
+        fragment_annotation_name(" 001 ")
 
 
 def test_duplicate_identifiers_rejected_across_directories_and_batches():
     with pytest.raises(InvalidInputError, match="duplicate fragment identifier"):
         build_plan([member("a/0021814.swc", 2), member("z/0021814.SWC", 2)], 2)
+    with pytest.raises(InvalidInputError, match="duplicate fragment identifier"):
+        build_plan([member("a/ 0021814 .swc", 2), member("z/0021814.SWC", 2)], 2)
     plan = build_plan([member("ID.swc", 2), member("id.swc", 2), member("1.swc", 2),
                        member("01.swc", 2), member("1.0.swc", 2)], 2)
     assert len(plan.members) == 5
@@ -55,7 +66,7 @@ def test_plan_rejects_fragment_identifier_inconsistent_with_filename():
 
 
 def test_new_plan_and_manifest_preserve_identifier_and_five_id_layout(tmp_path):
-    plan = build_plan([member("191805/0021814.swc", 2)], 2)
+    plan = build_plan([member("191805/ 0021814 .swc", 2)], 2)
     path = tmp_path / "plan.jsonl.gz"
     write_plan(path, plan)
     loaded = read_plan(path)
@@ -67,10 +78,20 @@ def test_new_plan_and_manifest_preserve_identifier_and_five_id_layout(tmp_path):
     manifest = tmp_path / "manifest.csv.gz"
     write_manifest(manifest, rows)
     assert read_manifest(manifest) == [{
-        "member_path": "191805/0021814.swc", "fragment_id": "0021814",
+        "member_path": "191805/ 0021814 .swc", "fragment_id": "0021814",
         "neuron_id": "10", "skeleton_id": "11", "node_count": "2",
-        "name": "0021814", "batch_index": "1",
+        "name": " 0021814 ", "batch_index": "1",
     }]
+
+
+def test_old_plan_with_untrimmed_identifiers_is_rejected_instead_of_renormalized(tmp_path):
+    plan = build_plan([member(" 001 .swc", 2)], 2)
+    path = tmp_path / "old-plan.jsonl.gz"
+    payload = gzip.decompress(serialize_plan(plan)).decode("utf-8")
+    with gzip.open(path, "wt", encoding="utf-8") as target:
+        target.write(payload.replace('"fragment_id":"001"', '"fragment_id":" 001 "'))
+    with pytest.raises(InvalidInputError, match="does not match its filename"):
+        read_plan(path)
 
 
 @pytest.mark.parametrize("schema_version", [1, 2])
@@ -150,7 +171,7 @@ def test_copy_rows_preserve_literal_identifiers_without_name_template_expansion(
     from catmaid_skeleton_batch_import.domain import IngestionRequest, SwcNode
     from catmaid_skeleton_batch_import.loader import ProjectContext, prepare_copy_rows
     request = IngestionRequest(1, tmp_path / "source.zip", "nm", (10, 10, 10), (1, 1, 1))
-    plan = build_plan([member("folder/00001.0 {n}.SWC", 2)], 2)
+    plan = build_plan([member("folder/ 00001.0 {n} .SWC", 2)], 2)
     project = ProjectContext(1, 2, 3, 7, 31, 32, 41, 33, 42)
     nodes = (SwcNode(1, 1, 1, 1, 1, 1, -1), SwcNode(2, 3, 2, 1, 1, 1, 1))
     # This helper checks cable length against the source independently of metadata.
@@ -159,8 +180,8 @@ def test_copy_rows_preserve_literal_identifiers_without_name_template_expansion(
         classes = list(csv.reader(prepared.class_file))
         links = list(csv.reader(prepared.relationship_file))
         assert classes == [
-            ["10", "7", "1", "31", "00001.0 {n}"],
-            ["11", "7", "1", "32", "00001.0 {n}"],
+            ["10", "7", "1", "31", " 00001.0 {n} "],
+            ["11", "7", "1", "32", " 00001.0 {n} "],
             ["13", "7", "1", "33", "source-fragment:00001.0 {n}"],
         ]
         assert links == [["12", "7", "1", "41", "11", "10"],

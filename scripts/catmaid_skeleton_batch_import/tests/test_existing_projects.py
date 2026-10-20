@@ -31,10 +31,10 @@ COUNTS = {
 }
 
 
-def request_file(tmp_path, *, target=123):
+def request_file(tmp_path, *, target=123, member_path="alpha.swc"):
     archive = tmp_path / "input.zip"
     with zipfile.ZipFile(archive, "w") as source:
-        source.writestr("alpha.swc", SWC)
+        source.writestr(member_path, SWC)
     path = tmp_path / "request.json"
     path.write_text(json.dumps({
         "schema_version": 1,
@@ -235,10 +235,11 @@ def test_complete_append_and_resume_are_scoped_and_preserve_target_configuration
         state.select_existing_project(124)
 
 
-def test_provenance_collision_is_rejected_before_any_batch_is_loaded(tmp_path, monkeypatch):
+@pytest.mark.parametrize("member_path", ["alpha.swc", "folder/ \talpha \u2003.swc"])
+def test_provenance_collision_is_rejected_before_any_batch_is_loaded(tmp_path, monkeypatch, member_path):
     configure_run(monkeypatch, Connection([(99, "source-fragment:alpha")]))
     state_dir = tmp_path / "state"
-    orchestrator.plan_ingestion(request_file(tmp_path), state_dir)
+    orchestrator.plan_ingestion(request_file(tmp_path, member_path=member_path), state_dir)
     monkeypatch.setattr(orchestrator, "execute_batch_transaction", forbidden)
     monkeypatch.setattr(database, "allocate_sequence_ids", forbidden)
     with pytest.raises(InvalidInputError, match="already exist in project 123"):

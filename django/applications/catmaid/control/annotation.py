@@ -71,14 +71,11 @@ def get_annotated_entities(project_id:Union[int,str], params, relations=None, cl
     not_annotation_sets:Set[FrozenSet] = set()
     annotation_sets_to_expand:Set[FrozenSet] = set()
 
-    # Filename provenance can contain significant whitespace and pattern syntax.
-    # Preserve it for literal lookups; other search modes keep their normalization.
-    raw_name = params.get('name', "")
+    # Get name, annotator and time constraints, if available
+    name = params.get('name', "").strip()
     name_not = get_request_bool(params, 'name_not', False)
     name_exact = get_request_bool(params, 'name_exact', False)
     name_case_sensitive = get_request_bool(params, 'name_case_sensitive', False)
-    literal_name = name_exact and name_case_sensitive
-    name = raw_name if literal_name else raw_name.strip()
     try:
         annotator_ids = set(map(int, params.getlist('annotated_by')))
     except AttributeError as e:
@@ -149,35 +146,32 @@ def get_annotated_entities(project_id:Union[int,str], params, relations=None, cl
     if end_date:
         params['end_date'] = end_date
 
-    # Keep pattern searches on their existing trigram/upper() index path; literal
-    # equality must not reinterpret a source filename as a search pattern.
+    # If a name is given, add this to the query. If its first character is a
+    # slash, treat it as regex. There is a a trigram index and a upper()
+    # expression index on class_instance.name and we add checks to utilize both,
+    # if possible. This is mainly useful for exact name queries, both
+    # case-sensitive and case insensitive as well as regex and normal.
     if name:
-        if literal_name:
-            # Exact lookup treats whitespace and LIKE/regex syntax as literal data.
-            params["name"] = name
-            op = '<>' if name_not else '='
-            filters.append(f"ci.name {op} %(name)s")
+        is_regex = name.startswith('/')
+        if is_regex:
+            op = '~' if name_case_sensitive else '~*'
+            upper_name_op = '~'
+            params["name"] = name[1:]
         else:
-            is_regex = name.startswith('/')
-            if is_regex:
-                op = '~' if name_case_sensitive else '~*'
-                upper_name_op = '~'
-                params["name"] = name[1:]
-            else:
-                op = '~~' if name_case_sensitive else '~~*'
-                upper_name_op = '~~'
-                # LIKE (~~) and ILIKE (~~*) treat _ and % as wildcards, therefore
-                # they need to be escaped in the input.
-                name = name.replace('_', '\\_').replace('%', '\\%')
+            op = '~~' if name_case_sensitive else '~~*'
+            upper_name_op = '~~'
+            # LIKE (~~) and ILIKE (~~*) treat _ and % as wildcards, therefore
+            # they need to be escaped in the input.
+            name = name.replace('_', '\\_').replace('%', '\\%')
 
-                params["name"] = name if name_exact else ('%' + name + '%')
+            params["name"] = name if name_exact else ('%' + name + '%')
 
-            if name_not:
-                filters.append(f"ci.name !{op} %(name)s")
-                filters.append(f"upper(ci.name) !{upper_name_op} upper(%(name)s)")
-            else:
-                filters.append(f"ci.name {op} %(name)s")
-                filters.append(f"upper(ci.name) {upper_name_op} upper(%(name)s)")
+        if name_not:
+            filters.append(f"ci.name !{op} %(name)s")
+            filters.append(f"upper(ci.name) !{upper_name_op} upper(%(name)s)")
+        else:
+            filters.append(f"ci.name {op} %(name)s")
+            filters.append(f"upper(ci.name) {upper_name_op} upper(%(name)s)")
 
     # Map annotation sets to their expanded sub-annotations
     sub_annotation_ids = get_sub_annotation_ids(project_id, annotation_sets_to_expand,
@@ -487,8 +481,7 @@ def query_annotated_classinstances(request:HttpRequest, project_id:Optional[Unio
       - name: name_exact
         description: |
             Whether the name has to match exactly or can be a part of the result
-            name. With name_case_sensitive enabled this is a literal equality
-            comparison, including whitespace and any pattern characters.
+            name. This is typically faster than using a regular expression.
             False by default.
         type: bool
         paramType: form

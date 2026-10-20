@@ -169,10 +169,12 @@ specimen-02/
   skeleton. Other files are ignored; nested ZIPs are not recursively imported.
   The archive must contain at least one SWC. Encrypted members and duplicate
   archive-member paths are rejected; SWC symlinks/special files are rejected.
-- The filename without its final extension becomes the source fragment ID:
+- The filename without its final extension, with leading and trailing whitespace
+  trimmed, becomes the source fragment ID:
   `specimen-01/0021814.swc` creates `source-fragment:0021814`.
   Identifiers must be non-empty, at most 239 characters, and unique across the
-  whole archive. `a/123.swc` and `b/123.swc` conflict despite different folders.
+  whole archive after trimming. `a/123.swc` and `b/ 123 .swc` conflict despite
+  different folders. Whitespace-only identifiers are rejected.
   Leading zeros, case and dots are preserved as literal strings.
 - Each SWC must fit within one batch's node limit (250,000 nodes by default).
   A large SWC is rejected rather than split automatically. Other archive/file
@@ -263,14 +265,18 @@ per-SWC API import transaction metadata.
 ## Source fragment identifiers
 
 Every SWC creates one protected `source-fragment:<fragment_id>` annotation on
-its modeled neuron. The identifier is the exact archive-member basename with
-only the final `.swc` extension removed, case-insensitively. For example,
+its modeled neuron. The identifier is the archive-member basename with the final
+`.swc` extension removed case-insensitively, then leading and trailing whitespace
+trimmed (including Unicode whitespace). For example,
 `191805/0021814.swc` yields `0021814`, and `1054599727.23.SWC` yields
-`1054599727.23`. Values remain strings: leading zeros, case, dots, whitespace,
-Unicode and template-looking text such as `{n}` are not transformed.
+`1054599727.23`. `folder/ 0021814 .swc` also yields `0021814`. Values remain
+strings: leading zeros, case, dots, internal whitespace, Unicode characters and
+template-looking text such as `{n}` are preserved. Original ZIP member paths and
+display names are retained in the manifest.
 
 Planning rejects empty identifiers, duplicate identifiers anywhere in the
-archive, and identifiers longer than 239 characters. The last limit leaves room
+archive after trimming, and identifiers longer than 239 characters after trimming.
+The last limit leaves room
 for the 16-character prefix in CATMAID's 255-character annotation field. It is
 per identifier, not a combined limit on the number or total length of a
 segment's contributing identifiers. Visible neuron and skeleton names keep
@@ -335,8 +341,14 @@ name_case_sensitive=true
 with_annotations=false
 ```
 
-Form-encode the name as a literal string. If no annotation is found, return no
-matches; do not issue an unfiltered second query. Then find the currently
+CATMAID's existing search behavior is unchanged: it trims the search string and
+uses LIKE for exact, case-sensitive queries. Before form-encoding the full
+annotation name, double any backslashes for LIKE escaping (a fragment ID
+`path\name` needs the query value `source-fragment:path\\name`). CATMAID already
+escapes `%` and `_`; the `source-fragment:` prefix prevents leading-slash regex
+interpretation. Check that a result's name equals the full expected annotation
+name. If no annotation is found, return no matches; do not issue an unfiltered
+second query. Then find the currently
 associated neurons and skeletons using the numeric annotation ID:
 
 ```text
@@ -371,6 +383,12 @@ and reimport the archive. Otherwise, create a new state directory. No legacy
 reader or backfill is provided. Public request and wrapper-result schemas remain
 version 1. Each fragment still reserves five concept IDs: neuron, skeleton, model
 link, annotation and annotation link.
+
+Plans produced before whitespace normalization that contain untrimmed fragment
+IDs are rejected rather than silently renamed on resume. If such a workspace has
+committed batches, use its original importer version to finish or recover it;
+otherwise, create a fresh state directory. Plans whose IDs were already trimmed
+remain compatible.
 
 ## Container ingestion entry point
 

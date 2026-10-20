@@ -7,6 +7,7 @@ import pytest
 
 from catmaid_skeleton_batch_import.domain import PlannedMember
 from catmaid_skeleton_batch_import.errors import InvalidInputError
+from catmaid_skeleton_batch_import.fragments import fragment_id_from_member_path
 from catmaid_skeleton_batch_import.planner import (
     build_plan,
     plan_sha256,
@@ -23,7 +24,7 @@ def member(path: str, nodes: int) -> PlannedMember:
         uncompressed_bytes=nodes * 10,
         crc32=nodes,
         display_name=Path(path).stem,
-        fragment_id=Path(path).stem,
+        fragment_id=fragment_id_from_member_path(path),
         cable_length_nm=float(nodes),
     )
 

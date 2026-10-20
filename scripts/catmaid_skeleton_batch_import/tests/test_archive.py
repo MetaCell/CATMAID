@@ -75,6 +75,16 @@ def test_rejects_non_file_and_invalid_zip(tmp_path: Path) -> None:
         scan_archive(request(invalid), settings())
 
 
+def test_trims_fragment_identifier_but_preserves_member_path_and_display_name(tmp_path: Path) -> None:
+    archive = tmp_path / "cells.zip"
+    path = "folder/ \t0021814 \u2003.swc"
+    write_zip(archive, [(path, VALID_SWC)])
+    scanned = scan_archive(request(archive), settings())
+    assert scanned.members[0].member_path == path
+    assert scanned.members[0].display_name == " \t0021814 \u2003"
+    assert scanned.members[0].fragment_id == "0021814"
+
+
 def test_rejects_duplicate_member_paths(tmp_path: Path) -> None:
     archive = tmp_path / "duplicate.zip"
     with warnings.catch_warnings():
