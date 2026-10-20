@@ -1,4 +1,4 @@
-"""Read-only final verification for importer-owned CATMAID data."""
+"""Read-only checks of project/stack setup and new-project aggregate counts."""
 
 from __future__ import annotations
 

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from catmaid_skeleton_batch_import import database, loader, materialization, offline_cache, orchestrator, project, verification
+from catmaid_skeleton_batch_import import database, loader, materialization, offline_cache, orchestrator, project, project_checks
 from catmaid_skeleton_batch_import.config import load_request, load_settings
 from catmaid_skeleton_batch_import.artifacts import read_id_artifact
 from catmaid_skeleton_batch_import.errors import ImmutableStateError, InvalidInputError, RetryableError
@@ -184,8 +184,8 @@ def configure_run(monkeypatch, connection):
     monkeypatch.setattr(project, "existing_project_context", lambda _pid: dict(CONTEXT))
     monkeypatch.setattr(project, "create_hidden_project", forbidden)
     monkeypatch.setattr(database, "allocate_project_ids", forbidden)
-    monkeypatch.setattr(verification, "verify_project_stack", forbidden)
-    monkeypatch.setattr(verification, "verify_project_aggregate_counts", forbidden)
+    monkeypatch.setattr(project_checks, "verify_project_stack", forbidden)
+    monkeypatch.setattr(project_checks, "verify_project_aggregate_counts", forbidden)
     monkeypatch.setattr(database, "analyze_tables", lambda *_args: {"count": 5})
     def database_context(_store, _state, *, require_replica_role):
         assert require_replica_role is True

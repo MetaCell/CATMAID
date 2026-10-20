@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from catmaid_skeleton_batch_import import loader, materialization, orchestrator, verification
+from catmaid_skeleton_batch_import import loader, materialization, orchestrator, project_checks
 from catmaid_skeleton_batch_import.artifacts import artifact_descriptor, write_id_artifact
 from catmaid_skeleton_batch_import.domain import IngestionRequest, PlannedMember, SwcNode
 from catmaid_skeleton_batch_import.loader import ProjectContext
@@ -78,7 +78,7 @@ def test_final_verification_reads_each_swc_once_and_finishes_one_batch_at_a_time
         return _counts(plan.member_count, plan.total_nodes)
     monkeypatch.setattr(materialization, "validate_batch", validate_batch)
     monkeypatch.setattr(loader, "verify_exact_treenodes", exact)
-    monkeypatch.setattr(verification, "verify_project_aggregate_counts", aggregate_counts)
+    monkeypatch.setattr(project_checks, "verify_project_aggregate_counts", aggregate_counts)
 
     result = orchestrator._verify_database_by_batch(
         store, plan, state, project, connection, load_nodes, request)

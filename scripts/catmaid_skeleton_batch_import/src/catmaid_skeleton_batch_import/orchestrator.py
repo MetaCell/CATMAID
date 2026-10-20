@@ -1006,7 +1006,7 @@ def _verify_database_by_batch(
     """Verify exact rows with memory bounded by the planned batch size."""
 
     from .materialization import validate_batch
-    from .verification import verify_project_aggregate_counts
+    from .project_checks import verify_project_aggregate_counts
     from .loader import verify_exact_treenodes
 
     validated_batches = 0
@@ -1174,7 +1174,7 @@ def run_ingestion(
         _combine_manifest(store, state)
 
         from .database import analyze_tables
-        from .verification import verify_project_stack
+        from .project_checks import verify_project_stack
 
         _run_phase(
             store,

@@ -12,7 +12,7 @@ from catmaid_skeleton_batch_import import (
     database,
     materialization,
     project,
-    verification,
+    project_checks,
 )
 from catmaid_skeleton_batch_import.errors import VerificationError
 
@@ -335,7 +335,7 @@ def test_final_project_stack_verification_checks_hidden_one_profile_project():
             (1, 1),
         ]
     )
-    result = verification.verify_project_stack(
+    result = project_checks.verify_project_stack(
         project_id=1,
         stack_id=2,
         project_stack_id=3,
@@ -378,7 +378,7 @@ def test_project_stack_verification_accepts_raw_json_driver_value():
         ]
     )
 
-    result = verification.verify_project_stack(
+    result = project_checks.verify_project_stack(
         project_id=1,
         stack_id=2,
         project_stack_id=3,
@@ -400,7 +400,7 @@ def test_project_stack_verification_accepts_raw_json_driver_value():
 def test_project_aggregate_counts_use_one_constant_size_result():
     connection = ScriptedConnection([(3, 3, 3, 10, 10, 3, 3, 3)])
 
-    result = verification.verify_project_aggregate_counts(
+    result = project_checks.verify_project_aggregate_counts(
         project_id=1,
         neuron_class_id=31,
         skeleton_class_id=32,
@@ -431,7 +431,7 @@ def test_project_aggregate_counts_use_one_constant_size_result():
 def test_project_aggregate_counts_reject_extra_project_rows():
     connection = ScriptedConnection([(3, 3, 4, 10, 10, 3, 3, 3)])
     with pytest.raises(VerificationError, match="project-wide database counts"):
-        verification.verify_project_aggregate_counts(
+        project_checks.verify_project_aggregate_counts(
             project_id=1,
             neuron_class_id=31,
             skeleton_class_id=32,

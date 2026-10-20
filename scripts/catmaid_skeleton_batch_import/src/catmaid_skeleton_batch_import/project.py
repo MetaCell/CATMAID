@@ -63,7 +63,11 @@ def build_stack_metadata(cache_cell_size_nm: int = 1_500_000) -> dict[str, Any]:
 
 
 def _catmaid_components() -> dict[str, Any]:
-    """Load CATMAID/Django components lazily for dependency-free imports."""
+    """Load runtime dependencies after Django setup; tests can inject substitutes.
+
+    Keeping these imports out of module scope lets the planning command import
+    this module without initializing CATMAID or requiring its Django runtime.
+    """
 
     from catmaid.apps import get_system_user
     from catmaid.control.common import get_class_to_id_map, get_relation_to_id_map
