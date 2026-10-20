@@ -318,7 +318,9 @@ neuron, skeleton and project deletion still work normally.
 
 Deleting a whole neuron, or its final skeleton node, also removes annotations
 that no other entity uses. Shared provenance survives until its last use is
-deleted. This allows a fresh import of a fully deleted source fragment while
+deleted. Cleanup locks the affected annotation rows in ID order and rechecks
+usage in the same transaction, so concurrent deletions cannot leave orphan
+provenance. This allows a fresh import of a fully deleted source fragment while
 retaining collision rejection for fragments still present in the project.
 
 The importer generates a compressed source-to-CATMAID CSV manifest with exactly
@@ -503,6 +505,17 @@ Run the dependency-free suite with:
 
 ```bash
 python -m pytest -q scripts/catmaid_skeleton_batch_import/tests
+```
+
+The Django provenance API tests also exercise concurrent cleanup, rollback, and
+overlapping split/join operations against PostgreSQL. With a configured CATMAID
+test database, run:
+
+```bash
+cd django/projects
+python manage.py test \
+  catmaid.tests.apis.test_source_fragment_annotations \
+  catmaid.tests.apis.test_source_fragment_skeletons
 ```
 
 The opt-in PostgreSQL tests create hidden projects, inject failures, verify exact

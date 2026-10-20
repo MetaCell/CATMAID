@@ -3,8 +3,10 @@
 import json
 from collections import Counter
 from contextlib import contextmanager
-from threading import Event, Thread
+from threading import Barrier, Event, Thread
+import time
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import networkx as nx
 
@@ -13,6 +15,7 @@ from django.db.models import F
 
 from catmaid.control.annotation import _annotate_entities, annotations_for_skeleton
 from catmaid.control.authentication import PermissionError
+from catmaid.control.neuron import _delete_neuron_and_unused_annotations
 from catmaid.control.skeleton import (
     _get_neuronname_from_skeletonid, _import_skeleton, _join_skeleton,
 )
@@ -281,3 +284,169 @@ class SourceFragmentTransactionTests(SourceFragmentFixtures, CatmaidApiTransacti
                 skeleton_id__in=[winner.skeleton, new_skeleton]
             ).exclude(parent__isnull=True).exclude(parent__skeleton_id=F('skeleton_id'))
         self.assertFalse(crossing_parents.exists())
+
+
+class SourceFragmentCleanupConcurrencyTests(SourceFragmentFixtures, CatmaidApiTransactionTestCase):
+    def run_overlapping(self, operations, *, ready=None, rollback_index=None):
+        """Keep both transactions open until they finish work or contend in PG."""
+        release = Event()
+        completed = [Event(), Event()]
+        backend_ids = [None, None]
+        failures = []
+        contended = False
+
+        def run(index):
+            close_old_connections()
+            try:
+                with transaction.atomic():
+                    with connections['default'].cursor() as cursor:
+                        cursor.execute("SELECT set_config('lock_timeout', '10s', true), "
+                                "set_config('statement_timeout', '15s', true)")
+                        cursor.execute('SELECT pg_backend_pid()')
+                        backend_ids[index] = cursor.fetchone()[0]
+                    operations[index]()
+                    completed[index].set()
+                    if not release.wait(15):
+                        raise AssertionError('Timed out waiting to finish cleanup transaction')
+                    if index == rollback_index:
+                        transaction.set_rollback(True)
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                connections['default'].close()
+
+        workers = [Thread(target=run, args=(index,), daemon=True) for index in range(2)]
+        for worker in workers:
+            worker.start()
+        try:
+            if ready is not None:
+                self.assertTrue(ready.wait(10), 'Both neuron deletions did not reach cleanup')
+            deadline = time.monotonic() + 10
+            while not all(event.is_set() for event in completed):
+                if failures:
+                    raise failures[0]
+                if all(identifier is not None for identifier in backend_ids):
+                    with connections['default'].cursor() as cursor:
+                        cursor.execute('SELECT pg_blocking_pids(%s), pg_blocking_pids(%s)',
+                                backend_ids)
+                        first, second = cursor.fetchone()
+                    if backend_ids[1] in first or backend_ids[0] in second:
+                        contended = True
+                        break
+                self.assertLess(time.monotonic(), deadline, 'Transactions did not overlap')
+                release.wait(0.01)
+        finally:
+            release.set()
+            for worker in workers:
+                worker.join(15)
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        if failures:
+            raise failures[0]
+        return contended
+
+    def delete_concurrently(self, neuron_ids, *, rollback_index=None):
+        """Force both link cascades before either last-use check can finish."""
+        deleted = Event()
+        barrier = Barrier(2, action=deleted.set, timeout=10)
+        original_delete = ClassInstance.delete
+
+        def delete_and_pause(instance, *args, **kwargs):
+            identifier = instance.pk
+            result = original_delete(instance, *args, **kwargs)
+            if identifier in neuron_ids:
+                barrier.wait()
+            return result
+
+        operations = [lambda identifier=identifier:
+                _delete_neuron_and_unused_annotations(ClassInstance.objects.get(pk=identifier))
+                for identifier in neuron_ids]
+        with patch.object(ClassInstance, 'delete', delete_and_pause):
+            return self.run_overlapping(operations, ready=deleted,
+                    rollback_index=rollback_index)
+
+    def split(self, fragment):
+        response = self.client.post(f'/{self.test_project_id}/skeleton/split', {
+            'treenode_id': fragment.nodes[1],
+            'upstream_annotation_map': '{}', 'downstream_annotation_map': '{}',
+        })
+        self.assertStatus(response)
+        skeleton_id = response.json()['new_skeleton_id']
+        return _get_neuronname_from_skeletonid(self.test_project_id,
+                skeleton_id)['neuronid']
+
+    def assert_annotation_absent(self, identifiers):
+        self.assertFalse(ClassInstance.objects.filter(project_id=self.test_project_id,
+                class_column__class_name='annotation',
+                name__in=[SOURCE_FRAGMENT_ANNOTATION_PREFIX + item
+                          for item in identifiers]).exists())
+
+    def test_concurrent_deletion_of_split_results_removes_orphan_provenance(self):
+        original = self.fragment('Split source', ['shared'])
+        second_neuron = self.split(original)
+        contended = self.delete_concurrently([original.neuron, second_neuron])
+        self.assertFalse(ClassInstance.objects.filter(
+                pk__in=[original.neuron, second_neuron]).exists())
+        # This is the same name/class lookup used to reject incoming fragments.
+        self.assert_annotation_absent(['shared'])
+        self.assertTrue(contended, 'Shared annotation cleanup did not serialize')
+
+    def test_multiple_shared_annotations_lock_in_one_order(self):
+        first = self.fragment('First', ['a', 'b', 'c'])
+        second = self.fragment('Second', ['c', 'b', 'a'])
+        _annotate_entities(self.test_project_id, [first.neuron, second.neuron],
+                {'shared-label': {'user_id': self.test_user_id}})
+        self.assertTrue(self.delete_concurrently([first.neuron, second.neuron]))
+        self.assert_annotation_absent(['a', 'b', 'c'])
+        self.assertFalse(ClassInstance.objects.filter(project_id=self.test_project_id,
+                class_column__class_name='annotation', name='shared-label').exists())
+
+    def test_rollback_retains_the_surviving_neurons_provenance(self):
+        first = self.fragment('Committed deletion', ['shared'])
+        second = self.fragment('Rolled back deletion', ['shared'])
+        self.assertTrue(self.delete_concurrently([first.neuron, second.neuron],
+                rollback_index=1))
+        self.assertFalse(ClassInstance.objects.filter(pk=first.neuron).exists())
+        self.assertTrue(ClassInstance.objects.filter(pk=second.neuron).exists())
+        self.assert_sources(second.neuron, ['shared'])
+
+    def test_cleanup_is_atomic_when_called_without_an_outer_transaction(self):
+        fragment = self.fragment('Direct cleanup', ['unshared'])
+        self.assertFalse(connections['default'].in_atomic_block)
+        _delete_neuron_and_unused_annotations(ClassInstance.objects.get(pk=fragment.neuron))
+        self.assert_annotation_absent(['unshared'])
+
+    def during_cleanup(self, fragment, operation):
+        cleaned = Event()
+
+        def cleanup():
+            _delete_neuron_and_unused_annotations(
+                    ClassInstance.objects.get(pk=fragment.neuron))
+            cleaned.set()
+
+        def edit():
+            if not cleaned.wait(10):
+                raise AssertionError('Cleanup did not acquire the annotation locks')
+            operation()
+
+        self.run_overlapping([cleanup, edit])
+
+    def test_split_retains_shared_provenance_during_another_neurons_cleanup(self):
+        removed = self.fragment('Removed', ['shared'])
+        retained = self.fragment('Split survivor', ['shared', 'retained'])
+        results = []
+        self.during_cleanup(removed, lambda: results.append(self.split(retained)))
+        self.assert_sources(retained.neuron, ['shared', 'retained'])
+        self.assert_sources(results[0], ['shared', 'retained'])
+
+    def test_join_retains_shared_provenance_during_another_neurons_cleanup(self):
+        removed = self.fragment('Removed', ['shared'])
+        winner = self.fragment('Winner', ['shared', 'winner'])
+        loser = self.fragment('Loser', ['loser'])
+
+        def join():
+            user = User.objects.get(pk=self.test_user_id)
+            _join_skeleton(user, winner.nodes[0], loser.nodes[0],
+                    self.test_project_id, {})
+
+        self.during_cleanup(removed, join)
+        self.assert_sources(winner.neuron, ['shared', 'winner', 'loser'])

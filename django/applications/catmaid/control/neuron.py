@@ -9,7 +9,7 @@ from typing import Any, Dict, DefaultDict, List, Optional, Tuple
 
 from django.http import HttpRequest, JsonResponse
 from django.shortcuts import get_object_or_404
-from django.db import connection
+from django.db import connection, transaction
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 
@@ -132,6 +132,7 @@ def get_skeleton_ids_for_neurons(project_id:int, neuron_ids:List) -> Dict[int, L
     return skeleton_map
 
 
+@transaction.atomic
 def _delete_neuron_and_unused_annotations(neuron) -> None:
     """Delete a neuron and annotations whose last use disappears with it."""
     project_id = neuron.project_id
@@ -143,6 +144,14 @@ def _delete_neuron_and_unused_annotations(neuron) -> None:
                     'class_instance_b_id', flat=True))
     neuron.delete()
     if annotation_ids:
+        # Two split results can lose their last links concurrently. Serialize
+        # cleanup on annotation objects, in one order, without locking classes.
+        # Evaluate the lock query before a separate usage query: a waiter must
+        # see the preceding cleanup's commit rather than its old link snapshot.
+        list(ClassInstance.objects.filter(project_id=project_id,
+                class_column__class_name='annotation', id__in=annotation_ids)
+                .order_by('id').select_for_update(of=('self',))
+                .values_list('id', flat=True))
         # Split results can share provenance; retain it while any entity uses it.
         used_annotation_ids = set(ClassInstanceClassInstance.objects.filter(
                 class_instance_b_id__in=annotation_ids,

@@ -40,7 +40,12 @@ def test_deletion_releases_only_unused_annotations_and_keeps_real_collisions(sha
         def delete():
             for identifier in filters["id__in"]:
                 annotations.pop(identifier)
-        return SimpleNamespace(delete=delete)
+        query = SimpleNamespace(delete=delete)
+        query.order_by = lambda *_args: query
+        query.select_for_update = lambda **_kwargs: query
+        query.values_list = lambda *_args, **_kwargs: sorted(
+            identifier for identifier in filters["id__in"] if identifier in annotations)
+        return query
     def delete_neuron():
         links[:] = [row for row in links if row["class_instance_a_id"] != 10]
     path = Path(__file__).resolve().parents[3] / "django/applications/catmaid/control/neuron.py"
@@ -48,6 +53,7 @@ def test_deletion_releases_only_unused_annotations_and_keeps_real_collisions(sha
                     if isinstance(node, ast.FunctionDef)
                     and node.name == "_delete_neuron_and_unused_annotations")
     namespace = {
+        "transaction": SimpleNamespace(atomic=lambda function: function),
         "ClassInstanceClassInstance": SimpleNamespace(objects=SimpleNamespace(filter=filter_links)),
         "ClassInstance": SimpleNamespace(objects=SimpleNamespace(filter=filter_annotations)),
     }
