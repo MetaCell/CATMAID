@@ -26,12 +26,11 @@ class OfflineGridCache:
     """
 
     def __init__(self, project_id: int, connection: Any, *,
-                 lock_timeout_ms: int, statement_timeout_ms: int, node_limit=None):
+                 lock_timeout_ms: int, statement_timeout_ms: int):
         self.project_id = project_id
         self.connection = connection
         self.lock_timeout_ms = lock_timeout_ms
         self.statement_timeout_ms = statement_timeout_ms
-        self.node_limit = node_limit
         self.grids = self._read_grids()
 
     def _read_grids(self):
@@ -100,7 +99,7 @@ class OfflineGridCache:
         from catmaid.control.grid_cache import locked_grid_cell
         from catmaid.control.node import update_grid_cell
 
-        params = {"project_id": self.project_id, "limit": self.node_limit, "ordering": grid["ordering"]}
+        params = {"project_id": self.project_id, "limit": None, "ordering": grid["ordering"]}
         for name in ("n_largest_skeletons_limit", "n_last_edited_skeletons_limit",
                      "hidden_last_editor_id"):
             if grid[name] is not None:
@@ -140,7 +139,7 @@ class OfflineGridCache:
                             (min(a, c), max(b, d)) for (a, b), (c, d) in zip(ranges, previous)]
             records.append({"definition": grid, "ranges": ranges})
         return {"schema_version": 1, "project_id": self.project_id,
-                "node_limit": self.node_limit, "grids": records}
+                "node_limit": None, "grids": records}
 
     def rebuild(self, log=lambda _message: None, *, plan=None):
         """A failed rebuild is restarted on resume; committed batches are skipped."""
@@ -149,7 +148,7 @@ class OfflineGridCache:
         self._check_grids()
         plan = self.plan() if plan is None else plan
         if (plan.get("schema_version") != 1 or plan.get("project_id") != self.project_id
-                or plan.get("node_limit") != self.node_limit
+                or plan.get("node_limit") is not None
                 or [record["definition"] for record in plan["grids"]] != self.grids):
             raise VerificationError("Cache rebuild plan changed; resume with --rebuild-cache")
         records = []
@@ -170,7 +169,7 @@ class OfflineGridCache:
                 cell_count = cursor.fetchone()[0]
             records.append({"definition": grid, "generated_at": started_at, "cell_count": cell_count})
         result = {"schema_version": 1, "project_id": self.project_id,
-                  "strategy": "offline_full_grid_rebuild", "node_limit": self.node_limit,
+                  "strategy": "offline_full_grid_rebuild", "node_limit": None,
                   "grids": records}
         self.verify(result)
         return result
@@ -179,7 +178,7 @@ class OfflineGridCache:
         """Verify preserved definitions and every stored payload without rebuilding."""
         self._check_grids()
         if (receipt.get("schema_version") != 1 or receipt.get("project_id") != self.project_id
-                or receipt.get("node_limit") != self.node_limit
+                or receipt.get("node_limit") is not None
                 or receipt.get("strategy") != "offline_full_grid_rebuild"
                 or [record["definition"] for record in receipt["grids"]] != self.grids):
             raise VerificationError("Cache rebuild receipt does not match the target configuration")

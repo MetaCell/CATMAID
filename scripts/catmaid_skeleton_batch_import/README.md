@@ -224,8 +224,9 @@ The sample root becomes `(10000, 20000, 30000)` nm with radius `2000` nm.
 For existing targets, grid IDs, dimensions, orientation, filters, ordering, LOD,
 JSON/JSON-text/MessagePack format flags, `allow_empty` and enabled/disabled state
 are preserved. Only payload cells are replaced, including those of disabled grids.
-Existing grids retain the normal worker's `NODE_LIST_MAXIMUM_COUNT` query limit;
-new importer-owned grids retain their unlimited-query policy.
+Cache generation has no node query limit for either target mode. Existing
+grid filters and ordering still apply; `NODE_LIST_MAXIMUM_COUNT` does not
+truncate the importer's rebuilt payloads. This workflow uses grid caches only.
 Bounds cover all project nodes and connectors, including negative coordinates
 and long edges. Intentionally cached empty coverage is retained for grids with
 `allow_empty`. New projects receive the configured default XY MessagePack grid
@@ -306,12 +307,19 @@ preserve literal identifiers. Native SWC annotation replacement keeps existing
 source identifiers, but native SWC uploads do not start generating them. Whole
 neuron, skeleton and project deletion still work normally.
 
+Deleting a whole neuron, or its final skeleton node, also removes annotations
+that no other entity uses. Shared provenance survives until its last use is
+deleted. This allows a fresh import of a fully deleted source fragment while
+retaining collision rejection for fragments still present in the project.
+
 The importer generates a compressed source-to-CATMAID CSV manifest with exactly
 `member_path,fragment_id,neuron_id,skeleton_id,node_count,name,batch_index`.
 This is an output audit artifact, not an input requirement. The filename-derived
 `fragment_id` is recorded separately from display `name` and the allocated
 CATMAID IDs. Annotation rows and links commit or roll back in the same atomic
 batch as morphology, and final verification checks the exact values and ownership.
+Final verification loads each SWC once per batch and reuses the prepared values
+for metadata, topology, summary and exact node checks.
 
 ### Search and audit API contract
 

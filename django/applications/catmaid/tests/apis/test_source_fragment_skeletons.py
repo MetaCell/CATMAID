@@ -18,6 +18,7 @@ from catmaid.control.skeleton import (
 )
 from catmaid.models import ClassInstance, ClassInstanceClassInstance, Treenode, User
 from catmaid.source_fragments import SOURCE_FRAGMENT_ANNOTATION_PREFIX
+from catmaid.state import make_nocheck_state
 
 from .common import CatmaidApiTestCase, CatmaidApiTransactionTestCase
 
@@ -171,11 +172,45 @@ class SourceFragmentSkeletonTests(SourceFragmentFixtures, CatmaidApiTestCase):
 class SourceFragmentTransactionTests(SourceFragmentFixtures, CatmaidApiTransactionTestCase):
     def test_whole_neuron_deletion_still_works(self):
         fragment = self.fragment('Delete complete entity', ['A'])
+        annotation = ClassInstance.objects.get(project_id=self.test_project_id,
+                class_column__class_name='annotation', name='source-fragment:A')
         response = self.client.post(
                 f'/{self.test_project_id}/neuron/{fragment.neuron}/delete')
         self.assertStatus(response)
         self.assertFalse(ClassInstance.objects.filter(pk=fragment.neuron).exists())
         self.assertFalse(Treenode.objects.filter(skeleton_id=fragment.skeleton).exists())
+        self.assertFalse(ClassInstance.objects.filter(pk=annotation.id).exists())
+
+    def test_deletion_preserves_shared_annotations_until_their_last_use(self):
+        first = self.fragment('First', ['shared', 'first-only'])
+        second = self.fragment('Second', ['shared'])
+        _annotate_entities(self.test_project_id, [first.neuron, second.neuron],
+                {'shared-label': {'user_id': self.test_user_id}})
+        _annotate_entities(self.test_project_id, [first.neuron],
+                {'private-label': {'user_id': self.test_user_id}})
+        self.assertStatus(self.client.post(
+                f'/{self.test_project_id}/neuron/{first.neuron}/delete'))
+        self.assert_sources(second.neuron, ['shared'])
+        names = ClassInstance.objects.filter(project_id=self.test_project_id,
+                class_column__class_name='annotation').values_list('name', flat=True)
+        self.assertIn('shared-label', names)
+        self.assertNotIn('private-label', names)
+        self.assertNotIn('source-fragment:first-only', names)
+        self.assertStatus(self.client.post(
+                f'/{self.test_project_id}/neuron/{second.neuron}/delete'))
+        self.assertFalse(ClassInstance.objects.filter(project_id=self.test_project_id,
+                class_column__class_name='annotation',
+                name__in=['shared-label', 'source-fragment:shared']).exists())
+
+    def test_deleting_the_final_treenode_removes_unused_provenance(self):
+        fragment = self.fragment('Delete nodes', ['A'])
+        for node_id in reversed(fragment.nodes):
+            response = self.client.post(f'/{self.test_project_id}/treenode/delete',
+                    {'treenode_id': node_id, 'state': make_nocheck_state()})
+            self.assertStatus(response)
+        self.assertFalse(ClassInstance.objects.filter(pk=fragment.neuron).exists())
+        self.assertFalse(ClassInstance.objects.filter(project_id=self.test_project_id,
+                class_column__class_name='annotation', name='source-fragment:A').exists())
 
     @contextmanager
     def paused_join(self, winner, loser):

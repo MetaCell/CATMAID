@@ -185,7 +185,6 @@ def configure_run(monkeypatch, connection):
     monkeypatch.setattr(project, "create_hidden_project", forbidden)
     monkeypatch.setattr(database, "allocate_project_ids", forbidden)
     monkeypatch.setattr(verification, "verify_project_stack", forbidden)
-    monkeypatch.setattr(verification, "verify_cache", forbidden)
     monkeypatch.setattr(verification, "verify_project_aggregate_counts", forbidden)
     monkeypatch.setattr(database, "analyze_tables", lambda *_args: {"count": 5})
     def database_context(_store, _state, *, require_replica_role):

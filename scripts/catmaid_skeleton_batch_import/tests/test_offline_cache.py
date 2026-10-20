@@ -171,7 +171,7 @@ def test_failed_rebuild_can_restart_without_accepting_partial_payloads(monkeypat
     assert cache.verify(receipt)["cell_count"] > 1
 
 
-@pytest.mark.parametrize("problem", ["missing", "invalid", "dirty", "configuration"])
+@pytest.mark.parametrize("problem", ["missing", "invalid", "dirty", "configuration", "node_limit"])
 def test_verification_rejects_incomplete_payloads_or_changed_settings(monkeypatch, problem):
     connection = Connection([grid()])
     cache = tracker(connection)
@@ -183,10 +183,23 @@ def test_verification_rejects_incomplete_payloads_or_changed_settings(monkeypatc
         connection.invalid = 1
     elif problem == "dirty":
         connection.dirty = 1
+    elif problem == "node_limit":
+        receipt["node_limit"] = 3500
     else:
         connection.grids[0]["ordering"] = "cable-desc"
     with pytest.raises((VerificationError, RetryableError)):
         cache.verify(receipt)
+
+
+def test_limited_cache_plan_is_rejected_before_existing_payloads_are_deleted():
+    connection = Connection([grid()])
+    cache = tracker(connection)
+    plan = cache.plan()
+    assert plan["node_limit"] is None
+    plan["node_limit"] = 3500
+    with pytest.raises(VerificationError, match="rebuild-cache"):
+        cache.rebuild(plan=plan)
+    assert not any("DELETE" in sql for sql, _params in connection.statements)
 
 
 def test_rebuild_passes_original_formats_lod_filters_and_grid_id(monkeypatch):
@@ -194,7 +207,6 @@ def test_rebuild_passes_original_formats_lod_filters_and_grid_id(monkeypatch):
                   n_largest_skeletons_limit=5, n_last_edited_skeletons_limit=2,
                   hidden_last_editor_id=7, ordering="cable-desc")
     cache = tracker(Connection([config]))
-    cache.node_limit = 3500
     calls = []
     @contextmanager
     def locked(*args, **kwargs):
@@ -208,7 +220,7 @@ def test_rebuild_passes_original_formats_lod_filters_and_grid_id(monkeypatch):
     assert calls[0][1]["statement_timeout_ms"] == 5000
     args, kwargs = calls[1]
     assert args[:8] == (123, 11, -1, 2, 3, 10, 20, 30)
-    assert args[8] == {"project_id": 123, "limit": 3500, "ordering": "cable-desc",
+    assert args[8] == {"project_id": 123, "limit": None, "ordering": "cable-desc",
                        "n_largest_skeletons_limit": 5, "n_last_edited_skeletons_limit": 2,
                        "hidden_last_editor_id": 7}
     assert args[9:] == (True, 2, 500, "quadratic", True, False, True)

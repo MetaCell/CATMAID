@@ -211,3 +211,21 @@ def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_c
     with pytest.raises(InvalidInputError, match="already exist"):
         run_ingestion(collision)
     assert snapshot() == after
+
+    # Complete neuron deletion releases its source ID for a fresh import.
+    from catmaid.apps import get_system_user
+    from catmaid.control.neuron import _delete_neuron_as_user
+    from catmaid_skeleton_batch_import.artifacts import read_manifest
+
+    imported = read_manifest(Path(result["manifest"]))[0]
+    _delete_neuron_as_user(get_system_user(), pid, int(imported["neuron_id"]))
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT count(*) FROM class_instance WHERE project_id=%s AND name=%s",
+                       [pid, "source-fragment:new-fragment"])
+        assert cursor.fetchone()[0] == 0
+    reimported = run_ingestion(request(tmp_path / "reimport", "new-fragment", pid))
+    assert reimported["status"] == "complete"
+    new_row = read_manifest(Path(reimported["manifest"]))[0]
+    assert new_row["fragment_id"] == imported["fragment_id"]
+    assert new_row["skeleton_id"] != imported["skeleton_id"]
+    assert old_derived_rows() == old_derived

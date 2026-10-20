@@ -132,6 +132,24 @@ def get_skeleton_ids_for_neurons(project_id:int, neuron_ids:List) -> Dict[int, L
     return skeleton_map
 
 
+def _delete_neuron_and_unused_annotations(neuron) -> None:
+    """Delete a neuron and annotations whose last use disappears with it."""
+    project_id = neuron.project_id
+    annotation_ids = set(ClassInstanceClassInstance.objects.filter(
+            project_id=project_id, class_instance_a_id=neuron.id,
+            relation__relation_name='annotated_with').values_list(
+                    'class_instance_b_id', flat=True))
+    neuron.delete()
+    if annotation_ids:
+        used_annotation_ids = set(ClassInstanceClassInstance.objects.filter(
+                class_instance_b_id__in=annotation_ids,
+                relation__relation_name='annotated_with').values_list(
+                        'class_instance_b_id', flat=True))
+        ClassInstance.objects.filter(project_id=project_id,
+                class_column__class_name='annotation',
+                id__in=annotation_ids - used_annotation_ids).delete()
+
+
 def _delete_if_empty(neuron_id) -> bool:
     """ Delete this neuron if no class_instance is a model_of it;
     which is to say, it contains no skeletons. """
@@ -139,7 +157,9 @@ def _delete_if_empty(neuron_id) -> bool:
             class_instance_b=neuron_id,
             relation__relation_name='model_of').exists()
     if is_empty:
-        ClassInstance.objects.filter(pk=neuron_id).delete()
+        neuron = ClassInstance.objects.filter(pk=neuron_id).first()
+        if neuron is not None:
+            _delete_neuron_and_unused_annotations(neuron)
     return is_empty
 
 
@@ -165,9 +185,7 @@ def _delete_neuron_as_user(user, project_id, neuron_id):
     # Make sure the user can edit the neuron in general
     can_edit_class_instance_or_fail(user, neuron_id, 'neuron')
 
-    # Create class and relation dictionaries
-    classes = dict(Class.objects.filter(
-            project_id=project_id).values_list('class_name', 'id'))
+    # Resolve relation IDs for permission checks and skeleton ownership.
     relations = dict(Relation.objects.filter(
             project_id=project_id).values_list('relation_name', 'id'))
 
@@ -188,13 +206,13 @@ def _delete_neuron_as_user(user, project_id, neuron_id):
                         "neuron won't be deleted." % skid)
 
     # Make sure the user has permission to edit all annotations of this neuron
-    annotation_ids = set(ClassInstanceClassInstance.objects.filter(
+    annotation_link_ids = set(ClassInstanceClassInstance.objects.filter(
             class_instance_a_id=neuron_id,
             relation_id=relations['annotated_with']).values_list(
                     'id', flat=True))
-    if annotation_ids:
+    if annotation_link_ids:
         try:
-            can_edit_all_or_fail(user, annotation_ids,
+            can_edit_all_or_fail(user, annotation_link_ids,
                     'class_instance_class_instance')
         except Exception:
             raise Exception("You don't have permission to remove all " \
@@ -216,15 +234,7 @@ def _delete_neuron_as_user(user, project_id, neuron_id):
     # Delete neuron (and implicitely all annotation links due to Django's
     # cascading deletion)
     neuron = get_object_or_404(ClassInstance, pk=neuron_id)
-    neuron.delete()
-
-    # Delete all annotations that are not used anymore
-    used_annotation_ids = set(ClassInstanceClassInstance.objects.filter(
-            class_instance_b_id__in=annotation_ids,
-            relation_id=relations['annotated_with']).values_list(
-                    'id', flat=True))
-    unused_annotation_ids = annotation_ids.difference(used_annotation_ids)
-    ClassInstance.objects.filter(id__in=unused_annotation_ids).delete()
+    _delete_neuron_and_unused_annotations(neuron)
 
     # Delete the skeletons (and their treenodes through cascading delete)
     cursor = connection.cursor()

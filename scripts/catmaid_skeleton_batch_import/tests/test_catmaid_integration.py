@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import pytest
 
 from catmaid_skeleton_batch_import import (
-    cache,
     edges,
     database,
     materialization,
@@ -396,53 +395,6 @@ def test_project_stack_verification_accepts_raw_json_driver_value():
     )
 
     assert result["metadata"] == metadata
-
-
-@pytest.mark.parametrize("lod_options", [{}, {"lod_levels": 7}])
-def test_cache_verification_checks_exact_grid_and_no_dirty_cells(lod_options):
-    lod_levels = lod_options.get("lod_levels", 1)
-    connection = ScriptedConnection(
-        [
-            [
-                (
-                    99,
-                    0,
-                    1_500_000,
-                    1_500_000,
-                    1_500_000,
-                    lod_levels,
-                    "quadratic",
-                    500,
-                    None,
-                    None,
-                    None,
-                    False,
-                    False,
-                    False,
-                    True,
-                    True,
-                    None,
-                )
-            ],
-            (2, 0, 0, 0, 0, 0, 0, 0, 0, 0),
-            (0,),
-        ]
-    )
-    result = verification.verify_cache(
-        project_id=1,
-        dimension=(10, 10, 10),
-        resolution_nm=(1000, 1000, 1000),
-        expected_node_count=2,
-        connection=connection,
-        **lod_options,
-    )
-    assert result == {
-        "grid_id": 99,
-        "grid_count": 1,
-        "cell_count": 2,
-        "dirty_cell_count": 0,
-        "msgpack_only": True,
-    }
 
 
 def test_project_aggregate_counts_use_one_constant_size_result():

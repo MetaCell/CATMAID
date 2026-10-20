@@ -994,47 +994,6 @@ def _run_phase(
     return result
 
 
-def _expected_batch_data(
-    store: StateStore,
-    batch: PlannedBatch,
-    state: Mapping[str, Any],
-    load_nodes: Callable[[PlannedMember], Sequence[SwcNode]],
-    scale_nm: float,
-) -> tuple[list[dict[str, object]], list[int]]:
-    from .loader import _stored_cable_nm
-
-    expected_skeletons: list[dict[str, object]] = []
-    batch_state = _batch_state(state, batch.index)
-    concept_ids = read_id_artifact(
-        store.state_dir,
-        batch_state["artifacts"]["concept_ids"],
-        expected_count=batch.skeleton_count * 5,
-    )
-    location_ids = read_id_artifact(
-        store.state_dir,
-        batch_state["artifacts"]["location_ids"],
-        expected_count=batch.node_count,
-    )
-    for member_index, member in enumerate(batch.members):
-        neuron_id, skeleton_id, link_id, annotation_id, annotation_link_id = concept_ids[
-            member_index * 5 : member_index * 5 + 5
-        ]
-        expected_skeletons.append(
-            {
-                "neuron_id": neuron_id,
-                "skeleton_id": skeleton_id,
-                "link_id": link_id,
-                "annotation_id": annotation_id,
-                "annotation_link_id": annotation_link_id,
-                "fragment_id": member.fragment_id,
-                "name": member.display_name,
-                "node_count": member.node_count,
-                "cable_length_nm": _stored_cable_nm(load_nodes(member), scale_nm),
-            }
-        )
-    return expected_skeletons, location_ids
-
-
 def _verify_database_by_batch(
     store: StateStore,
     plan: ImportPlan,
@@ -1042,13 +1001,13 @@ def _verify_database_by_batch(
     project: ProjectContext,
     connection: Any,
     load_nodes: Callable[[PlannedMember], Sequence[SwcNode]],
-    scale_nm: float,
-    request: IngestionRequest | None = None,
+    request: IngestionRequest,
 ) -> dict[str, int]:
     """Verify exact rows with memory bounded by the planned batch size."""
 
     from .materialization import validate_batch
     from .verification import verify_project_aggregate_counts
+    from .loader import verify_exact_treenodes
 
     validated_batches = 0
     validated_skeletons = 0
@@ -1059,33 +1018,32 @@ def _verify_database_by_batch(
             f"Verifying batch {batch.index}/{plan.batch_count}: "
             f"{batch.skeleton_count} skeletons, {batch.node_count} nodes"
         )
-        expected_skeletons, location_ids = _expected_batch_data(
-            store, batch, state, load_nodes, scale_nm
+        batch_state = _batch_state(state, batch.index)
+        concept_ids = read_id_artifact(
+            store.state_dir, batch_state["artifacts"]["concept_ids"],
+            expected_count=batch.skeleton_count * 5,
         )
-        counts = validate_batch(
-            project_id=project.project_id,
-            user_id=project.user_id,
-            neuron_class_id=project.neuron_class_id,
-            skeleton_class_id=project.skeleton_class_id,
-            model_of_relation_id=project.model_of_relation_id,
-            annotation_class_id=project.annotation_class_id,
-            annotated_with_relation_id=project.annotated_with_relation_id,
-            skeletons=expected_skeletons,
-            location_ids=location_ids,
-            connection=connection,
+        location_ids = read_id_artifact(
+            store.state_dir, batch_state["artifacts"]["location_ids"],
+            expected_count=batch.node_count,
         )
-        if request is not None:
-            from .loader import verify_exact_treenodes
-            batch_state = _batch_state(state, batch.index)
-            concept_ids = read_id_artifact(
-                store.state_dir, batch_state["artifacts"]["concept_ids"],
-                expected_count=batch.skeleton_count * 5,
+        with prepare_copy_rows(
+            batch, request, project, concept_ids, location_ids, load_nodes
+        ) as prepared:
+            counts = validate_batch(
+                project_id=project.project_id,
+                user_id=project.user_id,
+                neuron_class_id=project.neuron_class_id,
+                skeleton_class_id=project.skeleton_class_id,
+                model_of_relation_id=project.model_of_relation_id,
+                annotation_class_id=project.annotation_class_id,
+                annotated_with_relation_id=project.annotated_with_relation_id,
+                skeletons=[item.to_validation_dict() for item in prepared.expected_skeletons],
+                location_ids=prepared.location_ids,
+                connection=connection,
             )
-            with prepare_copy_rows(
-                batch, request, project, concept_ids, location_ids, load_nodes
-            ) as prepared:
-                with connection.cursor() as cursor:
-                    verify_exact_treenodes(cursor, prepared)
+            with connection.cursor() as cursor:
+                verify_exact_treenodes(cursor, prepared)
         for key, value in counts.items():
             imported_counts[key] = imported_counts.get(key, 0) + value
         if (
@@ -1187,12 +1145,10 @@ def run_ingestion(
         if project.existing_project:
             _check_existing_fragment_conflicts(store, plan, project, connection)
         from .offline_cache import OfflineGridCache
-        from django.conf import settings as django_settings
         grid_cache = OfflineGridCache(
             project.project_id, connection,
             lock_timeout_ms=settings.lock_timeout_ms,
             statement_timeout_ms=settings.statement_timeout_ms,
-            node_limit=django_settings.NODE_LIST_MAXIMUM_COUNT if project.existing_project else None,
         )
         if not project.existing_project:
             grid_cache.ensure_import_grid(
@@ -1226,8 +1182,7 @@ def run_ingestion(
             "database_maintenance",
             lambda: analyze_tables(connection),
         )
-        # Older runs used incremental cache refreshes and have no full rebuild
-        # receipt. Upgrade their cache checkpoint without reimporting any rows.
+        # Interrupted cache phases restart from their saved coverage plan.
         cache_state = store.load()
         if (rebuild_cache or cache_state["phases"]["cache"]["status"] != "complete"
                 or "cache_rebuild" not in cache_state["artifacts"]):
@@ -1286,7 +1241,6 @@ def run_ingestion(
                     project,
                     connection,
                     verification_archive.load,
-                    request.scale_nm,
                     request=request,
                 )
             cache_result = grid_cache.verify(
