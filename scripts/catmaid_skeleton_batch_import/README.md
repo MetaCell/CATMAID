@@ -1,11 +1,11 @@
 # CATMAID skeleton batch importer
 
 This package provides non-interactive CATMAID SWC batch ingestion. It owns
-validation, deterministic
-batch planning, database ingestion, CATMAID materialization, cache creation,
-verification, and durable resume state. It does not download inputs, publish a
-project, or delete a failed project. Imports can append to an existing tracing
-project (including one that already has skeletons) or create a new hidden project.
+validation, deterministic batch planning, database ingestion, CATMAID
+materialization, cache creation, verification, and durable resume state. It does
+not download inputs, publish a project, or delete a failed project. Imports can
+append to an existing tracing project (including one that already has skeletons)
+or create a new hidden project.
 Both use the same offline bulk ingestion path. Before running an import, make the
 managed layer **inactive in Neuroglass** and keep it inactive until all data and
 cache verification succeeds. Layer activation is an operator action; this script
@@ -371,25 +371,6 @@ calls and refresh source metadata after merges and splits. Keep fragment IDs
 as strings separately from numeric CATMAID skeleton IDs. This change does not
 add viewer code or append all identifiers to visible labels.
 
-### Development workspace format
-
-Version 0.5.0 removes the optional external-ID input CSV and its output column.
-`source` now accepts only `archive_path` and `coordinate_unit`; requests with the
-removed option are rejected as unknown fields. Internal plan and state formats
-are version 3, so older development workspaces are rejected before database writes
-instead of mixing manifest formats. If an older workspace has committed batches,
-finish or recover it with its original importer version; do not discard its state
-and reimport the archive. Otherwise, create a new state directory. No legacy
-reader or backfill is provided. Public request and wrapper-result schemas remain
-version 1. Each fragment still reserves five concept IDs: neuron, skeleton, model
-link, annotation and annotation link.
-
-Plans produced before whitespace normalization that contain untrimmed fragment
-IDs are rejected rather than silently renamed on resume. If such a workspace has
-committed batches, use its original importer version to finish or recover it;
-otherwise, create a fresh state directory. Plans whose IDs were already trimmed
-remain compatible.
-
 ## Container ingestion entry point
 
 The CATMAID image includes the package and a headless runtime wrapper:
@@ -464,11 +445,43 @@ retain their original visibility and permissions. Keep their Neuroglass managed
 layer inactive until the import completes; the importer does not enforce access
 restrictions on other CATMAID clients.
 
+## State and progress
+
+The directory supplied through `--state-dir` holds the recovery checkpoints and
+audit artifacts for one import. Reuse it when running or resuming that import,
+and keep it on persistent storage across deployment job or pod restarts.
+`state.py` locks the directory against concurrent importer writers and atomically
+replaces checkpoints so readers do not see partially written JSON. It tracks the
+input and artifact hashes, saved settings, ID reservations, project and batch
+statuses, and maintenance/cache/verification phases. The orchestrator uses this
+state to skip committed work, reuse reservations and block uncertain commits.
+
+| File in the state directory | Purpose |
+| --- | --- |
+| `state.json` | Authoritative recovery checkpoints and phase/batch statuses. |
+| `metrics.json` | Planned/completed batch, skeleton and node counts; operation durations, per-operation row counts and run settings history. |
+| `result.json` | JSON outcome of the most recent completed or failed CLI command. |
+
+Metrics are observational: completed counts are reconciled with committed state
+on resume and after each batch. Loading progress advances after a batch commits.
+Cache rebuilding has a running phase in `state.json`, but no structured live
+cell-by-cell percentage. The metrics `active_phase` field is not consistently
+populated by the orchestrator; most operation timings are recorded on completion.
+All planned nodes can therefore be loaded while cache rebuilding or final
+verification is still running.
+
+There is no client-facing HTTP progress endpoint. A backend can read these files
+from shared storage and expose a status summary to a polling client. Combine the
+checkpoints and counts with deployment job/process status to detect a stopped
+importer; the files are not a heartbeat. Reactivate the managed layer only after
+the import's successful final status, not merely when node counts reach 100%.
+
 ## Exit codes
 
 | Code | Meaning |
 |---:|---|
 | `0` | Command completed successfully |
+| `1` | Unexpected internal failure |
 | `2` | Invalid request, archive, setting, or deployment precondition |
 | `3` | Definite failure that is safe to retry with `run` |
 | `4` | Immutable request/archive/plan/database target mismatch |
@@ -511,8 +524,9 @@ is a suitable substitute. These checks run before the tests create any projects.
 
 ## Edge materialization
 
-The edge materialization introduced in version 0.2.0 creates edges from a validated temporary copy of each prepared
-batch, using PostgreSQL `real` coordinates to match CATMAID's stored precision.
+Edge materialization creates edges from a validated temporary copy of each
+prepared batch, using PostgreSQL `real` coordinates to match CATMAID's stored
+precision.
 It checks recorded IDs, ownership, and parent membership before inserting one
 edge per node. Roots retain NULL parents and zero-length geometry. Existing
 edges cause an error and batch rollback; no edges or connector materializations
