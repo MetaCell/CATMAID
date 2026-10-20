@@ -1319,6 +1319,7 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
         ORDER BY t.id
         FOR NO KEY UPDATE OF t
         ''', (skeleton_id, skeleton_id)) # no need to sanitize
+    # Metadata checks below reuse the cursor; retain the locked graph snapshot.
     locked_nodes = cursor.fetchall()
     _check_fragment_source_nodes(project_id, {treenode_id: skeleton_id},
             {skeleton_id: neuron.id}, cursor)
@@ -1331,6 +1332,8 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     downstream_annotation_map = (json.loads(downstream_annotation_map)
             if downstream_annotation_map else current_annotations)
     source_annotations = _source_fragment_annotations(project_id, [neuron.id], cursor)
+    # These annotations record inherited origin, rather than per-node membership.
+    # Both split results therefore retain the complete source set.
     upstream_annotation_map = _retain_source_fragment_annotations(
             upstream_annotation_map, source_annotations)
     downstream_annotation_map = _retain_source_fragment_annotations(
@@ -2419,13 +2422,18 @@ def join_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
         })
 
     except PermissionError:
+        # Keep reserved-annotation failures as HTTP 403 instead of validation errors.
         raise
     except Exception as e:
         raise ValueError(response_on_error + ':' + str(e))
 
 
 def _lock_source_fragment_neurons(project_id, neuron_ids, cursor) -> None:
-    """Serialize annotation inheritance across structural edits of a neuron."""
+    """Serialize inheritance even when edits select different nodes of one neuron.
+
+    Read provenance after locking its owner, then recheck captured node ownership.
+    NOWAIT asks a conflicting editor to retry with fresh state.
+    """
     expected = set(neuron_ids)
     try:
         cursor.execute("""
@@ -2491,6 +2499,7 @@ def _retain_source_fragment_annotations(annotation_map, source_annotations) -> D
     reject_reserved_annotation_names(name for name in annotation_map
             if is_source_fragment_annotation_name(name) and name not in source_annotations)
     retained = dict(annotation_map)
+    # Restore stored annotators too; a client selection must not rewrite origin.
     retained.update(source_annotations)
     return retained
 
@@ -2826,6 +2835,7 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
         return response
 
     except PermissionError:
+        # Let the endpoint preserve the permission response for protected metadata.
         raise
     except Exception as e:
         raise ValueError(response_on_error + ':' + str(e))
@@ -3345,6 +3355,7 @@ def _import_skeleton(user, project_id, arborescence, neuron_id=None,
     provided. Returns a dictionary of the neuron and skeleton IDs, and the
     original arborescence with attributes added for treenode IDs.
     """
+    # Native uploads accept user labels; only the batch importer creates source IDs.
     reject_reserved_annotation_names(annotations or ())
 
     # TODO: There is significant reuse here of code from create_treenode that

@@ -135,12 +135,15 @@ def get_skeleton_ids_for_neurons(project_id:int, neuron_ids:List) -> Dict[int, L
 def _delete_neuron_and_unused_annotations(neuron) -> None:
     """Delete a neuron and annotations whose last use disappears with it."""
     project_id = neuron.project_id
+    # Link IDs and annotation object IDs differ. Capture the objects before the
+    # cascade removes their links, so orphan provenance cannot block reimport.
     annotation_ids = set(ClassInstanceClassInstance.objects.filter(
             project_id=project_id, class_instance_a_id=neuron.id,
             relation__relation_name='annotated_with').values_list(
                     'class_instance_b_id', flat=True))
     neuron.delete()
     if annotation_ids:
+        # Split results can share provenance; retain it while any entity uses it.
         used_annotation_ids = set(ClassInstanceClassInstance.objects.filter(
                 class_instance_b_id__in=annotation_ids,
                 relation__relation_name='annotated_with').values_list(
@@ -159,6 +162,8 @@ def _delete_if_empty(neuron_id) -> bool:
     if is_empty:
         neuron = ClassInstance.objects.filter(pk=neuron_id).first()
         if neuron is not None:
+            # Final-node deletion and merge cleanup need the same provenance
+            # cleanup as explicit whole-neuron deletion.
             _delete_neuron_and_unused_annotations(neuron)
     return is_empty
 
@@ -355,6 +360,8 @@ def rename_neuron(request:HttpRequest, project_id=None, neuron_id=None) -> JsonR
 
     # Update neuron name
     neuron = ClassInstance.objects.get(id=neuron_id)
+    # Legacy rename routes accept ClassInstance IDs, including annotations.
+    # Inspect the actual class so they cannot rename protected source objects.
     reject_reserved_annotation_rename(neuron, new_name)
     old_name = neuron.name
     neuron.name=new_name
@@ -405,6 +412,7 @@ def rename_neurons(request:HttpRequest, project_id=None) -> JsonResponse:
         raise ValueError('Need at least one neuron ID / name mapping')
     neuron_ids = [int(k) for k, _ in neuron_name_pairs]
     neuron_names = [v for _, v in neuron_name_pairs]
+    # Preflight the whole batch before a generic rename can touch source metadata.
     candidates = ClassInstance.objects.select_related('class_column').in_bulk(neuron_ids)
     for neuron_id, new_name in zip(neuron_ids, neuron_names):
         candidate = candidates.get(neuron_id)

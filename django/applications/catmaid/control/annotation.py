@@ -71,7 +71,8 @@ def get_annotated_entities(project_id:Union[int,str], params, relations=None, cl
     not_annotation_sets:Set[FrozenSet] = set()
     annotation_sets_to_expand:Set[FrozenSet] = set()
 
-    # Get name, annotator and time constraints, if available
+    # Filename provenance can contain significant whitespace and pattern syntax.
+    # Preserve it for literal lookups; other search modes keep their normalization.
     raw_name = params.get('name', "")
     name_not = get_request_bool(params, 'name_not', False)
     name_exact = get_request_bool(params, 'name_exact', False)
@@ -148,11 +149,8 @@ def get_annotated_entities(project_id:Union[int,str], params, relations=None, cl
     if end_date:
         params['end_date'] = end_date
 
-    # If a name is given, add this to the query. If its first character is a
-    # slash, treat it as regex. There is a a trigram index and a upper()
-    # expression index on class_instance.name and we add checks to utilize both,
-    # if possible. This is mainly useful for exact name queries, both
-    # case-sensitive and case insensitive as well as regex and normal.
+    # Keep pattern searches on their existing trigram/upper() index path; literal
+    # equality must not reinterpret a source filename as a search pattern.
     if name:
         if literal_name:
             # Exact lookup treats whitespace and LIKE/regex syntax as literal data.
@@ -699,6 +697,8 @@ def _update_neuron_annotations(project_id:Union[int,str], neuron_id,
     than created from scratch. This preserves provenance such as creation times.
     allow_reserved is private to trusted structural operations, not request data.
     """
+    # Replacing a complete annotation set could silently erase source provenance.
+    # Structural callers must restore server-derived source IDs before opting in.
     if not allow_reserved:
         reject_reserved_annotation_names(annotation_map)
         reject_reserved_annotations(project_id, [neuron_id])
@@ -824,6 +824,8 @@ def _annotate_entities(project_id:Union[int,str], entity_ids, annotation_map:Dic
     source-fragment names remain literal. allow_reserved is only for trusted
     structural operations transferring server-derived provenance.
     """
+    # Annotations can also be targets of meta-annotations. Check both names and
+    # target objects so ordinary editing cannot alter the reserved source records.
     if not allow_reserved:
         reject_reserved_annotation_names(annotation_map)
         reject_reserved_annotations(project_id, entity_ids)
@@ -905,6 +907,8 @@ def _annotate_entities(project_id:Union[int,str], entity_ids, annotation_map:Dic
     return annotation_objects, new_annotations, existing_annotations
 
 def _annotate_entities_with_name(project_id:Union[int,str], user_id, entity_ids) -> Tuple[List[List[Any]], List[List[Any]]]:
+    # Deriving annotations from entity names can enter the reserved namespace
+    # without an explicit annotation argument. Preflight before creating any rows.
     reject_reserved_annotations(project_id, entity_ids)
     entity_name_map = dict(ClassInstance.objects.filter(
             project_id=project_id, pk__in=entity_ids).values_list('id', 'name'))
@@ -1908,6 +1912,8 @@ def annotations_for_skeleton(project_id:Union[int,str], skeleton_id, relations=N
 def clear_annotations(project_id:Union[int,str], skeleton_id, relations=None, classes=None) -> List[int]:
     """Remove editable annotations from a skeleton, retaining source provenance.
     """
+    # Native SWC annotation replacement uses this helper. Clearing user labels
+    # must preserve the imported source identity through that replacement.
     if not relations:
         relations = get_relation_to_id_map(project_id)
     if not classes:

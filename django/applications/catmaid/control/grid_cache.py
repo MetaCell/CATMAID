@@ -1,4 +1,4 @@
-"""Coordinate incremental grid updates without blocking cache readers."""
+"""Publish grid cells atomically across bulk rebuilds and normal cache workers."""
 
 from contextlib import contextmanager
 import hashlib
@@ -18,12 +18,18 @@ def locked_grid_cell(grid_id, x, y, z, *, connection=None,
     Spatial notifications may arrive while a cell is being generated. Compare
     the dirty row's MVCC version, not just its timestamp (``now()`` is the
     invalidator's transaction start time), so a newer invalidation survives.
-    Ordinary readers keep seeing the previous committed payload throughout.
+
+    Offline imports rebuild after loading, while normal workers can also refresh
+    cells. Sharing this transaction and lock prevents their format writes from
+    interleaving. Readers see the previous committed payload when one exists;
+    the full offline rebuild still requires the target layer to remain inactive.
     """
     if connection is None or atomic is None:
         from django.db import connection as default_connection, transaction
         connection = connection if connection is not None else default_connection
         atomic = atomic or (lambda: transaction.atomic(using=connection.alias))
+    # Every format and its invalidation acknowledgement must share one cell's
+    # commit or rollback, independently of a caller's longer-running operation.
     if connection.in_atomic_block:
         raise RuntimeError('Grid cell refresh requires its own transaction')
     coordinates = [grid_id, x, y, z]

@@ -384,6 +384,8 @@ def remove_classification_graph(request:HttpRequest, workspace_pid, project_id=N
     if root_links_q.count() == 0:
         raise Exception("The link provided doesn't refer to a 'classification_root' derived instance.")
 
+    # An ordinary root may lead to a protected annotation through generic
+    # ClassInstance links. Validate the whole graph before cascading deletions.
     _reject_reserved_classification_subtree(graph_ci.id)
 
     # Collect some statistics
@@ -829,7 +831,11 @@ def list_classification_graph(request:HttpRequest, workspace_pid, project_id=Non
         raise Exception(response_on_error + ':' + str(e))
 
 def _reject_reserved_classification_subtree(root_id):
-    """Preflight the complete manual subtree deletion before deleting any node."""
+    """Preflight deletion because classification nodes and annotations share storage.
+
+    Checking descendants first prevents a generic graph operation from deleting
+    protected source metadata below an otherwise editable root.
+    """
     visited = set()
     pending = {root_id}
     while pending:
