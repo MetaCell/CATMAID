@@ -78,8 +78,9 @@ def parse_swc(
     """Parse and validate an SWC from a binary stream.
 
     Parsing is strict UTF-8 and bounded by ``max_bytes`` and ``max_nodes`` when
-    supplied. Geometry bounds are deliberately not checked: the ingestion
-    request's stack geometry is authoritative in the first public profile.
+    supplied. XYZ must be non-negative because the current viewer discovers
+    skeletons within a stack that starts at zero. Upper stack bounds are not
+    checked; stack geometry does not transform the source coordinates.
     ``scale_nm`` is used only to reject values that would become non-finite
     during conversion; returned node values remain in source units.
     """
@@ -113,8 +114,10 @@ def parse_swc(
         except UnicodeDecodeError as exc:
             raise _line_error(label, physical_line_number, "invalid UTF-8") from exc
 
-        line = decoded.strip()
-        if not line or line.startswith("#"):
+        # Exporters also put comments after the seven numeric fields. Strip
+        # them before counting columns, retaining physical line numbers below.
+        line = decoded.partition("#")[0].strip()
+        if not line:
             continue
         columns = line.split()
         if len(columns) != 7:
@@ -139,6 +142,11 @@ def parse_swc(
         )
 
         for column, value in (("x", x), ("y", y), ("z", z)):
+            if value < 0:
+                raise _line_error(
+                    label, physical_line_number,
+                    f"{column} must be non-negative, got {value!r}",
+                )
             if not math.isfinite(value * scale_nm):
                 raise _line_error(
                     label,
@@ -176,11 +184,6 @@ def parse_swc(
 
     if not nodes:
         raise InvalidInputError(f"{label}: no SWC nodes found")
-    if len(nodes) < 2:
-        raise InvalidInputError(
-            f"{label}: one-node SWCs are not supported by CATMAID selective summaries"
-        )
-
     nodes_by_id = {node.source_id: node for node in nodes}
     roots = [node.source_id for node in nodes if node.parent_source_id == -1]
     if len(roots) != 1:

@@ -17,8 +17,10 @@ from .artifacts import (
     combine_manifests,
     manifest_rows,
     read_id_artifact,
+    verify_node_map,
     write_id_artifact,
     write_manifest,
+    write_node_map,
 )
 from .config import (
     load_operational_settings,
@@ -35,7 +37,7 @@ from .errors import (
     RetryableError,
     VerificationError,
 )
-from .loader import ProjectContext, execute_batch_transaction, prepare_copy_rows
+from .loader import PreparedBatch, ProjectContext, execute_batch_transaction, prepare_copy_rows
 from .metrics import MetricsStore
 from .planner import ImportPlan, plan_archive, read_plan, write_plan
 from .state import ArchiveMetadata, StateStore
@@ -757,6 +759,25 @@ def _reconcile_completed_progress(
     )
 
 
+def _ensure_batch_node_map(store: StateStore, prepared: PreparedBatch) -> None:
+    """Save reserved identities before COMMIT and check them on every retry."""
+    batch = prepared.batch
+    state = store.load()
+    descriptor = _batch_state(state, batch.index)["artifacts"].get("node_map")
+    if descriptor is not None:
+        if descriptor["count"] != batch.node_count:
+            raise ImmutableStateError(f"Node mapping count changed for batch {batch.index}")
+        path = _artifact_path(store, state, "node_map", batch_index=batch.index)
+        verify_node_map(path, prepared.node_map_file)
+        return
+    relative = Path("batches") / f"{batch.index:06d}" / "node-map.csv.gz"
+    write_node_map(store.state_dir / relative, prepared.node_map_file)
+    store.register_artifact(
+        "node_map", relative, count=batch.node_count, compression="gzip",
+        batch_index=batch.index,
+    )
+
+
 def _run_batch(
     store: StateStore,
     batch: PlannedBatch,
@@ -836,6 +857,7 @@ def _run_batch(
 
     try:
         with prepared_context as prepared:
+            _ensure_batch_node_map(store, prepared)
             counts = execute_batch_transaction(
                 prepared,
                 project,
@@ -1044,6 +1066,9 @@ def _verify_database_by_batch(
             )
             with connection.cursor() as cursor:
                 verify_exact_treenodes(cursor, prepared)
+            # Also backfill mappings for batches committed by an older importer,
+            # but only after verifying their exact database rows and reservations.
+            _ensure_batch_node_map(store, prepared)
         for key, value in counts.items():
             imported_counts[key] = imported_counts.get(key, 0) + value
         if (

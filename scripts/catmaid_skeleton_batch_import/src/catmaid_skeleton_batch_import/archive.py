@@ -120,15 +120,6 @@ def _collect_swc_infos(
             )
         if not info.filename.lower().endswith(".swc"):
             continue
-        if not _is_regular_zip_member(info):
-            raise InvalidInputError(
-                f"SWC member is not a regular file: {info.filename!r}"
-            )
-        if info.file_size > settings.max_swc_bytes:
-            raise InvalidInputError(
-                f"SWC member {info.filename!r} is {info.file_size} bytes; "
-                f"limit is {settings.max_swc_bytes}"
-            )
         swc_infos.append(info)
         if len(swc_infos) > settings.max_swc_count:
             raise InvalidInputError(
@@ -156,25 +147,47 @@ def scan_archive(
     _reject_if_changed(archive_path, before, "SWC archive")
 
     members: list[PlannedMember] = []
+    member_errors: dict[str, str] = {}
+    fragment_paths: dict[str, list[str]] = {}
     total_nodes = 0
     try:
         with zipfile.ZipFile(archive_path, "r") as archive:
             infos = _collect_swc_infos(archive, settings)
             for info in infos:
                 label = f"{archive_path.name}:{info.filename}"
-                with archive.open(info, "r") as member_source:
-                    parsed = parse_swc(
-                        member_source,
-                        label,
-                        max_bytes=settings.max_swc_bytes,
-                        max_nodes=settings.max_nodes_per_batch,
-                        scale_nm=request.scale_nm,
-                    )
-                if parsed.bytes_read != info.file_size:
-                    raise InvalidInputError(
-                        f"{label}: ZIP metadata reports {info.file_size} bytes but "
-                        f"the member produced {parsed.bytes_read} bytes"
-                    )
+                try:
+                    if not _is_regular_zip_member(info):
+                        raise InvalidInputError(
+                            f"SWC member is not a regular file: {info.filename!r}"
+                        )
+                    if info.file_size > settings.max_swc_bytes:
+                        raise InvalidInputError(
+                            f"SWC member {info.filename!r} is {info.file_size} bytes; "
+                            f"limit is {settings.max_swc_bytes}"
+                        )
+                    fragment_id = fragment_id_from_member_path(info.filename)
+                    fragment_paths.setdefault(fragment_id, []).append(info.filename)
+                    with archive.open(info, "r") as member_source:
+                        parsed = parse_swc(
+                            member_source,
+                            label,
+                            max_bytes=settings.max_swc_bytes,
+                            max_nodes=settings.max_nodes_per_batch,
+                            scale_nm=request.scale_nm,
+                        )
+                    if parsed.bytes_read != info.file_size:
+                        raise InvalidInputError(
+                            f"{label}: ZIP metadata reports {info.file_size} bytes but "
+                            f"the member produced {parsed.bytes_read} bytes"
+                        )
+                except InvalidInputError as exc:
+                    # One useful error per member; continue so the operator can
+                    # fix the whole archive in one pass. Never plan a subset.
+                    member_errors[info.filename] = str(exc)
+                    continue
+                except (zipfile.BadZipFile, RuntimeError, NotImplementedError, OSError) as exc:
+                    member_errors[info.filename] = f"Could not read {label}: {exc}"
+                    continue
                 total_nodes += parsed.summary.node_count
                 if (
                     settings.max_total_nodes is not None
@@ -198,7 +211,7 @@ def scan_archive(
                         uncompressed_bytes=info.file_size,
                         crc32=info.CRC,
                         display_name=PurePosixPath(info.filename).stem[:255],
-                        fragment_id=fragment_id_from_member_path(info.filename),
+                        fragment_id=fragment_id,
                         cable_length_nm=cable_length_nm,
                     )
                 )
@@ -209,6 +222,22 @@ def scan_archive(
             f"Could not read SWC archive {archive_path}: {exc}"
         ) from exc
     _reject_if_changed(archive_path, before, "SWC archive")
+
+    for fragment_id, paths in fragment_paths.items():
+        if len(paths) > 1:
+            for index, member_path in enumerate(paths):
+                other_path = paths[0] if index else paths[1]
+                member_errors.setdefault(member_path,
+                    f"Archive contains duplicate fragment identifier {fragment_id!r}; "
+                    f"also used by {other_path!r}")
+    if member_errors:
+        errors = [{"member_path": path, "message": message}
+                  for path, message in sorted(member_errors.items())]
+        raise InvalidInputError(
+            f"{len(errors)} SWC file(s) failed validation; "
+            f"see error.details.member_errors. First error: {errors[0]['message']}",
+            details={"invalid_swc_count": len(errors), "member_errors": errors},
+        )
 
     return ArchiveScan(
         archive_path=archive_path,

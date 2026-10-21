@@ -13,10 +13,11 @@ import re
 from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple, Union
 
 from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 from django.http import HttpRequest, HttpResponse, HttpResponseBadRequest, Http404, \
         JsonResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404
-from django.db import connection, OperationalError
+from django.db import connection, OperationalError, transaction
 from django.db.models import Q
 from django.views.decorators.cache import never_cache
 from django.utils.decorators import method_decorator
@@ -1306,6 +1307,8 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     # Make sure the user has permissions to edit
     can_edit_class_instance_or_fail(request.user, neuron.id, 'neuron')
     _lock_source_fragment_neurons(project_id, [neuron.id], cursor)
+    # A committed edit during the wait may have changed edit restrictions.
+    can_edit_class_instance_or_fail(request.user, neuron.id, 'neuron')
 
     # Retrieve the id, parent_id of all nodes in the skeleton. Also
     # pre-emptively lock all treenodes and connectors in the skeleton to prevent
@@ -2432,24 +2435,42 @@ def _lock_source_fragment_neurons(project_id, neuron_ids, cursor) -> None:
     """Serialize inheritance even when edits select different nodes of one neuron.
 
     Read provenance after locking its owner, then recheck captured node ownership.
-    NOWAIT asks a conflicting editor to retry with fresh state.
+    Wait briefly for a conflicting editor; longer contention asks the caller to
+    retry. Limit only this lock acquisition, not the rest of the request.
     """
     expected = set(neuron_ids)
+    timeout_ms = settings.SKELETON_EDIT_LOCK_TIMEOUT_MS
+    if (isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int)
+            or not 0 < timeout_ms <= 2147483647):
+        raise ImproperlyConfigured('SKELETON_EDIT_LOCK_TIMEOUT_MS must be a positive integer')
     try:
-        cursor.execute("""
-            SELECT ci.id
-            FROM class_instance ci
-            JOIN class c ON c.id = ci.class_id
-            WHERE ci.project_id = %s AND ci.id = ANY(%s::bigint[])
-                AND c.class_name = 'neuron'
-            ORDER BY ci.id
-            FOR NO KEY UPDATE OF ci NOWAIT
-        """, (project_id, sorted(expected)))
+        # A savepoint restores the timeout and releases partial locks if the
+        # query times out. On success the row locks live until request commit.
+        with transaction.atomic(using=cursor.db.alias):
+            cursor.execute("SELECT setting::integer FROM pg_settings WHERE name='lock_timeout'")
+            previous_timeout_ms = cursor.fetchone()[0]
+            # Do not weaken an existing, stricter database timeout.
+            effective_timeout_ms = (min(timeout_ms, previous_timeout_ms)
+                    if previous_timeout_ms else timeout_ms)
+            cursor.execute("SELECT set_config('lock_timeout', %s, true)",
+                    [f'{effective_timeout_ms}ms'])
+            cursor.execute("""
+                SELECT ci.id
+                FROM class_instance ci
+                JOIN class c ON c.id = ci.class_id
+                WHERE ci.project_id = %s AND ci.id = ANY(%s::bigint[])
+                    AND c.class_name = 'neuron'
+                ORDER BY ci.id
+                FOR NO KEY UPDATE OF ci
+            """, (project_id, sorted(expected)))
+            locked = {row[0] for row in cursor.fetchall()}
+            cursor.execute("SELECT set_config('lock_timeout', %s, true)",
+                    [f'{previous_timeout_ms}ms'])
     except OperationalError as error:
         if getattr(error.__cause__, 'pgcode', None) == '55P03':
             raise ValueError('A source neuron is being edited; retry the operation.') from error
         raise
-    if {row[0] for row in cursor.fetchall()} != expected:
+    if locked != expected:
         raise ValueError('A source neuron changed during the operation; retry it.')
 
 
@@ -2619,6 +2640,18 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
 
         cursor = connection.cursor()
 
+        # Acquire ownership locks before reading metadata that can change while
+        # waiting, including edit restrictions, names and stable-winner labels.
+        _lock_source_fragment_neurons(project_id,
+                [from_neuron['neuronid'], to_neuron['neuronid']], cursor)
+        can_edit_class_instance_or_fail(user, from_neuron['neuronid'], 'neuron')
+        can_edit_class_instance_or_fail(user, to_neuron['neuronid'], 'neuron')
+        current_names = dict(ClassInstance.objects.filter(
+                pk__in=[from_neuron['neuronid'], to_neuron['neuronid']]
+                ).values_list('id', 'name'))
+        from_neuron['neuronname'] = current_names[from_neuron['neuronid']]
+        to_neuron['neuronname'] = current_names[to_neuron['neuronid']]
+
         # Test if either join partner is marked as stable. If this is the case,
         # the neuron marked as stable is enforced to be the winner of the join.
         # If both join partners are marked stable, the join is canceld. This
@@ -2663,11 +2696,6 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
                 to_skid, to_neuron = original_from_skid, original_from_neuron
                 to_treenode, to_treenode_id = original_from_treenode, original_from_treenode_id
                 stable_induced_swap = True
-
-        # Serialize on neurons before taking a node snapshot: split and joins
-        # at different target nodes must see the same committed source metadata.
-        _lock_source_fragment_neurons(project_id,
-                [from_neuron['neuronid'], to_neuron['neuronid']], cursor)
 
         # We are going to change the skeleton ID of the "to" neuron, therefore
         # all its nodes need to be locked to prevent modification from other

@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Iterator, Sequence, TextIO
 
+from .artifacts import NODE_MAP_FIELDS
 from .domain import ImportSettings, IngestionRequest, PlannedBatch, PlannedMember, SwcNode
 from .errors import InvalidInputError, VerificationError
 from .fragments import fragment_annotation_name
@@ -81,6 +82,7 @@ class PreparedBatch:
         class_file: TextIO,
         relationship_file: TextIO,
         treenode_file: TextIO,
+        node_map_file: TextIO,
         expected_skeletons: tuple[ExpectedSkeleton, ...],
         location_ids: tuple[int, ...],
     ) -> None:
@@ -88,6 +90,7 @@ class PreparedBatch:
         self.class_file = class_file
         self.relationship_file = relationship_file
         self.treenode_file = treenode_file
+        self.node_map_file = node_map_file
         self.expected_skeletons = expected_skeletons
         self.location_ids = location_ids
 
@@ -99,11 +102,13 @@ class PreparedBatch:
         self.class_file.seek(0)
         self.relationship_file.seek(0)
         self.treenode_file.seek(0)
+        self.node_map_file.seek(0)
 
     def close(self) -> None:
         self.class_file.close()
         self.relationship_file.close()
         self.treenode_file.close()
+        self.node_map_file.close()
 
     def __enter__(self) -> "PreparedBatch":
         return self
@@ -192,9 +197,12 @@ def prepare_copy_rows(
     class_file = _spooled_text_file()
     relationship_file = _spooled_text_file()
     treenode_file = _spooled_text_file()
+    node_map_file = _spooled_text_file()
     class_writer = csv.writer(class_file, lineterminator="\n")
     relationship_writer = csv.writer(relationship_file, lineterminator="\n")
     treenode_writer = csv.writer(treenode_file, lineterminator="\n")
+    node_map_writer = csv.writer(node_map_file, lineterminator="\n")
+    node_map_writer.writerow(NODE_MAP_FIELDS)
 
     concept_offset = 0
     location_offset = 0
@@ -272,6 +280,12 @@ def prepare_copy_rows(
             ])
 
             for node in nodes:
+                # IDs follow source row order, not the numeric SWC ID. Capture
+                # the very same assignment as COPY, including the ZIP path
+                # because separate SWCs routinely reuse local node IDs.
+                node_map_writer.writerow([
+                    member.member_path, node.source_id, node_id_map[node.source_id],
+                ])
                 parent_id = (
                     r"\N"
                     if node.parent_source_id == -1
@@ -310,11 +324,13 @@ def prepare_copy_rows(
         class_file.flush()
         relationship_file.flush()
         treenode_file.flush()
+        node_map_file.flush()
         prepared = PreparedBatch(
             batch=batch,
             class_file=class_file,
             relationship_file=relationship_file,
             treenode_file=treenode_file,
+            node_map_file=node_map_file,
             expected_skeletons=tuple(expected_skeletons),
             location_ids=tuple(int(value) for value in location_ids),
         )
@@ -324,6 +340,7 @@ def prepare_copy_rows(
         class_file.close()
         relationship_file.close()
         treenode_file.close()
+        node_map_file.close()
         raise
 
 

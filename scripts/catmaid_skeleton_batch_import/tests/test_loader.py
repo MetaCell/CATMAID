@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from catmaid_skeleton_batch_import.archive import scan_archive
-from catmaid_skeleton_batch_import.artifacts import manifest_rows, read_manifest, write_manifest
+from catmaid_skeleton_batch_import.artifacts import NODE_MAP_FIELDS, manifest_rows, read_manifest, write_manifest
 from catmaid_skeleton_batch_import.config import DEFAULTS
 from catmaid_skeleton_batch_import.domain import (
     IngestionRequest,
@@ -140,6 +140,36 @@ def test_treenode_row_comparison_uses_postgres_float4_precision() -> None:
     )
     assert not _treenode_row_matches((*actual[:4], 8379525.0, *actual[5:]), expected)
     assert not _treenode_row_matches((*actual[:9], 999), expected)
+
+
+def test_node_map_uses_exact_copy_assignments_and_full_csv_quoted_member_paths(tmp_path):
+    members = tuple(PlannedMember(
+        member_path=path, node_count=2, uncompressed_bytes=40, crc32=1,
+        display_name=f"cell{i}", fragment_id=f"cell{i}", cable_length_nm=1,
+        batch_index=1,
+    ) for i, path in enumerate(['folder/细胞,"one".swc', 'other/line\nbreak.swc']))
+    batch = PlannedBatch(index=1, members=members)
+    request = IngestionRequest(1, tmp_path / "source.zip", "nm", target_project_id=5)
+    project = ProjectContext(5, None, None, 1, 8, 9, 10, 11, 12, existing_project=True)
+    # Child before parent, with IDs repeated across SWCs. Sequence gaps and
+    # integers above JavaScript's exact range must survive the CSV unchanged.
+    nodes = (SwcNode(42, 3, 1, 0, 0, -1, 7), SwcNode(7, 1, 0, 0, 0, -1, -1))
+    ids = [200, 207, 9007199254740993, 9007199254741001]
+    with prepare_copy_rows(batch, request, project, list(range(100, 110)), ids,
+                           lambda _member: nodes) as prepared:
+        rows = list(csv.DictReader(prepared.node_map_file))
+        assert list(rows[0]) == list(NODE_MAP_FIELDS)
+        assert rows == [
+            {"member_path": members[i // 2].member_path,
+             "source_node_id": str([42, 7][i % 2]), "treenode_id": str(node_id)}
+            for i, node_id in enumerate(ids)
+        ]
+        copied = list(csv.reader(prepared.treenode_file))
+        assert [int(row[0]) for row in copied] == ids
+        assert [row[-1] for row in copied] == [str(ids[1]), r"\N", str(ids[3]), r"\N"]
+        prepared.rewind()
+        assert prepared.node_map_file.tell() == 0
+    assert prepared.node_map_file.closed
 
 
 def test_expected_cable_uses_catmaid_float4_coordinates(tmp_path: Path) -> None:

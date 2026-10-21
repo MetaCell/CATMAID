@@ -234,7 +234,7 @@ def test_materialize_and_verify_batch_uses_batch_edges_and_exact_checks(monkeypa
     assert all(duration >= 0 for _name, duration in timings)
 
 
-def test_materialization_requires_origin_and_rejects_singletons():
+def test_materialization_accepts_singleton_expectations_but_requires_origin():
     expected = [
         {
             "neuron_id": 10,
@@ -248,7 +248,7 @@ def test_materialization_requires_origin_and_rejects_singletons():
             "cable_length_nm": 0,
         }
     ]
-    with pytest.raises(ValueError, match="one-node"):
+    with pytest.raises(RuntimeError, match="must be origin"):
         materialization.materialize_and_verify_batch(
             project_id=1,
             user_id=7,
@@ -259,7 +259,7 @@ def test_materialization_requires_origin_and_rejects_singletons():
         annotated_with_relation_id=42,
             skeletons=expected,
             location_ids=[20],
-            connection=ScriptedConnection(in_atomic_block=True),
+            connection=ScriptedConnection([[('replica',)]], in_atomic_block=True),
             treenode_file=io.StringIO(),
         )
 

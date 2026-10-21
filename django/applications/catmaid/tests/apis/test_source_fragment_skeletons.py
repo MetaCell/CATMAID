@@ -12,12 +12,14 @@ import networkx as nx
 
 from django.db import close_old_connections, connections, transaction
 from django.db.models import F
+from django.test import override_settings
 
 from catmaid.control.annotation import _annotate_entities, annotations_for_skeleton
 from catmaid.control.authentication import PermissionError
 from catmaid.control.neuron import _delete_neuron_and_unused_annotations
 from catmaid.control.skeleton import (
     _get_neuronname_from_skeletonid, _import_skeleton, _join_skeleton,
+    _lock_source_fragment_neurons,
 )
 from catmaid.models import ClassInstance, ClassInstanceClassInstance, Treenode, User
 from catmaid.source_fragments import SOURCE_FRAGMENT_ANNOTATION_PREFIX
@@ -216,7 +218,7 @@ class SourceFragmentTransactionTests(SourceFragmentFixtures, CatmaidApiTransacti
                 class_column__class_name='annotation', name='source-fragment:A').exists())
 
     @contextmanager
-    def paused_join(self, winner, loser):
+    def paused_join(self, winner, loser, after_join=None):
         ready, release = Event(), Event()
         failures = []
 
@@ -227,6 +229,8 @@ class SourceFragmentTransactionTests(SourceFragmentFixtures, CatmaidApiTransacti
                     user = User.objects.get(pk=self.test_user_id)
                     _join_skeleton(user, winner.nodes[0], loser.nodes[0],
                             self.test_project_id, {})
+                    if after_join is not None:
+                        after_join()
                     ready.set()
                     if not release.wait(15):
                         raise AssertionError('Timed out waiting to commit first join')
@@ -242,13 +246,177 @@ class SourceFragmentTransactionTests(SourceFragmentFixtures, CatmaidApiTransacti
             self.assertTrue(ready.wait(15), 'First join did not acquire locks')
             if failures:
                 raise failures[0]
-            yield
+            yield release
         finally:
             release.set()
             worker.join(15)
         self.assertFalse(worker.is_alive())
         self.assertEqual(failures, [])
 
+    def complete_after_wait(self, release, operation):
+        """Release the first editor only once PostgreSQL observes a waiter."""
+        ready = Event()
+        backend_ids, failures = [], []
+
+        def run():
+            close_old_connections()
+            try:
+                with transaction.atomic():
+                    with connections['default'].cursor() as cursor:
+                        cursor.execute('SELECT pg_backend_pid()')
+                        backend_ids.append(cursor.fetchone()[0])
+                    ready.set()
+                    operation()
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                ready.set()
+                connections['default'].close()
+
+        worker = Thread(target=run, daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(ready.wait(10), 'Second editor did not start')
+            deadline = time.monotonic() + 3
+            while True:
+                if failures:
+                    raise failures[0]
+                with connections['default'].cursor() as cursor:
+                    cursor.execute('SELECT pg_blocking_pids(%s)', backend_ids)
+                    if cursor.fetchone()[0]:
+                        break
+                self.assertTrue(worker.is_alive(), 'Second editor did not wait for the lock')
+                self.assertLess(time.monotonic(), deadline, 'No database lock wait observed')
+                release.wait(0.01)
+        finally:
+            release.set()
+            worker.join(10)
+        self.assertFalse(worker.is_alive())
+        if failures:
+            raise failures[0]
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
+    def test_join_waits_for_commit_then_inherits_current_identifiers(self):
+        winner = self.fragment('A', ['A'])
+        first = self.fragment('B', ['B'])
+        second = self.fragment('C', ['C'])
+        with self.paused_join(winner, first) as release:
+            self.complete_after_wait(release, lambda: _join_skeleton(
+                User.objects.get(pk=self.test_user_id), winner.nodes[2],
+                second.nodes[0], self.test_project_id, {}))
+        self.assert_sources(winner.neuron, ['A', 'B', 'C'])
+        self.assertFalse(ClassInstance.objects.filter(pk__in=[first.neuron, second.neuron]).exists())
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
+    def test_split_waits_for_join_then_copies_current_identifiers(self):
+        winner = self.fragment('A', ['A'])
+        loser = self.fragment('B', ['B'])
+        responses = []
+        data = {'treenode_id': winner.nodes[1],
+                'upstream_annotation_map': '{}', 'downstream_annotation_map': '{}'}
+        with self.paused_join(winner, loser) as release:
+            self.complete_after_wait(release,
+                    lambda: responses.append(self.client.post(
+                        f'/{self.test_project_id}/skeleton/split', data)))
+        response = responses[0]
+        self.assertStatus(response)
+        new_skeleton = response.json()['new_skeleton_id']
+        new_neuron = _get_neuronname_from_skeletonid(self.test_project_id, new_skeleton)['neuronid']
+        self.assert_sources(winner.neuron, ['A', 'B'])
+        self.assert_sources(new_neuron, ['A', 'B'])
+        crossing = Treenode.objects.filter(skeleton_id__in=[winner.skeleton, new_skeleton]
+                ).exclude(parent__isnull=True).exclude(parent__skeleton_id=F('skeleton_id'))
+        self.assertFalse(crossing.exists())
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
+    def test_waiting_join_rechecks_stable_winner_and_current_names(self):
+        winner = self.fragment('A', ['A'])
+        first = self.fragment('B', ['B'])
+        second = self.fragment('C', ['C'])
+
+        def change_metadata():
+            ClassInstance.objects.filter(pk=winner.neuron).update(name='Updated A')
+            _annotate_entities(self.test_project_id, [second.neuron],
+                    {'stable': {'user_id': self.test_user_id}})
+
+        results = []
+        with self.paused_join(winner, first, after_join=change_metadata) as release:
+            self.complete_after_wait(release, lambda: results.append(_join_skeleton(
+                User.objects.get(pk=self.test_user_id), winner.nodes[2],
+                second.nodes[0], self.test_project_id, {}, from_name_reference=True)))
+        self.assertTrue(results[0]['stable_annotation_swap'])
+        self.assert_sources(second.neuron, ['A', 'B', 'C'])
+        names = annotations_for_skeleton(self.test_project_id, second.skeleton)
+        self.assertIn('Merged: Updated A', names)
+        self.assertNotIn('Merged: A', names)
+        self.assertFalse(ClassInstance.objects.filter(pk=winner.neuron).exists())
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
+    def test_ordinary_skeletons_also_wait_then_join(self):
+        winner = self.fragment('Ordinary A', [])
+        first = self.fragment('Ordinary B', [])
+        second = self.fragment('Ordinary C', [])
+        with self.paused_join(winner, first) as release:
+            self.complete_after_wait(release, lambda: _join_skeleton(
+                User.objects.get(pk=self.test_user_id), winner.nodes[2],
+                second.nodes[0], self.test_project_id, {}))
+        self.assertEqual(Treenode.objects.filter(skeleton_id=winner.skeleton).count(), 9)
+        self.assert_sources(winner.neuron, [])
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
+    def test_ordinary_skeletons_also_wait_then_split(self):
+        winner = self.fragment('Ordinary A', [])
+        loser = self.fragment('Ordinary B', [])
+        responses = []
+        with self.paused_join(winner, loser) as release:
+            self.complete_after_wait(release, lambda: responses.append(
+                self.client.post(f'/{self.test_project_id}/skeleton/split', {
+                    'treenode_id': winner.nodes[1],
+                    'upstream_annotation_map': '{}', 'downstream_annotation_map': '{}',
+                })))
+        response = responses[0]
+        self.assertStatus(response)
+        skeleton_ids = [winner.skeleton, response.json()['new_skeleton_id']]
+        self.assertEqual(Treenode.objects.filter(skeleton_id__in=skeleton_ids).count(), 6)
+        self.assertEqual(ClassInstance.objects.filter(pk=loser.neuron).count(), 0)
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=75)
+    def test_timeout_restores_database_policy_and_releases_partial_locks(self):
+        # This first neuron is locked before the contended winner in ID order.
+        free = self.fragment('Free', [])
+        winner = self.fragment('A', ['A'])
+        loser = self.fragment('B', ['B'])
+        with self.paused_join(winner, loser):
+            for previous_timeout in (25, 2500):
+                with self.subTest(previous_timeout=previous_timeout), transaction.atomic():
+                    with connections['default'].cursor() as cursor:
+                        cursor.execute("SELECT set_config('lock_timeout', %s, true)",
+                                [f'{previous_timeout}ms'])
+                        with self.assertRaisesRegex(ValueError, 'being edited; retry'):
+                            _lock_source_fragment_neurons(self.test_project_id,
+                                    [free.neuron, winner.neuron], cursor)
+                        cursor.execute("SELECT setting::integer FROM pg_settings WHERE name='lock_timeout'")
+                        self.assertEqual(cursor.fetchone()[0], previous_timeout)
+                        # A separate session must be able to acquire the partial
+                        # lock even while this outer transaction remains open.
+                        probe = connections['default'].copy(alias='lock_probe')
+                        try:
+                            with probe.cursor() as probe_cursor:
+                                probe_cursor.execute('SELECT id FROM class_instance WHERE id=%s '
+                                        'FOR NO KEY UPDATE NOWAIT', [free.neuron])
+                                self.assertEqual(probe_cursor.fetchone()[0], free.neuron)
+                        finally:
+                            probe.close()
+
+    def test_successful_lock_restores_database_timeout(self):
+        fragment = self.fragment('Uncontended', [])
+        with transaction.atomic(), connections['default'].cursor() as cursor:
+            cursor.execute("SELECT set_config('lock_timeout', '2500ms', true)")
+            _lock_source_fragment_neurons(self.test_project_id, [fragment.neuron], cursor)
+            cursor.execute("SELECT setting::integer FROM pg_settings WHERE name='lock_timeout'")
+            self.assertEqual(cursor.fetchone()[0], 2500)
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=75)
     def test_concurrent_joins_at_different_nodes_retry_without_losing_identifiers(self):
         winner = self.fragment('A', ['A'])
         first = self.fragment('B', ['B'])
@@ -264,6 +432,7 @@ class SourceFragmentTransactionTests(SourceFragmentFixtures, CatmaidApiTransacti
         self.assert_sources(winner.neuron, ['A', 'B', 'C'])
         self.assertEqual(ClassInstance.objects.get(pk=winner.neuron).name, 'A')
 
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=75)
     def test_split_during_join_retries_with_complete_node_and_identifier_sets(self):
         winner = self.fragment('A', ['A'])
         loser = self.fragment('B', ['B'])

@@ -34,7 +34,7 @@ def test_parse_valid_swc_strictly_and_preserve_unknown_radius() -> None:
 @pytest.mark.parametrize(
     ("content", "message"),
     [
-        (b"1 1 0 0 0 1 -1\n", "one-node SWCs"),
+        (b"# comments only\n", "no SWC nodes"),
         (b"1 1 0 0 0 1 -1\n2 nope 1 0 0 1 1\n", "type must be an integer"),
         (b"1 1 0 0 0 1 -1\n2 3 1 0 0 1\n", "expected 7 columns"),
         (b"1 1 0 0 0 1 -1\n1 3 1 0 0 1 1\n", "duplicate SWC node id"),
@@ -76,11 +76,51 @@ def test_rejects_values_that_overflow_after_unit_conversion() -> None:
 
 
 def test_cable_length_is_finite() -> None:
-    content = b"1 1 -1e308 0 0 1 -1\n2 3 1e308 0 0 1 1\n"
+    content = b"1 1 0 0 0 1 -1\n2 3 1.1e308 1.1e308 1.1e308 1 1\n"
     with pytest.raises(InvalidInputError, match="non-finite length"):
         parse(content)
 
 
-def test_geometry_is_not_checked_against_stack_bounds() -> None:
-    parsed = parse(b"1 1 -100 0 0 1 -1\n2 3 1000000 0 0 1 1\n")
-    assert math.isclose(parsed.summary.cable_length_source_units, 1_000_100)
+def test_geometry_is_not_checked_against_upper_stack_bounds() -> None:
+    parsed = parse(b"1 1 100 0 0 1 -1\n2 3 1000000 0 0 1 1\n")
+    assert math.isclose(parsed.summary.cable_length_source_units, 999_900)
+
+
+@pytest.mark.parametrize("axis", ["x", "y", "z"])
+@pytest.mark.parametrize("scale_nm", [1, 1000])
+def test_rejects_negative_coordinates_with_axis_member_and_line_context(axis, scale_nm):
+    coordinates = ["0", "0", "0"]
+    coordinates[["x", "y", "z"].index(axis)] = "-0.001"
+    content = ("# header\n1 1 " + " ".join(coordinates) + " -1 -1\n").encode()
+    with pytest.raises(InvalidInputError, match=rf"cell\.swc:2: {axis} must be non-negative"):
+        parse(content, scale_nm=scale_nm)
+
+
+def test_zero_coordinates_and_unknown_radius_and_root_sentinels_remain_valid():
+    parsed = parse(b"1 1 -0.0 0 0 -1 -1\n", scale_nm=1000)
+    assert parsed.nodes[0].radius == -1
+    assert parsed.nodes[0].parent_source_id == -1
+
+
+def test_single_node_has_zero_cable_length() -> None:
+    parsed = parse(b"42 1 3 4 5 -1 -1 # point soma\n", scale_nm=1000)
+    assert parsed.summary.node_count == 1
+    assert parsed.summary.cable_length_source_units == 0
+    assert parsed.nodes[0].source_id == 42
+    assert parsed.nodes[0].parent_source_id == -1
+    assert parsed.nodes[0].radius == -1
+
+
+def test_inline_comments_leave_seven_fields_and_preserve_byte_counts() -> None:
+    content = (b"  # header\n\n1 1 0 0 0 1 -1# root\n"
+               b"2 3 3 4 0 1 1 # bifurcation / exporter note\n")
+    parsed = parse(content)
+    assert parsed.summary.node_count == 2
+    assert parsed.summary.cable_length_source_units == 5
+    assert parsed.bytes_read == len(content)
+
+
+@pytest.mark.parametrize("row", [b"2 3 3 4 0 1", b"2 3 3 4 0 1 1 99"])
+def test_inline_comments_do_not_hide_invalid_field_counts_or_line_numbers(row) -> None:
+    with pytest.raises(InvalidInputError, match=r"cell\.swc:4: expected 7 columns"):
+        parse(b"# header\n\n1 1 0 0 0 1 -1\n" + row + b" # note\n")

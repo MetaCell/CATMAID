@@ -6,11 +6,11 @@ import csv
 import gzip
 import io
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Sequence, TextIO
 
 from .domain import PlannedBatch
 from .errors import ImmutableStateError
-from .util import atomic_write_bytes, deterministic_gzip_bytes, sha256_file
+from .util import atomic_output_path, atomic_write_bytes, deterministic_gzip_bytes, sha256_file
 
 
 MANIFEST_FIELDS = (
@@ -22,6 +22,40 @@ MANIFEST_FIELDS = (
     "name",
     "batch_index",
 )
+
+NODE_MAP_FIELDS = ("member_path", "source_node_id", "treenode_id")
+
+
+def write_node_map(path: Path, source: TextIO) -> None:
+    """Persist the prepared COPY identity mapping with bounded memory."""
+    source.seek(0)
+    try:
+        with atomic_output_path(path) as temporary:
+            with temporary.open("wb") as output:
+                # No filename or wall-clock timestamp in the gzip header, so
+                # retries with the same reservations produce identical bytes.
+                with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
+                    while chunk := source.read(64 * 1024):
+                        compressed.write(chunk.encode("utf-8"))
+    finally:
+        source.seek(0)
+
+
+def verify_node_map(path: Path, expected: TextIO) -> None:
+    """Check saved identities against the exact rows regenerated for COPY."""
+    expected.seek(0)
+    try:
+        with gzip.open(path, "rt", encoding="utf-8", newline="") as source:
+            while True:
+                chunk = expected.read(64 * 1024)
+                if source.read(64 * 1024) != chunk:
+                    raise ImmutableStateError(f"Node mapping does not match reserved IDs: {path}")
+                if not chunk:
+                    break
+    except (OSError, EOFError, UnicodeError) as exc:
+        raise ImmutableStateError(f"Could not read node mapping from {path}: {exc}") from exc
+    finally:
+        expected.seek(0)
 
 
 def artifact_descriptor(

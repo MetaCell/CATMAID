@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import zipfile
 from decimal import Decimal
 from pathlib import Path
 
@@ -75,3 +76,28 @@ def test_rebuild_cache_flag_is_forwarded(
         "rebuild_cache": True,
     }
     assert json.loads(capsys.readouterr().out) == {"ok": True}
+
+
+def test_invalid_archive_reports_all_members_without_writing_a_partial_plan(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    monkeypatch.delenv("DJANGO_SETTINGS_MODULE", raising=False)
+    archive = tmp_path / "mixed.zip"
+    with zipfile.ZipFile(archive, "w") as source:
+        source.writestr("a.swc", "1 1 0 0 0 1 -1\n2 3 1 0 0 1 -1\n")
+        source.writestr("b.swc", "1 1 0 0 0 1 -1\n2 3 1 0 0 1 99\n")
+        source.writestr("valid.swc", "42 1 1 2 3 1 -1 # point\n")
+    request = tmp_path / "request.json"
+    atomic_write_json(request, {"schema_version": 1, "source": {
+        "archive_path": str(archive), "coordinate_unit": "nm"},
+        "stack": {"dimension": [10, 10, 10], "resolution_nm": [1, 1, 1]}})
+    state_dir = tmp_path / "state"
+    assert cli.execute(["plan", "--request", str(request),
+                        "--state-dir", str(state_dir)]) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["error"]["category"] == "invalid_input"
+    assert result["error"]["details"]["invalid_swc_count"] == 2
+    assert [error["member_path"] for error in
+            result["error"]["details"]["member_errors"]] == ["a.swc", "b.swc"]
+    assert not (state_dir / "plan.jsonl.gz").exists()
+    assert not (state_dir / "state.json").exists()

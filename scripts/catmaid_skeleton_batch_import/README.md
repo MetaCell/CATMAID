@@ -53,6 +53,25 @@ and the unchanged local input files recorded there. Run the command from a
 CATMAID application environment where `mysite.settings` and the `catmaid`
 package are importable.
 
+Planning checks every readable SWC and reports all invalid files together in
+`error.details.member_errors`, with one useful reason per file. For example:
+
+```json
+{
+  "invalid_swc_count": 2,
+  "member_errors": [
+    {"member_path": "a.swc", "message": "skeletons.zip:a.swc: expected exactly one root, found 5"},
+    {"member_path": "b.swc", "message": "skeletons.zip:b.swc:2: expected 7 columns, got 6"}
+  ]
+}
+```
+
+An invalid archive produces no executable plan, even if some SWCs are valid.
+Fix the reported files and rerun `plan`. Archive-wide failures such as an
+unreadable ZIP, duplicate ZIP paths, encryption, or archive/count limits still
+stop immediately; per-file size/type checks and fragment-ID collisions are
+reported with the other member errors.
+
 ## Input contract
 
 An ingestion consists of a **request JSON file plus a local ZIP containing SWC
@@ -101,6 +120,22 @@ Create a new hidden project instead: replace `target` with `stack`:
 | `stack.dimension` | New project only | `[size_x, size_y, size_z]`, three positive integer voxel counts. |
 | `stack.resolution_nm` | New project only | `[nm_per_voxel_x, nm_per_voxel_y, nm_per_voxel_z]`, three positive finite numbers. Used to configure the new stack; does not scale SWC coordinates. |
 
+The stack describes the viewer's image/coordinate extent; it is not a transform
+of the SWCs. `dimension[i] * resolution_nm[i]` gives its physical size along
+axis `i`. For example, dimensions `[100, 200, 50]` at resolution `[1000, 1000,
+2000]` describe a volume of `[100000, 200000, 100000]` nm (100 × 200 × 100 µm).
+The importer creates this stack with zero translation and XY orientation.
+SWC positions are converted solely by `source.coordinate_unit` and remain in
+their original coordinate frame. Planning rejects negative X, Y or Z values,
+reporting the member, line and axis, because the current viewer assumes a
+coordinate frame starting at zero. Radius `-1` (unknown) and parent `-1` (root)
+remain valid. Positions are not clipped or translated, and positive positions
+beyond the stack extent are still accepted.
+A client that restricts spatial fetching to the stack extent can therefore
+miss out-of-bounds morphology. Choose metadata consistent with the intended
+coordinate frame and viewer. Append imports preserve the target's existing
+stacks and morphology, including any existing negative coordinates.
+
 Supply exactly one of `target` and `stack`. Unknown JSON fields are rejected;
 there are no request fields for arbitrary annotations or cache overrides. Cache
 and batch defaults are deployment settings documented below.
@@ -116,6 +151,9 @@ finish with `status: "complete"`; new hidden projects finish with
 
 ### How source units are determined
 
+CATMAID stores tracing coordinates and radii in nanometres, so the importer
+converts the declared source units to nanometres before inserting rows.
+
 **The caller must establish the units from the source dataset documentation,
 exporter settings, or a reliable header/metadata statement before planning.**
 The [SWC specification](https://swc-specification.readthedocs.io/en/latest/swc.html)
@@ -125,7 +163,7 @@ from coordinate magnitudes alone. If the units are unknown, establish them with
 the dataset provider before ingestion.
 
 The importer treats the request's `source.coordinate_unit` as authoritative. It
-ignores `#` comment lines, including any unit, scale or offset declarations; it
+ignores `#` comments, including any unit, scale or offset declarations; it
 does not read image metadata or automatically detect a mismatch between the
 request and the actual data.
 
@@ -200,11 +238,20 @@ uncommented row. Example file, with physical values expressed in micrometres and
 3 3 12 21 30 -1 2
 ```
 
+Full-line and trailing `#` comments are ignored. For example,
+`2 3 11 20 30 0.5 1 # branch point` contains seven data fields. All remaining
+fields are still validated strictly, with the original physical line number
+included in errors.
+
 `id`, `type` and `parent_id` are integers; XYZ and radius are finite numbers.
 Node IDs are unique within a file and may be reused in other files: they are
-local topology references, not CATMAID IDs. There must be at least two nodes,
+local topology references, not CATMAID IDs. There must be at least one node,
 exactly one root (`parent_id=-1`), valid parent references, and one connected
-acyclic tree. A radius must be non-negative or exactly `-1` for unknown.
+acyclic tree. X, Y and Z must be non-negative. A radius must be non-negative or
+exactly `-1` for unknown.
+A one-node SWC creates a neuron/skeleton with one root, a zero-length root edge,
+and a summary with `num_nodes=1` and `cable_length=0`; its provenance and cache
+generation use the same path as larger skeletons.
 The sample root becomes `(10000, 20000, 30000)` nm with radius `2000` nm.
 
 ## Offline import and cache rebuild
@@ -309,6 +356,15 @@ Duplicates are not linked twice. This records inherited provenance; after a
 split it does not assert that every original fragment still supplies nodes to
 both results.
 
+Join/split operations wait up to `SKELETON_EDIT_LOCK_TIMEOUT_MS` (default `1000`,
+one second) per contended neuron lock, then return a retry error if contention
+persists. Configure this positive integer in CATMAID's web Django settings
+(`mysite.settings`); it is separate from the importer's batch timeouts. An
+existing stricter database lock timeout is respected. The previous timeout is
+restored after acquisition or failure. Provenance, edit permissions and node
+ownership are read or rechecked after acquisition; joins also refresh names and
+stable-winner selection. Existing treenode `NOWAIT` behavior is unchanged.
+
 The namespace is importer-managed. Manual creation, attachment, rename,
 replacement and removal through CATMAID editing APIs return HTTP 403, including
 for ordinary superuser editing requests. Trusted structural copies and merges
@@ -331,6 +387,34 @@ CATMAID IDs. Annotation rows and links commit or roll back in the same atomic
 batch as morphology, and final verification checks the exact values and ownership.
 Final verification loads each SWC once per batch and reuses the prepared values
 for metadata, topology, summary and exact node checks.
+
+Each batch also writes `state/batches/000001/node-map.csv.gz` (using the batch
+index) with exactly `member_path,source_node_id,treenode_id`. There is one row
+per imported node, for example:
+
+```csv
+member_path,source_node_id,treenode_id
+folder/0021814.swc,42,900123
+folder/0021814.swc,7,900124
+other/0021815.swc,42,900125
+```
+
+`member_path` is the complete ZIP member path; SWC node IDs are local to that
+file and need not be ordered or consecutive. `treenode_id` is the exact CATMAID
+ID assigned during COPY. Read both ID columns as integers without floating-point
+conversion. Join with the manifest on `member_path` for the imported skeleton
+and neuron, and use `project-context.json` for the target project.
+
+The mapping is streamed, gzip-compressed, atomically written and registered
+with its row count and SHA-256 in `state.json` before the batch transaction.
+Only a batch with status `committed` confirms that its mapped nodes were loaded;
+`prepared` or `retryable` mappings describe reserved IDs. Resume checks saved
+mappings against those same source rows and reserved IDs. For older workspaces,
+final verification creates missing mappings after verifying the database rows.
+Retain the state directory on durable storage after the import if a review
+queue will need these mappings. They add no per-node CATMAID labels or new
+database table. They record import-time identity: merges and splits retain node
+IDs but can change their skeleton membership, and deleted nodes no longer exist.
 
 ### Search and audit API contract
 
@@ -395,6 +479,12 @@ or resumes its `state` directory. `plan` needs no database. `run` requires
 applying migrations. `CATMAID_INGESTION_DB_WAIT_SECONDS` controls the bounded
 readiness wait (default 120 seconds, maximum 3600); the wrapper does not retry
 failed ingestion automatically.
+
+Apply CATMAID migration `0126_fix_single_node_selective_summary` through the
+normal deployment migration process before running this importer. It fixes
+selective summary rebuilding for single-node skeletons. Preflight rejects
+unapplied migrations. Finish active imports before upgrading the database:
+their saved migration/database fingerprint is immutable across retries.
 
 `CATMAID_PROJECTS_DIRECTORY` defaults to `/home/django/projects`, and
 `CATMAID_INGESTION_MEDIA_ROOT` defaults to
@@ -551,7 +641,7 @@ edge per node. Roots retain NULL parents and zero-length geometry. Existing
 edges cause an error and batch rollback; no edges or connector materializations
 are deleted or rebuilt.
 
-Core rows, edges, the unchanged CATMAID summary refresh, and validation remain
+Core rows, edges, CATMAID's selective summary refresh, and validation remain
 inside one atomic transaction. Current-format state files keep their immutable
 settings and recorded IDs. Committed batches are skipped on resume, while
 uncertain commit outcomes continue to block further writes.

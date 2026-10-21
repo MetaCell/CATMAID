@@ -149,3 +149,69 @@ def test_archive_ignores_directories_and_non_swc_files(tmp_path: Path) -> None:
     )
     scanned = scan_archive(request(archive), settings())
     assert [member.member_path for member in scanned.members] == ["real.SWC"]
+
+
+def test_reports_each_invalid_member_without_stopping_at_the_first(tmp_path: Path) -> None:
+    archive = tmp_path / "mixed.zip"
+    write_zip(archive, [
+        ("a.swc", b"1 1 0 0 0 1 -1\n2 3 1 0 0 1 -1\n"),
+        ("b.swc", b"1 1 0 0 0 1 -1\n2 3 1 0 0 1 99\n"),
+        ("c.swc", b"1 1 0 0 0 1 -1\n2 3 1 0 0 1 # missing parent\n"),
+        ("valid.swc", VALID_SWC),
+    ])
+    with pytest.raises(InvalidInputError) as failure:
+        scan_archive(request(archive), settings())
+    details = failure.value.details
+    assert details["invalid_swc_count"] == 3
+    assert [error["member_path"] for error in details["member_errors"]] == [
+        "a.swc", "b.swc", "c.swc",
+    ]
+    for error, reason in zip(details["member_errors"], [
+        "exactly one root", "missing parent", "expected 7 columns",
+    ]):
+        assert reason in error["message"]
+
+
+def test_planning_reports_all_members_with_negative_coordinates(tmp_path: Path) -> None:
+    from catmaid_skeleton_batch_import.orchestrator import plan_ingestion
+    import json
+
+    archive = tmp_path / "negative.zip"
+    write_zip(archive, [
+        ("x.swc", b"1 1 -1 0 0 -1 -1\n"),
+        ("y.swc", b"1 1 0 -2 0 -1 -1\n"),
+        ("z.swc", b"1 1 0 0 -3 -1 -1\n"),
+        ("valid.swc", VALID_SWC),
+    ])
+    path = tmp_path / "request.json"
+    path.write_text(json.dumps(request(archive).to_dict()))
+    state_dir = tmp_path / "state"
+    with pytest.raises(InvalidInputError) as failure:
+        plan_ingestion(path, state_dir)
+    errors = failure.value.details["member_errors"]
+    assert [item["member_path"] for item in errors] == ["x.swc", "y.swc", "z.swc"]
+    assert all(f"{axis} must be non-negative" in item["message"]
+               for axis, item in zip("xyz", errors))
+    assert not (state_dir / "state.json").exists()
+
+
+def test_reports_member_metadata_errors_and_fragment_collisions_together(tmp_path: Path) -> None:
+    archive = tmp_path / "mixed.zip"
+    symlink = zipfile.ZipInfo("bad-link.swc")
+    symlink.create_system = 3
+    symlink.external_attr = (stat.S_IFLNK | 0o777) << 16
+    write_zip(archive, [
+        ("a/same.swc", VALID_SWC), ("b/ same .SWC", VALID_SWC),
+        (symlink, b"target"), ("empty.swc", b"# no nodes\n"),
+        ("oversize.swc", b"#" * 100),
+    ])
+    with pytest.raises(InvalidInputError) as failure:
+        scan_archive(request(archive), settings(max_swc_bytes=90))
+    errors = {item["member_path"]: item["message"]
+              for item in failure.value.details["member_errors"]}
+    assert len(errors) == failure.value.details["invalid_swc_count"] == 5
+    assert "duplicate fragment identifier" in errors["a/same.swc"]
+    assert "duplicate fragment identifier" in errors["b/ same .SWC"]
+    assert "not a regular file" in errors["bad-link.swc"]
+    assert "no SWC nodes" in errors["empty.swc"]
+    assert "limit is 90" in errors["oversize.swc"]

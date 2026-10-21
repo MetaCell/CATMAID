@@ -62,10 +62,6 @@ def _normalize_expected_skeletons(
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"expected skeleton {index}.{key} must be positive")
             values[key] = value
-        if values["node_count"] < 2:
-            raise ValueError(
-                "one-node skeletons are unsupported by CATMAID selective summaries"
-            )
         name = skeleton["name"]
         if not isinstance(name, str) or not name:
             raise ValueError(f"expected skeleton {index}.name must be non-empty")
