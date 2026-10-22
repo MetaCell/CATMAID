@@ -56,7 +56,8 @@ class GridWorker():
                 'limit': settings.NODE_LIST_MAXIMUM_COUNT,
                 'ordering': g.ordering,
             }
-            if g.n_last_edited_skeletons_limit:
+            # The largest-skeleton filter is independent of the last-edited filter.
+            if g.n_largest_skeletons_limit:
                 params['n_largest_skeletons_limit'] = int(g.n_largest_skeletons_limit)
             if g.n_last_edited_skeletons_limit:
                 params['n_last_edited_skeletons_limit'] = int(g.n_last_edited_skeletons_limit)
