@@ -15,6 +15,7 @@ import errno
 import fcntl
 import json
 import os
+import subprocess
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -391,8 +392,22 @@ class StateStore:
                 "artifacts": {},
                 "operator_attention": None,
             }
-            atomic_write_json(self.state_path, state)
+            self._persist(state)
             return copy.deepcopy(state)
+
+    def _persist(self, state):
+        atomic_write_json(self.state_path, state)
+        # Optional deployment adapter. Its acknowledgement is part of the
+        # before_commit boundary; never acknowledge COMMIT intent locally only.
+        raw = os.environ.get("CATMAID_BATCH_IMPORT_CHECKPOINT_COMMAND")
+        if raw:
+            try:
+                command = json.loads(raw)
+                if not isinstance(command, list) or not command or not all(isinstance(s, str) and s for s in command):
+                    raise ValueError("invalid command")
+                subprocess.run([*command, str(self.state_dir)], check=True, timeout=300)
+            except (ValueError, OSError, subprocess.SubprocessError) as exc:
+                raise RetryableError("Durable checkpoint acknowledgement failed; reconcile before another process resumes") from exc
 
     # A concise alias is useful to callers without creating a second behavior.
     initialize = initialize_plan
@@ -842,7 +857,7 @@ class StateStore:
                     details=state.get("operator_attention") or {},
                 )
             mutator(state)
-            atomic_write_json(self.state_path, state)
+            self._persist(state)
             return copy.deepcopy(state)
 
     def _assert_mutations_allowed(self) -> None:

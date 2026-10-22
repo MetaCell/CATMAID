@@ -702,3 +702,61 @@ Paired local benchmarks on a populated 42.5-million-node database measured
 time when comparing sums of per-fixture medians. The 113-test correctness run
 and full 171-batch rehearsal passed. These are local measurements and do not
 establish a cluster speedup.
+
+
+## Prepared source and off-pod recovery (0.6)
+
+New plans retain the validated source nodes in deterministic gzip JSON-lines
+files, one bounded file per whole-SWC batch. Version-4 plan headers bind their
+SHA-256, byte sizes and node counts. Loading and final verification reuse those
+values instead of reparsing SWCs. They retain source-unit double precision;
+normal unit conversion and stored float32 checks remain in the loader. Counts,
+topology, edges, summaries, metadata and final cache verification are unchanged.
+
+Version-3 plans continue using the original ZIP reader, without rewriting
+immutable settings, IDs or the plan digest. The checkpoint schema remains 3.
+Metrics record the executing importer version, including on legacy resumes.
+
+A deployment may set `CATMAID_BATCH_IMPORT_CHECKPOINT_COMMAND` to a JSON argv
+array. After each atomic state update, the importer invokes it with the absolute
+state directory appended and requires a successful exit within 300 seconds.
+The adapter must durably save referenced ID/map artifacts before publishing the
+state pointer. Commit intent must be acknowledged before the transaction may
+commit. An acknowledgement failure stops the import; an uncertain commit still
+requires reconciliation. No command is configured by default, so standalone
+filesystem workflows retain their existing behavior. This hook adds no
+CATMAID application dependency, schema/table, owner override or cloud SDK.
+
+MNP uses the hook for durable NeuroGlass recovery and maps, with one processing
+pod and `emptyDir` storage. Prepared source and the original ZIP need not be
+archived in the application database. After exporting a recovery checkpoint,
+restore the original ZIP at its recorded path and call:
+
+```python
+from catmaid_skeleton_batch_import.prepared_source import regenerate_prepared_source
+regenerate_prepared_source(state_dir)
+```
+
+This offline helper requires the original archive hash, geometry snapshot and
+an identical regenerated plan digest. It reserves no IDs and changes no saved
+settings or commit outcomes. The deployment must separately verify that the
+old writer has stopped and reconcile uncertain outcomes before releasing its
+writer fence. Recreating source cache data is not permission to retry an
+uncertain database commit.
+
+The source-only benchmark performs one warm-up plus three measured trials by
+default; it creates no database connection. Use identical Python/runtime and
+resource limits for both modes, and discard trial 0 when computing medians:
+
+```bash
+PYTHONPATH=scripts/catmaid_skeleton_batch_import/src python \
+  scripts/catmaid_skeleton_batch_import/benchmarks/benchmark_prepared_source.py \
+  /path/to/aind-191805-two-batches.zip --mode baseline --coordinate-unit um
+PYTHONPATH=scripts/catmaid_skeleton_batch_import/src python \
+  scripts/catmaid_skeleton_batch_import/benchmarks/benchmark_prepared_source.py \
+  /path/to/aind-191805-two-batches.zip --mode prepared --coordinate-unit um
+```
+
+This measures source planning and two subsequent source reads, not total import,
+database/cache performance or cluster speedup. Trial totals should be compared
+directly; sums of independently computed component medians can differ.

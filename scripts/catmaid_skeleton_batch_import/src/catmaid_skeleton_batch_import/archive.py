@@ -135,6 +135,7 @@ def scan_archive(
     request: IngestionRequest,
     settings: ImportSettings,
     *, bounds_nm: tuple[StackBounds, ...] | None = None,
+    on_member=None,
 ) -> ArchiveScan:
     """Hash and validate one local SWC ZIP without extracting its members."""
 
@@ -221,6 +222,8 @@ def scan_archive(
                         cable_length_nm=cable_length_nm,
                     )
                 )
+                if on_member is not None:
+                    on_member(members[-1], parsed.nodes)
     except InvalidInputError:
         raise
     except (zipfile.BadZipFile, RuntimeError, NotImplementedError, OSError) as exc:

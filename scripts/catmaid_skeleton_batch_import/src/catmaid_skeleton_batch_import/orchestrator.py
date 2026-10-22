@@ -8,6 +8,9 @@ import sys
 import time
 import zipfile
 from contextlib import ExitStack
+from dataclasses import replace
+import tempfile
+import os
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -40,6 +43,7 @@ from .errors import (
 from .loader import PreparedBatch, ProjectContext, execute_batch_transaction, prepare_copy_rows
 from .metrics import MetricsStore
 from .planner import ImportPlan, plan_archive, read_plan, write_plan
+from .prepared_source import PreparedSourceReader, PreparedSourceWriter
 from .state import ArchiveMetadata, StateStore
 from .stack_bounds import StackBounds, geometry_bounds, read_project_stack_geometry
 from .swc import parse_swc
@@ -184,8 +188,18 @@ def plan_ingestion(request_path: Path, state_dir: Path) -> dict[str, object]:
 
         _progress(f"Scanning and validating local archive {request.archive_path}")
         planning_started = time.monotonic()
-        scan = scan_archive(request, settings, bounds_nm=bounds)
-        plan = plan_archive(scan, settings)
+        with tempfile.TemporaryDirectory(prefix=".prepared-", dir=store.state_dir) as staging:
+            writer = PreparedSourceWriter(Path(staging), settings.max_nodes_per_batch)
+            try:
+                scan = scan_archive(request, settings, bounds_nm=bounds, on_member=writer.add)
+            finally:
+                writer.close()
+            plan = plan_archive(scan, settings)
+            # Never change the immutable digest of an existing legacy checkpoint.
+            if not store.state_path.exists():
+                plan = replace(plan, schema_version=4, prepared_batches=tuple(writer.descriptors))
+                for descriptor in plan.prepared_batches:
+                    os.replace(Path(staging) / descriptor["path"], store.state_dir / descriptor["path"])
         plan_path = store.state_dir / PLAN_FILENAME
         plan_digest = write_plan(plan_path, plan)
         planning_duration = time.monotonic() - planning_started
@@ -205,6 +219,9 @@ def plan_ingestion(request_path: Path, state_dir: Path) -> dict[str, object]:
             compression="gzip",
             expected_sha256=plan_digest,
         )
+        for batch, descriptor in zip(plan.batches, plan.prepared_batches):
+            store.register_artifact("prepared_source", descriptor["path"], count=batch.node_count,
+                                    batch_index=batch.index, expected_sha256=descriptor["sha256"])
         if geometry is not None:
             _write_registered_json(store, "stack_geometry", STACK_GEOMETRY_FILENAME, geometry)
         metrics = MetricsStore(store.state_dir)
@@ -1287,7 +1304,8 @@ def run_ingestion(
             )
         _progress("Offline import: keep the Neuroglass managed layer inactive until verification succeeds")
 
-        with _RunArchive(request, settings, bounds_nm=bounds) as archive:
+        with (PreparedSourceReader(store.state_dir, plan) if plan.prepared_batches
+              else _RunArchive(request, settings, bounds_nm=bounds)) as archive:
             for batch in plan.batches:
                 _run_batch(
                     store,
@@ -1364,7 +1382,8 @@ def run_ingestion(
                     cache_cell_size_nm=settings.cache_cell_size_nm,
                     connection=connection,
                 )
-            with _RunArchive(request, settings, bounds_nm=bounds) as verification_archive:
+            with (PreparedSourceReader(store.state_dir, plan) if plan.prepared_batches
+                  else _RunArchive(request, settings, bounds_nm=bounds)) as verification_archive:
                 database_result = _verify_database_by_batch(
                     store,
                     plan,
