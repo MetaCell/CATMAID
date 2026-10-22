@@ -81,13 +81,14 @@ def parse_swc(
     """Parse and validate an SWC from a binary stream.
 
     Parsing is strict UTF-8 and bounded by ``max_bytes`` and ``max_nodes`` when
-    supplied. XYZ must be non-negative because the current viewer discovers
-    skeletons within a stack that starts at zero. If ``max_nm`` is supplied,
-    converted XYZ must not exceed the declared stack's physical extent.
+    supplied. Without associated stack bounds, XYZ must be non-negative.
+    If ``max_nm`` is supplied, converted XYZ must not exceed the declared
+    new stack's physical extent.
     ``scale_nm`` is used to validate converted values; returned node values
     remain in source units. Stack geometry does not transform coordinates.
     ``bounds_nm`` checks the union of associated stacks in project space for
-    append imports, including their translation and orientation.
+    append imports, including their translation and orientation. Negative XYZ
+    is allowed when the point lies within one of those associated stacks.
     """
 
     if max_bytes is not None and max_bytes <= 0:
@@ -153,7 +154,9 @@ def parse_swc(
         )
 
         for axis, (column, value) in enumerate((("x", x), ("y", y), ("z", z))):
-            if value < 0:
+            # New projects start at zero. Appends instead use their associated
+            # stacks' actual bounds, which may extend into negative coordinates.
+            if value < 0 and bounds_nm is None:
                 raise _line_error(
                     label, physical_line_number,
                     f"{column} must be non-negative, got {value!r}",

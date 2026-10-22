@@ -70,6 +70,98 @@ def test_append_preflight_reads_translated_oriented_stack_bounds_from_postgres(
 
 
 @pytest.mark.parametrize("coordinate_unit", ["nm", "um"])
+@pytest.mark.parametrize("orientation,maximum", [
+    (0, (10000, 20000, 30000)), (1, (10000, 40000, 10000)),
+    (2, (50000, 20000, -10000)),
+])
+def test_negative_append_coordinates_are_planned_loaded_verified_and_cached(
+    tmp_path, isolated_database, coordinate_unit, orientation, maximum,
+):
+    import msgpack
+    from catmaid_skeleton_batch_import.errors import InvalidInputError
+    from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, preflight_ingestion, run_ingestion
+
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    archive = seed / "input.zip"
+    with zipfile.ZipFile(archive, "w") as source:
+        source.writestr("existing.swc", "1 1 1 1 1 -1 -1\n")
+    path = seed / "request.json"
+    path.write_text(json.dumps({"schema_version": 1, "source": {
+        "archive_path": str(archive), "coordinate_unit": "nm"},
+        "stack": {"dimension": [20, 40, 60], "resolution_nm": [1000] * 3}}))
+    plan_ingestion(path, seed / "state")
+    project_id = run_ingestion(seed / "state")["project_id"]
+    with isolated_database.cursor() as cursor:
+        cursor.execute("""
+            UPDATE project_stack SET orientation=%s,
+                translation=ROW(-10000,-20000,-30000)::double3d
+            WHERE project_id=%s
+        """, [orientation, project_id])
+
+    append = tmp_path / "append"
+    append.mkdir()
+    minimum = (-10000, -20000, -30000)
+    scale = 1000 if coordinate_unit == "um" else 1
+
+    def row(identifier, point, parent=-1):
+        coordinates = " ".join(str(value / scale) for value in point)
+        return f"{identifier} 3 {coordinates} -1 {parent}\n"
+
+    archive = append / "outside.zip"
+    with zipfile.ZipFile(archive, "w") as source:
+        for axis in range(3):
+            for label, edge, offset in (("lower", minimum, -1), ("upper", maximum, 1)):
+                point = list(minimum)
+                point[axis] = edge[axis] + offset
+                source.writestr(f"{'xyz'[axis]}-{label}.swc", row(1, point))
+    path = append / "request.json"
+    request = {"schema_version": 1, "source": {
+        "archive_path": str(archive), "coordinate_unit": coordinate_unit},
+        "target": {"project_id": project_id}}
+    path.write_text(json.dumps(request))
+    invalid_state = append / "invalid-state"
+    preflight_ingestion(path, invalid_state)
+    with pytest.raises(InvalidInputError) as failure:
+        plan_ingestion(path, invalid_state)
+    assert failure.value.details["invalid_swc_count"] == 6
+    assert all("outside all associated target stack bounds" in error["message"]
+               for error in failure.value.details["member_errors"])
+    assert not (invalid_state / "state.json").exists()
+    assert not (invalid_state / "plan.jsonl.gz").exists()
+
+    archive = append / "valid.zip"
+    with zipfile.ZipFile(archive, "w") as source:
+        source.writestr("shifted.swc", row(1, minimum) + row(2, maximum, 1))
+    request["source"]["archive_path"] = str(archive)
+    path.write_text(json.dumps(request))
+    state_dir = append / "state"
+    preflight_ingestion(path, state_dir)
+    assert plan_ingestion(path, state_dir)["nodes"] == 2
+    result = run_ingestion(state_dir)
+    assert result["status"] == "complete"
+    assert result["project_id"] == project_id
+    with isolated_database.cursor() as cursor:
+        cursor.execute("""
+            SELECT id, location_x, location_y, location_z FROM treenode
+            WHERE project_id=%s AND location_x<0
+        """, [project_id])
+        root_id, *coordinates = cursor.fetchone()
+        assert tuple(coordinates) == minimum
+        cursor.execute("SELECT location_x, location_y, location_z FROM treenode WHERE project_id=%s", [project_id])
+        assert set(cursor.fetchall()) == {(1, 1, 1), minimum, maximum}
+        cursor.execute("""
+            SELECT c.msgpack_data FROM node_grid_cache_cell c
+            JOIN node_grid_cache g ON g.id=c.grid_id WHERE g.project_id=%s
+        """, [project_id])
+        cached_ids = {node[0] for (buckets,) in cursor.fetchall() for bucket in buckets
+                      if bucket is not None
+                      for node in msgpack.unpackb(bytes(bucket), strict_map_key=False)[0]}
+        assert root_id in cached_ids
+    assert run_ingestion(state_dir) == result
+
+
+@pytest.mark.parametrize("coordinate_unit", ["nm", "um"])
 @pytest.mark.parametrize("existing_project", [False, True])
 def test_single_node_import_rolls_back_resumes_and_is_cached(
     tmp_path, monkeypatch, isolated_database, coordinate_unit, existing_project,

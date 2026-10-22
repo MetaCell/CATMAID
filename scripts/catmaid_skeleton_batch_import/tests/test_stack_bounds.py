@@ -33,15 +33,43 @@ def test_stack_bounds_match_catmaid_orientation_and_translation(orientation, max
 @pytest.mark.parametrize("unit_scale", [1, 1000])
 def test_append_parser_checks_the_union_of_actual_stacks_without_accepting_gaps(unit_scale):
     bounds = geometry_bounds({"project_id": 123, "stacks": [
-        stack(translation_nm=[0, 0, 0]), stack(translation_nm=[100, 0, 0]),
+        stack(translation_nm=[-100, 0, 0]), stack(translation_nm=[0, 0, 0]),
+        stack(translation_nm=[100, 0, 0]),
     ]})
     # Each node may belong to a different associated stack.
-    content = (f"1 1 0 0 0 -1 -1\n2 3 {120 / unit_scale} 0 0 -1 1\n").encode()
+    content = (f"1 1 {-100 / unit_scale} 0 0 -1 -1\n2 3 {120 / unit_scale} 0 0 -1 1\n").encode()
     assert parse_swc(io.BytesIO(content), "two.swc", scale_nm=unit_scale, bounds_nm=bounds).summary.node_count == 2
-    for x in (50, 121):
+    for x in (-101, -50, 50, 121):
         content = f"# header\n1 1 {x / unit_scale} 0 0 -1 -1\n".encode()
         with pytest.raises(InvalidInputError, match=r"gap.swc:2: point x=.*outside all associated"):
             parse_swc(io.BytesIO(content), "gap.swc", scale_nm=unit_scale, bounds_nm=bounds)
+
+
+@pytest.mark.parametrize("unit_scale", [1, 1000])
+@pytest.mark.parametrize("orientation", [0, 1, 2])
+def test_negative_append_coordinates_obey_translated_bounds_on_every_axis(unit_scale, orientation):
+    bounds = geometry_bounds({"project_id": 123, "stacks": [
+        stack(orientation=orientation, translation_nm=[-1000, -2000, -3000]),
+    ]})
+    minimum, maximum = bounds[0]
+    interior = tuple((low + high) / 2 for low, high in zip(minimum, maximum))
+
+    def parse_point(point):
+        coordinates = " ".join(str(value / unit_scale) for value in point)
+        return parse_swc(io.BytesIO(f"# header\n1 1 {coordinates} -1 -1\n".encode()),
+                         "shifted.swc", scale_nm=unit_scale, bounds_nm=bounds)
+
+    # All coordinates are negative, including both exact stack boundaries.
+    for point in (minimum, interior, maximum):
+        parsed = parse_point(point)
+        node = parsed.nodes[0]
+        assert (node.x * unit_scale, node.y * unit_scale, node.z * unit_scale) == pytest.approx(point)
+    for axis in range(3):
+        for edge, offset in ((minimum, -1), (maximum, 1)):
+            outside = list(interior)
+            outside[axis] = edge[axis] + offset
+            with pytest.raises(InvalidInputError, match=r"shifted.swc:2: point .*outside all associated"):
+                parse_point(outside)
 
 
 @pytest.mark.parametrize("overrides", [

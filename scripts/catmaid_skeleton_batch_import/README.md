@@ -137,10 +137,9 @@ axis `i`. For example, dimensions `[100, 200, 50]` at resolution `[1000, 1000,
 2000]` describe a volume of `[100000, 200000, 100000]` nm (100 × 200 × 100 µm).
 The importer creates this stack with zero translation and XY orientation.
 SWC positions are converted solely by `source.coordinate_unit` and remain in
-their original coordinate frame. Planning rejects negative X, Y or Z values,
-reporting the member, line and axis, because the current viewer assumes a
-coordinate frame starting at zero. For a new project, each converted position
-must also satisfy `coordinate_nm <= dimension[i] * resolution_nm[i]` on every
+their original coordinate frame. For a new project, planning rejects negative
+X, Y or Z values, reporting the member, line and axis. Each converted position
+must satisfy `0 <= coordinate_nm <= dimension[i] * resolution_nm[i]` on every
 axis; the physical extents must be positive and finite. Positions exactly on
 the boundary are accepted. In the example above, X = 100 µm is valid but
 X = 100.001 µm is rejected. All invalid members are collected in
@@ -153,8 +152,11 @@ the separate, read-only `preflight` step.
 Planning computes each stack's project-space bounds from its dimensions,
 resolution, XY/XZ/ZY orientation and translation. Every incoming node must lie
 within at least one associated stack, including the boundary. Gaps between
-disjoint stacks are outside their coverage. Negative incoming XYZ remains
-rejected. Missing stacks or invalid stack geometry also prevent planning.
+disjoint stacks are outside their coverage. Negative incoming XYZ is accepted
+when the point lies within an associated stack's bounds. For example, a stack
+translated to `[-1000, -2000, -3000]` nm with physical size `[2000, 4000, 6000]`
+nm accepts `[-500, -1000, -1500]` nm; X = -1001 nm is outside it.
+Missing stacks or invalid stack geometry also prevent planning.
 
 `plan` reads this snapshot locally and registers its hash alongside the plan.
 Preflight may refresh the snapshot before planning; afterward it only checks
@@ -279,8 +281,9 @@ included in errors.
 Node IDs are unique within a file and may be reused in other files: they are
 local topology references, not CATMAID IDs. There must be at least one node,
 exactly one root (`parent_id=-1`), valid parent references, and one connected
-acyclic tree. X, Y and Z must be non-negative and, after conversion to nm, must
-fit the declared new stack or at least one associated target stack for an append.
+acyclic tree. After conversion to nm, XYZ must fit the declared zero-origin
+stack for a new project or at least one associated target stack for an append.
+Append coordinates may be negative when the associated stack bounds include them.
 A radius must be non-negative or
 exactly `-1` for unknown.
 A one-node SWC creates a neuron/skeleton with one root, a zero-length root edge,

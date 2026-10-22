@@ -116,12 +116,12 @@ def test_invalid_declared_extents_are_rejected(extent):
 
 @pytest.mark.parametrize("axis", ["x", "y", "z"])
 @pytest.mark.parametrize("scale_nm", [1, 1000])
-def test_rejects_negative_coordinates_with_axis_member_and_line_context(axis, scale_nm):
+def test_rejects_negative_coordinates_without_associated_bounds_with_axis_member_and_line_context(axis, scale_nm):
     coordinates = ["0", "0", "0"]
     coordinates[["x", "y", "z"].index(axis)] = "-0.001"
     content = ("# header\n1 1 " + " ".join(coordinates) + " -1 -1\n").encode()
     with pytest.raises(InvalidInputError, match=rf"cell\.swc:2: {axis} must be non-negative"):
-        parse(content, scale_nm=scale_nm)
+        parse(content, scale_nm=scale_nm, max_nm=(1000, 2000, 3000))
 
 
 def test_zero_coordinates_and_unknown_radius_and_root_sentinels_remain_valid():
