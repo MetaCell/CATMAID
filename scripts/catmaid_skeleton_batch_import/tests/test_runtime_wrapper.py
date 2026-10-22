@@ -69,6 +69,27 @@ exit 0
     )
 
 
+def test_append_plan_sets_up_the_database_environment_for_read_only_stack_lookup(tmp_path):
+    calls = tmp_path / "calls"
+    importer = tmp_path / "importer"
+    _write_executable(importer, """#!/bin/bash
+printf '%s|%s|%s\\n' "${DJANGO_SETTINGS_MODULE-unset}" "${PYTHONPATH}" "$*" >> "${CALLS_FILE}"
+exit 0
+""")
+    environment = _base_environment(tmp_path, importer)
+    workspace = Path(environment["SKELETON_INGESTION_WORKSPACE"])
+    (workspace / "request.json").write_text(json.dumps({"target": {"project_id": 123}}))
+    environment["CALLS_FILE"] = str(calls)
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run([sys.executable, str(WRAPPER), "plan"], env=environment,
+                            text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert calls.read_text().strip() == (
+        f"mysite.ingestion_settings|{environment['CATMAID_PROJECTS_DIRECTORY']}|"
+        f"plan --request {workspace}/request.json --state-dir {workspace}/state"
+    )
+
+
 def test_run_does_not_retry_retryable_importer_exit(tmp_path: Path) -> None:
     calls = tmp_path / "calls"
     counter = tmp_path / "counter"

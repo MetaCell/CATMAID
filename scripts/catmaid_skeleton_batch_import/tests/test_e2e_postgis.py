@@ -20,6 +20,53 @@ pytestmark = [
 ]
 
 
+@pytest.mark.parametrize("orientation,maximum", [
+    (0, (120, 260, 420)), (1, (120, 320, 360)), (2, (220, 260, 320)),
+])
+def test_append_planning_reads_translated_oriented_stack_bounds_from_postgres(
+    tmp_path, isolated_database, orientation, maximum,
+):
+    from catmaid_skeleton_batch_import.errors import InvalidInputError
+    from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, run_ingestion
+
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    archive = seed / "input.zip"
+    with zipfile.ZipFile(archive, "w") as source:
+        source.writestr("seed.swc", "1 1 1 1 1 -1 -1\n")
+    path = seed / "request.json"
+    path.write_text(json.dumps({"schema_version": 1, "source": {
+        "archive_path": str(archive), "coordinate_unit": "nm"},
+        "stack": {"dimension": [10, 20, 30], "resolution_nm": [2, 3, 4]}}))
+    plan_ingestion(path, seed / "state")
+    project = run_ingestion(seed / "state")
+    with isolated_database.cursor() as cursor:
+        cursor.execute("""
+            UPDATE project_stack SET orientation=%s,
+                translation=ROW(100,200,300)::double3d
+            WHERE project_id=%s
+        """, [orientation, project["project_id"]])
+    append = tmp_path / "append"
+    append.mkdir()
+    archive = append / "input.zip"
+    request = {"schema_version": 1, "source": {
+        "archive_path": str(archive), "coordinate_unit": "nm"},
+        "target": {"project_id": project["project_id"]}}
+    path = append / "request.json"
+    path.write_text(json.dumps(request))
+    with zipfile.ZipFile(archive, "w") as source:
+        source.writestr("boundary.swc", f"1 1 {' '.join(map(str, maximum))} -1 -1\n")
+    assert plan_ingestion(path, append / "valid-state")["ok"]
+    archive = append / "outside.zip"
+    with zipfile.ZipFile(archive, "w") as source:
+        source.writestr("outside.swc", f"1 1 {maximum[0] + 1} {maximum[1]} {maximum[2]} -1 -1\n")
+    request["source"]["archive_path"] = str(archive)
+    path.write_text(json.dumps(request))
+    with pytest.raises(InvalidInputError, match="outside all associated target stack bounds"):
+        plan_ingestion(path, append / "invalid-state")
+    assert not (append / "invalid-state" / "state.json").exists()
+
+
 @pytest.mark.parametrize("coordinate_unit", ["nm", "um"])
 @pytest.mark.parametrize("existing_project", [False, True])
 def test_single_node_import_rolls_back_resumes_and_is_cached(

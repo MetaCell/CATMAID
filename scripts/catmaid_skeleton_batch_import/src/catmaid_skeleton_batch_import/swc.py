@@ -8,6 +8,7 @@ from typing import BinaryIO
 
 from .domain import SwcNode, SwcSummary
 from .errors import InvalidInputError
+from .stack_bounds import StackBounds, contains_point
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,7 @@ def parse_swc(
     max_nodes: int | None = None,
     scale_nm: float = 1.0,
     max_nm: tuple[float, float, float] | None = None,
+    bounds_nm: tuple[StackBounds, ...] | None = None,
 ) -> ParsedSwc:
     """Parse and validate an SWC from a binary stream.
 
@@ -84,6 +86,8 @@ def parse_swc(
     converted XYZ must not exceed the declared stack's physical extent.
     ``scale_nm`` is used to validate converted values; returned node values
     remain in source units. Stack geometry does not transform coordinates.
+    ``bounds_nm`` checks the union of associated stacks in project space for
+    append imports, including their translation and orientation.
     """
 
     if max_bytes is not None and max_bytes <= 0:
@@ -96,6 +100,8 @@ def parse_swc(
         len(max_nm) != 3 or any(not math.isfinite(value) or value <= 0 for value in max_nm)
     ):
         raise ValueError("max_nm must contain three positive finite extents")
+    if bounds_nm is not None and not bounds_nm:
+        raise ValueError("bounds_nm must contain at least one stack")
 
     nodes: list[SwcNode] = []
     seen_ids: set[int] = set()
@@ -167,6 +173,12 @@ def parse_swc(
                     f"{column} coordinate {coordinate_nm!r} nm exceeds declared "
                     f"stack extent {max_nm[axis]!r} nm",
                 )
+        if bounds_nm is not None and not contains_point((x * scale_nm, y * scale_nm, z * scale_nm), bounds_nm):
+            raise _line_error(
+                label, physical_line_number,
+                f"point x={x * scale_nm!r}, y={y * scale_nm!r}, z={z * scale_nm!r} nm "
+                f"is outside all associated target stack bounds {bounds_nm!r}",
+            )
         if radius != -1.0:
             if radius < 0:
                 raise _line_error(

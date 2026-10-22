@@ -40,7 +40,8 @@ def test_display_name_sanitization_matches_copy_expectations_and_manifest(
     request = IngestionRequest(schema_version=1, archive_path=archive,
                                coordinate_unit="nm", target_project_id=5)
     settings = ImportSettings(**DEFAULTS)
-    plan = plan_archive(scan_archive(request, settings), settings)
+    plan = plan_archive(scan_archive(request, settings,
+                                    bounds_nm=(((0, 0, 0), (1000, 1000, 1000)),)), settings)
     plan_path = tmp_path / "plan.jsonl.gz"
     write_plan(plan_path, plan)
     batch = read_plan(plan_path).batches[0]

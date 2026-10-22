@@ -2,10 +2,10 @@
 """Run the skeleton importer safely inside a short-lived CATMAID job.
 
 The importer CLI deliberately knows nothing about Kubernetes or CATMAID image
-startup.  This entrypoint supplies that boundary: ``plan`` stays independent
-from Django, while ``run`` waits for PostgreSQL, selects the ingestion-only
-Django settings, forwards pod termination signals, and records a failed run as
-terminal for the workflow notifier. Argo invokes this script rather than
+startup. This entrypoint supplies that boundary: new-project ``plan`` stays
+independent from Django; append ``plan`` and ``run`` wait for PostgreSQL and
+select the ingestion-only Django settings. It forwards termination signals and
+records a failed run as terminal for the workflow notifier. Argo invokes this script rather than
 starting CATMAID's web process.
 """
 
@@ -170,9 +170,16 @@ def _plan(workspace: Path, importer: str, environ: Mapping[str, str]) -> int:
             EX_NOINPUT,
         )
     plan_environment = dict(environ)
-    # Planning is dependency-free and must not initialize Django or connect to
-    # CATMAID's database.
-    plan_environment.pop("DJANGO_SETTINGS_MODULE", None)
+    try:
+        value = json.loads(request.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        # Leave input diagnostics and their JSON error format to the CLI.
+        value = None
+    if isinstance(value, dict) and "target" in value:
+        # Append planning reads its associated stacks without changing them.
+        _projects_directory, plan_environment = _database_environment(environ)
+    else:
+        plan_environment.pop("DJANGO_SETTINGS_MODULE", None)
     return _run_child(
         (
             importer,
@@ -228,8 +235,7 @@ def _wait_for_database(
         time.sleep(min(2, max(0, deadline - time.monotonic())))
 
 
-def _run(workspace: Path, importer: str, environ: Mapping[str, str]) -> int:
-    _clear_terminal_marker(workspace / STATE_DIRECTORY)
+def _database_environment(environ: Mapping[str, str]) -> tuple[Path, dict[str, str]]:
     database_host = _required_environment_value(environ, "DB_HOST")
     database_name = _required_environment_value(environ, "DB_NAME")
     database_user = _required_environment_value(environ, "DB_USER")
@@ -283,11 +289,15 @@ def _run(workspace: Path, importer: str, environ: Mapping[str, str]) -> int:
         wait_seconds=wait_seconds,
         environ=run_environment,
     ):
-        print(
-            f"CATMAID database was not ready after {wait_seconds} seconds",
-            file=sys.stderr,
+        raise EntrypointError(
+            f"CATMAID database was not ready after {wait_seconds} seconds", RETRYABLE_IMPORTER_EXIT,
         )
-        return RETRYABLE_IMPORTER_EXIT
+    return projects_directory, run_environment
+
+
+def _run(workspace: Path, importer: str, environ: Mapping[str, str]) -> int:
+    _clear_terminal_marker(workspace / STATE_DIRECTORY)
+    projects_directory, run_environment = _database_environment(environ)
 
     original_directory = Path.cwd()
     try:

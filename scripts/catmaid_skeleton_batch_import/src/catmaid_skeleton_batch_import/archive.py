@@ -14,6 +14,7 @@ from .domain import ImportSettings, IngestionRequest, PlannedMember
 from .fragments import fragment_id_from_member_path
 from .errors import InvalidInputError
 from .swc import parse_swc
+from .stack_bounds import StackBounds
 from .util import sha256_file
 
 
@@ -133,9 +134,12 @@ def _collect_swc_infos(
 def scan_archive(
     request: IngestionRequest,
     settings: ImportSettings,
+    *, bounds_nm: tuple[StackBounds, ...] | None = None,
 ) -> ArchiveScan:
     """Hash and validate one local SWC ZIP without extracting its members."""
 
+    if request.target_project_id is not None and bounds_nm is None:
+        raise InvalidInputError("Append validation requires associated target stack bounds")
     archive_path = request.archive_path
     before = _regular_file_stat(archive_path, "SWC archive")
     if before.st_size > settings.max_archive_bytes:
@@ -175,6 +179,7 @@ def scan_archive(
                             max_nodes=settings.max_nodes_per_batch,
                             scale_nm=request.scale_nm,
                             max_nm=request.max_nm if request.target_project_id is None else None,
+                            bounds_nm=bounds_nm,
                         )
                     if parsed.bytes_read != info.file_size:
                         raise InvalidInputError(

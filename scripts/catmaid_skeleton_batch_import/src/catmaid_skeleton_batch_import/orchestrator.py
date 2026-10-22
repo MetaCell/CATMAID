@@ -41,6 +41,7 @@ from .loader import PreparedBatch, ProjectContext, execute_batch_transaction, pr
 from .metrics import MetricsStore
 from .planner import ImportPlan, plan_archive, read_plan, write_plan
 from .state import ArchiveMetadata, StateStore
+from .stack_bounds import StackBounds, geometry_bounds, read_project_stack_geometry
 from .swc import parse_swc
 from .util import atomic_write_json, canonical_json_bytes, load_json, sha256_file
 
@@ -52,6 +53,7 @@ PROJECT_CONTEXT_FILENAME = "project-context.json"
 MANIFEST_FILENAME = "manifest.csv.gz"
 VERIFICATION_FILENAME = "verification.json"
 RESULT_FILENAME = "result.json"
+STACK_GEOMETRY_FILENAME = "stack-geometry.json"
 
 
 def _progress(message: str) -> None:
@@ -107,6 +109,8 @@ def plan_ingestion(request_path: Path, state_dir: Path) -> dict[str, object]:
     with store.lock():
         request = load_request(request_path)
         settings = load_settings()
+        geometry = _append_geometry(request)
+        bounds = geometry_bounds(geometry) if geometry is not None else None
 
         if store.state_path.exists():
             state = store.verify_immutable()
@@ -120,12 +124,14 @@ def plan_ingestion(request_path: Path, state_dir: Path) -> dict[str, object]:
                 )
             if "plan" in state.get("artifacts", {}):
                 store.verify_artifact("plan")
-                result = _plan_result(store, state)
-                return _write_result(store.state_dir, result)
+                if geometry is None or "stack_geometry" in state.get("artifacts", {}):
+                    _check_saved_geometry(store, state, geometry)
+                    result = _plan_result(store, state)
+                    return _write_result(store.state_dir, result)
 
         _progress(f"Scanning and validating local archive {request.archive_path}")
         planning_started = time.monotonic()
-        scan = scan_archive(request, settings)
+        scan = scan_archive(request, settings, bounds_nm=bounds)
         plan = plan_archive(scan, settings)
         plan_path = store.state_dir / PLAN_FILENAME
         plan_digest = write_plan(plan_path, plan)
@@ -146,6 +152,8 @@ def plan_ingestion(request_path: Path, state_dir: Path) -> dict[str, object]:
             compression="gzip",
             expected_sha256=plan_digest,
         )
+        if geometry is not None:
+            _write_registered_json(store, "stack_geometry", STACK_GEOMETRY_FILENAME, geometry)
         metrics = MetricsStore(store.state_dir)
         metrics.initialize(
             planned_batches=plan.batch_count,
@@ -307,6 +315,12 @@ def _database_context(
             raise classified from exc
         raise
 
+    # Bind a fresh run to the database used for append planning before writing
+    # its runtime fingerprint, so a mistaken connection cannot poison retries.
+    if "stack_geometry" in state.get("artifacts", {}):
+        geometry = _load_registered_json(store, state, "stack_geometry")
+        if geometry["database_target"] != current["target"]:
+            raise ImmutableStateError("Configured CATMAID database differs from append planning")
     persisted = state.get("artifacts", {}).get("database")
     if persisted is None:
         _write_registered_json(
@@ -326,6 +340,27 @@ def _database_context(
                 },
             )
     return connection, current
+
+
+def _append_geometry(request: IngestionRequest, connection: Any = None) -> dict[str, Any] | None:
+    if request.target_project_id is None:
+        return None
+    try:
+        return read_project_stack_geometry(request.target_project_id, connection)
+    except ImporterError:
+        raise
+    except Exception as exc:
+        classified = _classified_runtime_error(exc, context="target stack lookup", preflight=True)
+        if classified is not None:
+            raise classified from exc
+        raise InvalidInputError(f"Could not read target stack geometry: {exc}") from exc
+
+
+def _check_saved_geometry(store: StateStore, state: Mapping[str, Any], geometry: Mapping[str, Any] | None) -> None:
+    if geometry is not None and _load_registered_json(store, state, "stack_geometry") != geometry:
+        raise ImmutableStateError(
+            "Target stack geometry or database identity changed since planning; use a new plan"
+        )
 
 
 def _project_title(state: Mapping[str, Any], request: IngestionRequest) -> str:
@@ -652,9 +687,13 @@ class _RunArchive:
         self,
         request: IngestionRequest,
         settings: ImportSettings,
+        *, bounds_nm: tuple[StackBounds, ...] | None = None,
     ) -> None:
+        if request.target_project_id is not None and bounds_nm is None:
+            raise InvalidInputError("Append validation requires associated target stack bounds")
         self.request = request
         self.settings = settings
+        self.bounds_nm = bounds_nm
         self.archive: zipfile.ZipFile | None = None
 
     def __enter__(self) -> "_RunArchive":
@@ -689,6 +728,7 @@ class _RunArchive:
                     max_nodes=self.settings.max_nodes_per_batch,
                     scale_nm=self.request.scale_nm,
                     max_nm=self.request.max_nm if self.request.target_project_id is None else None,
+                    bounds_nm=self.bounds_nm,
                 )
         except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
             raise ImmutableStateError(
@@ -1164,6 +1204,17 @@ def run_ingestion(
             resources.enter_context(
                 existing_project_import_lock(request.target_project_id, connection)
             )
+        geometry = _append_geometry(request, connection)
+        bounds = geometry_bounds(geometry) if geometry is not None else None
+        if geometry is not None:
+            state = store.load()
+            if "stack_geometry" in state.get("artifacts", {}):
+                _check_saved_geometry(store, state, geometry)
+            else:
+                # Older plans must pass the same bounds check before reserving
+                # IDs or loading any batch. Preserve already committed data.
+                scan_archive(request, settings, bounds_nm=bounds)
+                _write_registered_json(store, "stack_geometry", STACK_GEOMETRY_FILENAME, geometry)
         state = store.load()
         project = _ensure_project(
             store, state, request, settings, connection, metrics
@@ -1183,7 +1234,7 @@ def run_ingestion(
             )
         _progress("Offline import: keep the Neuroglass managed layer inactive until verification succeeds")
 
-        with _RunArchive(request, settings) as archive:
+        with _RunArchive(request, settings, bounds_nm=bounds) as archive:
             for batch in plan.batches:
                 _run_batch(
                     store,
@@ -1237,6 +1288,7 @@ def run_ingestion(
 
         def verify() -> Mapping[str, Any]:
             if project.existing_project:
+                _check_saved_geometry(store, store.load(), _append_geometry(request, connection))
                 from .project import ProjectSetupError, existing_project_context
                 try:
                     current_project = ProjectContext.from_dict(
@@ -1259,7 +1311,7 @@ def run_ingestion(
                     cache_cell_size_nm=settings.cache_cell_size_nm,
                     connection=connection,
                 )
-            with _RunArchive(request, settings) as verification_archive:
+            with _RunArchive(request, settings, bounds_nm=bounds) as verification_archive:
                 database_result = _verify_database_by_batch(
                     store,
                     plan,

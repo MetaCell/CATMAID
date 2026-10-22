@@ -11,7 +11,7 @@ managed layer **inactive in Neuroglass** and keep it inactive until all data and
 cache verification succeeds. Layer activation is an operator action; this script
 does not call Neuroglass or change CATMAID permissions. The CATMAID web service
 can remain running, but no other client, administrator or background job may edit
-the target project's morphology or cache configuration during the import.
+the target project's morphology, stack geometry or cache configuration during the import.
 Deactivating one viewer's layer alone does not block other writers.
 
 ## Interface
@@ -25,6 +25,7 @@ python -m pip install ./scripts/catmaid_skeleton_batch_import
 Then prepare and run one ingestion:
 
 ```bash
+DJANGO_SETTINGS_MODULE=mysite.settings \
 catmaid-skeleton-import plan \
   --request /staging/request.json \
   --state-dir /staging/state
@@ -48,7 +49,9 @@ The rebuild first invalidates the cache and verification checkpoints. If it is
 interrupted, an ordinary later `run` resumes at cache creation without changing
 skeleton rows.
 
-`plan` never mutates the database. `run` reads only the durable state directory
+`plan` never mutates the database. New-project planning needs no database;
+append planning uses the configured Django connection to read the target's
+associated stacks and database identity. `run` reads only the durable state directory
 and the unchanged local input files recorded there. Run the command from a
 CATMAID application environment where `mysite.settings` and the `catmaid`
 package are importable.
@@ -116,7 +119,7 @@ Create a new hidden project instead: replace `target` with `stack`:
 | `schema_version` | Always | Literal `1`. |
 | `source.archive_path` | Always | Non-empty local ZIP path, visible in the importer's runtime/container. Prefer an absolute path; relative paths resolve against the process working directory. URLs are not supported. |
 | `source.coordinate_unit` | Always | Exactly `"um"` or `"nm"`; applies to every SWC's XYZ coordinates and all known radii. No automatic detection or per-file unit override. |
-| `target.project_id` | Existing project only | Positive integer, at most 2147483647. The project must exist and have complete tracing setup. |
+| `target.project_id` | Existing project only | Positive integer, at most 2147483647. The project must exist, have complete tracing setup and have at least one associated stack with valid geometry. |
 | `stack.dimension` | New project only | `[size_x, size_y, size_z]`, three positive integer voxel counts. |
 | `stack.resolution_nm` | New project only | `[nm_per_voxel_x, nm_per_voxel_y, nm_per_voxel_z]`, three positive finite numbers. Used to configure the new stack; does not scale SWC coordinates. |
 
@@ -137,10 +140,20 @@ X = 100.001 µm is rejected. All invalid members are collected in
 check runs when loading a planned member, including plans from older versions.
 Radius `-1` (unknown) and parent `-1` (root) remain valid. Positions are not
 clipped or translated.
-Append requests declare no stack geometry, so they have no upper coordinate
-check. They preserve the target's existing stacks and morphology, including
-any existing negative coordinates. Choose metadata consistent with the
-intended coordinate frame and viewer.
+Append requests use the target project's associated stack geometry from CATMAID.
+Planning computes each stack's project-space bounds from its dimensions,
+resolution, XY/XZ/ZY orientation and translation. Every incoming node must lie
+within at least one associated stack, including the boundary. Gaps between
+disjoint stacks are outside their coverage. Negative incoming XYZ remains
+rejected. Missing stacks or invalid stack geometry also prevent planning.
+
+The hashed `stack-geometry.json` artifact saves these definitions and the database
+identity. They are rechecked before loading and final verification; a changed
+target stops the run. Older append plans without this artifact are rescanned
+against the current stacks before any IDs are reserved or batches loaded.
+Existing stacks and morphology, including existing out-of-bounds or negative
+coordinates, remain unchanged. Choose metadata consistent with the intended
+coordinate frame and viewer.
 
 Supply exactly one of `target` and `stack`. Unknown JSON fields are rejected;
 there are no request fields for arbitrary annotations or cache overrides. Cache
@@ -253,8 +266,8 @@ included in errors.
 Node IDs are unique within a file and may be reused in other files: they are
 local topology references, not CATMAID IDs. There must be at least one node,
 exactly one root (`parent_id=-1`), valid parent references, and one connected
-acyclic tree. X, Y and Z must be non-negative and, for a new project, must not
-exceed the declared stack's physical extent after conversion to nm.
+acyclic tree. X, Y and Z must be non-negative and, after conversion to nm, must
+fit the declared new stack or at least one associated target stack for an append.
 A radius must be non-negative or
 exactly `-1` for unknown.
 A one-node SWC creates a neuron/skeleton with one root, a zero-length root edge,
@@ -481,9 +494,10 @@ SKELETON_INGESTION_WORKSPACE=/staging \
 ```
 
 The existing absolute workspace must contain `request.json`; the wrapper creates
-or resumes its `state` directory. `plan` needs no database. `run` requires
+or resumes its `state` directory. New-project `plan` needs no database.
+Append `plan` and every `run` require
 `DB_HOST`, `DB_NAME`, `DB_USER` and `DB_PASS`, with optional `DB_PORT` (default
-5432), and uses `mysite.ingestion_settings` without starting the web server or
+5432), and use `mysite.ingestion_settings` without starting the web server or
 applying migrations. `CATMAID_INGESTION_DB_WAIT_SECONDS` controls the bounded
 readiness wait (default 120 seconds, maximum 3600); the wrapper does not retry
 failed ingestion automatically.

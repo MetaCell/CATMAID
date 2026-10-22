@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import zipfile
+from copy import deepcopy
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -28,6 +29,12 @@ COUNTS = {
     "edge_count": 3, "summary_count": 1, "class_instance_count": 3,
     "relationship_count": 2, "annotation_count": 1,
     "annotation_link_count": 1, "model_of_count": 1,
+}
+STACK_GEOMETRY = {
+    "schema_version": 1, "project_id": 123, "database_target": {"sha256": "test-cluster"},
+    "stacks": [{"project_stack_id": 8, "stack_id": 9, "orientation": 0,
+                "dimension": [100, 100, 100], "resolution_nm": [1000, 1000, 1000],
+                "translation_nm": [0, 0, 0]}],
 }
 
 
@@ -84,6 +91,7 @@ class Connection:
         self.annotations = annotations
         self.available = available
         self.in_atomic_block = False
+        self.geometry = deepcopy(STACK_GEOMETRY)
 
     def cursor(self):
         return Cursor(self)
@@ -191,10 +199,117 @@ def configure_run(monkeypatch, connection):
         assert require_replica_role is True
         return connection, {}
     monkeypatch.setattr(orchestrator, "_database_context", database_context)
+    monkeypatch.setattr(orchestrator, "read_project_stack_geometry",
+                        lambda _pid, _connection=None: deepcopy(connection.geometry))
     monkeypatch.setattr(materialization, "validate_batch", lambda **_kwargs: dict(COUNTS))
     allocated = iter(range(1000, 10000))
     monkeypatch.setattr(database, "allocate_sequence_ids", lambda _seq, count, *_args:
                         tuple(next(allocated) for _ in range(count)))
+
+
+def test_append_planning_rejects_outside_coordinates_without_persisting_a_plan(tmp_path, monkeypatch):
+    connection = Connection()
+    configure_run(monkeypatch, connection)
+    connection.geometry["stacks"][0]["dimension"] = [1, 100, 100]
+    state_dir = tmp_path / "state"
+    with pytest.raises(InvalidInputError, match="outside all associated target stack bounds"):
+        orchestrator.plan_ingestion(request_file(tmp_path), state_dir)
+    assert not (state_dir / "plan.jsonl.gz").exists()
+    assert not (state_dir / "state.json").exists()
+    assert connection.statements == []
+
+
+@pytest.mark.parametrize("stage", ["plan", "run"])
+@pytest.mark.parametrize("change", ["geometry", "database"])
+def test_changed_append_geometry_or_database_is_rejected_before_reserving_ids(tmp_path, monkeypatch, stage, change):
+    connection = Connection()
+    configure_run(monkeypatch, connection)
+    state_dir = tmp_path / "state"
+    path = request_file(tmp_path)
+    orchestrator.plan_ingestion(path, state_dir)
+    if change == "geometry":
+        connection.geometry["stacks"][0]["translation_nm"][0] = 10
+    else:
+        connection.geometry["database_target"]["sha256"] = "different-cluster"
+    monkeypatch.setattr(database, "allocate_sequence_ids", forbidden)
+    monkeypatch.setattr(orchestrator, "execute_batch_transaction", forbidden)
+    with pytest.raises(ImmutableStateError, match="geometry or database identity changed"):
+        if stage == "plan":
+            orchestrator.plan_ingestion(path, state_dir)
+        else:
+            orchestrator.run_ingestion(state_dir)
+    assert StateStore(state_dir).load()["batches"][0]["status"] == "planned"
+
+
+def test_older_append_plan_is_checked_before_loading_or_reserving_ids(tmp_path, monkeypatch):
+    from catmaid_skeleton_batch_import.util import atomic_write_json
+
+    connection = Connection()
+    configure_run(monkeypatch, connection)
+    state_dir = tmp_path / "state"
+    orchestrator.plan_ingestion(request_file(tmp_path), state_dir)
+    store = StateStore(state_dir)
+    state = store.load()
+    del state["artifacts"]["stack_geometry"]
+    atomic_write_json(store.state_path, state)
+    connection.geometry["stacks"][0]["dimension"] = [1, 100, 100]
+    monkeypatch.setattr(database, "allocate_sequence_ids", forbidden)
+    monkeypatch.setattr(orchestrator, "execute_batch_transaction", forbidden)
+    with pytest.raises(InvalidInputError, match="outside all associated target stack bounds"):
+        orchestrator.run_ingestion(state_dir)
+    assert store.load()["batches"][0]["status"] == "planned"
+
+
+def test_wrong_database_does_not_persist_a_conflicting_runtime_fingerprint(tmp_path, monkeypatch):
+    database_context = orchestrator._database_context
+    connection = Connection()
+    configure_run(monkeypatch, connection)
+    state_dir = tmp_path / "state"
+    orchestrator.plan_ingestion(request_file(tmp_path), state_dir)
+    store = StateStore(state_dir)
+    monkeypatch.setattr(database, "bootstrap_django", lambda: connection)
+    monkeypatch.setattr(database, "preflight_database", lambda *_args, **_kwargs:
+                        {"target": {"sha256": "wrong-cluster"}})
+    with pytest.raises(ImmutableStateError, match="differs from append planning"):
+        database_context(store, store.load())
+    assert "database" not in store.load()["artifacts"]
+
+
+def test_valid_older_append_plan_gains_geometry_checkpoint_and_can_finish(tmp_path, monkeypatch):
+    from catmaid_skeleton_batch_import.util import atomic_write_json
+
+    connection = Connection()
+    configure_run(monkeypatch, connection)
+    state_dir = tmp_path / "state"
+    orchestrator.plan_ingestion(request_file(tmp_path), state_dir)
+    store = StateStore(state_dir)
+    state = store.load()
+    del state["artifacts"]["stack_geometry"]
+    atomic_write_json(store.state_path, state)
+    def commit(_prepared, _context, _settings, before_commit, _timings):
+        before_commit()
+        return dict(COUNTS)
+    monkeypatch.setattr(orchestrator, "execute_batch_transaction", commit)
+    monkeypatch.setattr(loader, "verify_exact_treenodes", lambda *_args: None)
+    assert orchestrator.run_ingestion(state_dir)["status"] == "complete"
+    assert "stack_geometry" in store.load()["artifacts"]
+
+
+def test_geometry_change_during_import_prevents_completion(tmp_path, monkeypatch):
+    connection = Connection()
+    configure_run(monkeypatch, connection)
+    state_dir = tmp_path / "state"
+    orchestrator.plan_ingestion(request_file(tmp_path), state_dir)
+    def commit(_prepared, _context, _settings, before_commit, _timings):
+        before_commit()
+        connection.geometry["stacks"][0]["dimension"][0] += 1
+        return dict(COUNTS)
+    monkeypatch.setattr(orchestrator, "execute_batch_transaction", commit)
+    with pytest.raises(ImmutableStateError, match="geometry or database identity changed"):
+        orchestrator.run_ingestion(state_dir)
+    state = StateStore(state_dir).load()
+    assert state["batches"][0]["status"] == "committed"
+    assert state["status"] != "complete"
 
 
 def test_complete_append_and_resume_are_scoped_and_preserve_target_configuration(tmp_path, monkeypatch):
