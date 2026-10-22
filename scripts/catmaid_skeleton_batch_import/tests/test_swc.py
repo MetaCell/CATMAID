@@ -81,9 +81,37 @@ def test_cable_length_is_finite() -> None:
         parse(content)
 
 
-def test_geometry_is_not_checked_against_upper_stack_bounds() -> None:
+def test_geometry_without_declared_stack_has_no_upper_bound() -> None:
     parsed = parse(b"1 1 100 0 0 1 -1\n2 3 1000000 0 0 1 1\n")
     assert math.isclose(parsed.summary.cable_length_source_units, 999_900)
+
+
+@pytest.mark.parametrize("axis", ["x", "y", "z"])
+@pytest.mark.parametrize("scale_nm", [1, 1000])
+def test_rejects_coordinates_beyond_declared_extent_after_unit_conversion(axis, scale_nm):
+    extents = (1000.0, 2000.0, 3000.0)
+    index = ["x", "y", "z"].index(axis)
+    coordinates = ["0", "0", "0"]
+    coordinates[index] = str((extents[index] + 1) / scale_nm)
+    content = ("# header\n1 1 " + " ".join(coordinates) + " -1 -1\n").encode()
+    with pytest.raises(InvalidInputError, match=rf"cell\.swc:2: {axis} coordinate .* exceeds declared stack extent"):
+        parse(content, scale_nm=scale_nm, max_nm=extents)
+
+
+@pytest.mark.parametrize("scale_nm", [1, 1000])
+def test_origin_and_exact_declared_extent_are_accepted_without_scaling_source_nodes(scale_nm):
+    extents = (1000.0, 2000.0, 3000.0)
+    coordinates = tuple(value / scale_nm for value in extents)
+    content = ("1 1 0 0 0 -1 -1\n2 3 " +
+               " ".join(map(str, coordinates)) + " -1 1\n").encode()
+    parsed = parse(content, scale_nm=scale_nm, max_nm=extents)
+    assert (parsed.nodes[1].x, parsed.nodes[1].y, parsed.nodes[1].z) == coordinates
+
+
+@pytest.mark.parametrize("extent", [(1, 2), (1, 2, 0), (1, 2, float("inf"))])
+def test_invalid_declared_extents_are_rejected(extent):
+    with pytest.raises(ValueError, match="positive finite extents"):
+        parse(b"1 1 0 0 0 -1 -1\n", max_nm=extent)
 
 
 @pytest.mark.parametrize("axis", ["x", "y", "z"])

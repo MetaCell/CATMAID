@@ -5,12 +5,13 @@ import stat
 import struct
 import warnings
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from catmaid_skeleton_batch_import.archive import scan_archive
-from catmaid_skeleton_batch_import.domain import ImportSettings, IngestionRequest
+from catmaid_skeleton_batch_import.domain import ImportSettings, IngestionRequest, PlannedMember
 from catmaid_skeleton_batch_import.errors import InvalidInputError
 
 
@@ -22,8 +23,8 @@ def request(archive: Path) -> IngestionRequest:
         schema_version=1,
         archive_path=archive,
         coordinate_unit="um",
-        dimension=(1, 1, 1),
-        resolution_nm=(1.0, 1.0, 1.0),
+        dimension=(10, 20, 30),
+        resolution_nm=(1000.0, 1000.0, 1000.0),
     )
 
 
@@ -193,6 +194,64 @@ def test_planning_reports_all_members_with_negative_coordinates(tmp_path: Path) 
     assert all(f"{axis} must be non-negative" in item["message"]
                for axis, item in zip("xyz", errors))
     assert not (state_dir / "state.json").exists()
+
+
+@pytest.mark.parametrize("unit", ["nm", "um"])
+def test_planning_reports_all_members_beyond_declared_stack_without_a_partial_plan(tmp_path, unit):
+    from catmaid_skeleton_batch_import.orchestrator import plan_ingestion
+    import json
+
+    archive = tmp_path / "outside.zip"
+    ingestion_request = replace(request(archive), coordinate_unit=unit)
+    members = [("valid.swc", VALID_SWC)]
+    for axis, extent in enumerate(ingestion_request.max_nm):
+        coordinates = ["0", "0", "0"]
+        coordinates[axis] = str((extent + 1) / ingestion_request.scale_nm)
+        content = ("# header\n1 1 " + " ".join(coordinates) + " -1 -1\n").encode()
+        members.append((f"{'xyz'[axis]}.swc", content))
+    write_zip(archive, members)
+    path = tmp_path / "request.json"
+    path.write_text(json.dumps(ingestion_request.to_dict()))
+    state_dir = tmp_path / "state"
+
+    with pytest.raises(InvalidInputError) as failure:
+        plan_ingestion(path, state_dir)
+    errors = failure.value.details["member_errors"]
+    assert failure.value.details["invalid_swc_count"] == 3
+    assert [item["member_path"] for item in errors] == ["x.swc", "y.swc", "z.swc"]
+    for axis, item in zip("xyz", errors):
+        assert f"outside.zip:{axis}.swc:2: {axis} coordinate" in item["message"]
+        assert "exceeds declared stack extent" in item["message"]
+    assert not (state_dir / "plan.jsonl.gz").exists()
+    assert not (state_dir / "state.json").exists()
+
+
+def test_run_rechecks_declared_extent_for_previously_planned_members(tmp_path):
+    from catmaid_skeleton_batch_import.orchestrator import _RunArchive
+
+    archive_path = tmp_path / "old-plan.zip"
+    content = b"1 1 10.001 0 0 -1 -1\n"
+    write_zip(archive_path, [("cell.swc", content)])
+    with zipfile.ZipFile(archive_path) as archive:
+        info = archive.getinfo("cell.swc")
+    member = PlannedMember(
+        member_path=info.filename, node_count=1, uncompressed_bytes=info.file_size,
+        crc32=info.CRC, display_name="cell", fragment_id="cell", cable_length_nm=0,
+    )
+    with _RunArchive(request(archive_path), settings()) as archive:
+        with pytest.raises(InvalidInputError, match="exceeds declared stack extent"):
+            archive.load(member)
+
+
+def test_append_without_declared_stack_keeps_no_upper_coordinate_limit(tmp_path):
+    from catmaid_skeleton_batch_import.orchestrator import _RunArchive
+
+    archive_path = tmp_path / "append.zip"
+    write_zip(archive_path, [("cell.swc", b"1 1 1000000000 0 0 -1 -1\n")])
+    ingestion_request = IngestionRequest(1, archive_path, "um", target_project_id=123)
+    scanned = scan_archive(ingestion_request, settings())
+    with _RunArchive(ingestion_request, settings()) as archive:
+        assert archive.load(scanned.members[0])[0].x == 1_000_000_000
 
 
 def test_reports_member_metadata_errors_and_fragment_collisions_together(tmp_path: Path) -> None:

@@ -688,6 +688,7 @@ class _RunArchive:
                     max_bytes=self.settings.max_swc_bytes,
                     max_nodes=self.settings.max_nodes_per_batch,
                     scale_nm=self.request.scale_nm,
+                    max_nm=self.request.max_nm if self.request.target_project_id is None else None,
                 )
         except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
             raise ImmutableStateError(

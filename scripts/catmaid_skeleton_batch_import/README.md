@@ -128,13 +128,19 @@ The importer creates this stack with zero translation and XY orientation.
 SWC positions are converted solely by `source.coordinate_unit` and remain in
 their original coordinate frame. Planning rejects negative X, Y or Z values,
 reporting the member, line and axis, because the current viewer assumes a
-coordinate frame starting at zero. Radius `-1` (unknown) and parent `-1` (root)
-remain valid. Positions are not clipped or translated, and positive positions
-beyond the stack extent are still accepted.
-A client that restricts spatial fetching to the stack extent can therefore
-miss out-of-bounds morphology. Choose metadata consistent with the intended
-coordinate frame and viewer. Append imports preserve the target's existing
-stacks and morphology, including any existing negative coordinates.
+coordinate frame starting at zero. For a new project, each converted position
+must also satisfy `coordinate_nm <= dimension[i] * resolution_nm[i]` on every
+axis; the physical extents must be positive and finite. Positions exactly on
+the boundary are accepted. In the example above, X = 100 µm is valid but
+X = 100.001 µm is rejected. All invalid members are collected in
+`error.details.member_errors`, and no executable plan is produced. The same
+check runs when loading a planned member, including plans from older versions.
+Radius `-1` (unknown) and parent `-1` (root) remain valid. Positions are not
+clipped or translated.
+Append requests declare no stack geometry, so they have no upper coordinate
+check. They preserve the target's existing stacks and morphology, including
+any existing negative coordinates. Choose metadata consistent with the
+intended coordinate frame and viewer.
 
 Supply exactly one of `target` and `stack`. Unknown JSON fields are rejected;
 there are no request fields for arbitrary annotations or cache overrides. Cache
@@ -247,7 +253,9 @@ included in errors.
 Node IDs are unique within a file and may be reused in other files: they are
 local topology references, not CATMAID IDs. There must be at least one node,
 exactly one root (`parent_id=-1`), valid parent references, and one connected
-acyclic tree. X, Y and Z must be non-negative. A radius must be non-negative or
+acyclic tree. X, Y and Z must be non-negative and, for a new project, must not
+exceed the declared stack's physical extent after conversion to nm.
+A radius must be non-negative or
 exactly `-1` for unknown.
 A one-node SWC creates a neuron/skeleton with one root, a zero-length root edge,
 and a summary with `num_nodes=1` and `cable_length=0`; its provenance and cache

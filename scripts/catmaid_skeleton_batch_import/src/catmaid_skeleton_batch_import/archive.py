@@ -174,6 +174,7 @@ def scan_archive(
                             max_bytes=settings.max_swc_bytes,
                             max_nodes=settings.max_nodes_per_batch,
                             scale_nm=request.scale_nm,
+                            max_nm=request.max_nm if request.target_project_id is None else None,
                         )
                     if parsed.bytes_read != info.file_size:
                         raise InvalidInputError(

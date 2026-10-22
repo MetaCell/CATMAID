@@ -61,6 +61,20 @@ def test_request_rejects_unknown_input_policy(
         load_request(request_path)
 
 
+@pytest.mark.parametrize("dimension,resolution", [
+    ([10, 20, 30], [1e308, 1, 1]),
+    ([10**400, 20, 30], [1, 1, 1]),
+])
+def test_request_rejects_nonfinite_physical_stack_extent(tmp_path, dimension, resolution):
+    path = tmp_path / "request.json"
+    write_request(path)
+    value = json.loads(path.read_text())
+    value["stack"] = {"dimension": dimension, "resolution_nm": resolution}
+    path.write_text(json.dumps(value))
+    with pytest.raises(InvalidInputError, match="positive finite extents"):
+        load_request(path)
+
+
 def test_settings_use_module_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DJANGO_SETTINGS_MODULE", raising=False)
     for name in (

@@ -116,6 +116,17 @@ def load_request(path: Path) -> IngestionRequest:
         resolution_nm = _positive_number_tuple(
             raw["stack"]["resolution_nm"], "request.stack.resolution_nm"
         )
+        try:
+            valid_extent = all(
+                math.isfinite(float(size) * resolution) and float(size) * resolution > 0
+                for size, resolution in zip(dimension, resolution_nm)
+            )
+        except OverflowError:
+            valid_extent = False
+        if not valid_extent:
+            raise InvalidInputError(
+                "request.stack dimension * resolution_nm must produce positive finite extents"
+            )
     if raw["schema_version"] != 1:
         raise InvalidInputError("request.schema_version must be 1")
     if not isinstance(raw["source"], dict):
