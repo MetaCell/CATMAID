@@ -26,6 +26,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=__version__)
     commands = parser.add_subparsers(dest="command", required=True)
 
+    preflight = commands.add_parser(
+        "preflight", help="snapshot associated stack metadata before offline append planning"
+    )
+    preflight.add_argument("--request", type=Path, required=True)
+    preflight.add_argument("--state-dir", type=Path, required=True)
+
     plan = commands.add_parser("plan", help="validate inputs and persist a deterministic plan")
     plan.add_argument("--request", type=Path, required=True)
     plan.add_argument("--state-dir", type=Path, required=True)
@@ -106,9 +112,11 @@ def execute(argv: Sequence[str] | None = None) -> int:
         args = build_parser().parse_args(argv)
         command = args.command
         state_dir = args.state_dir
-        from .orchestrator import plan_ingestion, run_ingestion
+        from .orchestrator import plan_ingestion, preflight_ingestion, run_ingestion
 
-        if args.command == "plan":
+        if args.command == "preflight":
+            result = preflight_ingestion(args.request, args.state_dir)
+        elif args.command == "plan":
             result = plan_ingestion(args.request, args.state_dir)
         else:
             result = run_ingestion(

@@ -23,11 +23,11 @@ pytestmark = [
 @pytest.mark.parametrize("orientation,maximum", [
     (0, (120, 260, 420)), (1, (120, 320, 360)), (2, (220, 260, 320)),
 ])
-def test_append_planning_reads_translated_oriented_stack_bounds_from_postgres(
+def test_append_preflight_reads_translated_oriented_stack_bounds_from_postgres(
     tmp_path, isolated_database, orientation, maximum,
 ):
     from catmaid_skeleton_batch_import.errors import InvalidInputError
-    from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, run_ingestion
+    from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, preflight_ingestion, run_ingestion
 
     seed = tmp_path / "seed"
     seed.mkdir()
@@ -56,12 +56,14 @@ def test_append_planning_reads_translated_oriented_stack_bounds_from_postgres(
     path.write_text(json.dumps(request))
     with zipfile.ZipFile(archive, "w") as source:
         source.writestr("boundary.swc", f"1 1 {' '.join(map(str, maximum))} -1 -1\n")
+    assert preflight_ingestion(path, append / "valid-state")["ok"]
     assert plan_ingestion(path, append / "valid-state")["ok"]
     archive = append / "outside.zip"
     with zipfile.ZipFile(archive, "w") as source:
         source.writestr("outside.swc", f"1 1 {maximum[0] + 1} {maximum[1]} {maximum[2]} -1 -1\n")
     request["source"]["archive_path"] = str(archive)
     path.write_text(json.dumps(request))
+    preflight_ingestion(path, append / "invalid-state")
     with pytest.raises(InvalidInputError, match="outside all associated target stack bounds"):
         plan_ingestion(path, append / "invalid-state")
     assert not (append / "invalid-state" / "state.json").exists()
@@ -76,7 +78,7 @@ def test_single_node_import_rolls_back_resumes_and_is_cached(
     from catmaid_skeleton_batch_import import materialization
     from catmaid_skeleton_batch_import.artifacts import read_manifest
     from catmaid_skeleton_batch_import.errors import RetryableError
-    from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, run_ingestion
+    from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, preflight_ingestion, run_ingestion
     from catmaid_skeleton_batch_import.state import StateStore
 
     monkeypatch.setenv("CATMAID_BATCH_IMPORT_MAX_NODES_PER_BATCH", "2")
@@ -97,6 +99,8 @@ def test_single_node_import_rolls_back_resumes_and_is_cached(
             request["target"] = {"project_id": project_id}
         path = directory / "request.json"
         path.write_text(json.dumps(request))
+        if project_id is not None:
+            preflight_ingestion(path, directory / "state")
         plan_ingestion(path, directory / "state")
         return directory / "state"
 
@@ -262,7 +266,7 @@ def test_known_rollback_preserves_prior_batch_and_resumes(
 def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_caches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_database,
 ) -> None:
-    from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, run_ingestion
+    from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, preflight_ingestion, run_ingestion
     from guardian.models import UserObjectPermission, GroupObjectPermission
     from catmaid.models import Project
     from django.contrib.contenttypes.models import ContentType
@@ -283,6 +287,8 @@ def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_c
             value["target"] = {"project_id": target}
         path = directory / "request.json"
         path.write_text(json.dumps(value))
+        if target is not None:
+            preflight_ingestion(path, directory / "state")
         plan_ingestion(path, directory / "state")
         return directory / "state"
 

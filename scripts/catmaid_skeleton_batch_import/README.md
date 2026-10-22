@@ -25,7 +25,12 @@ python -m pip install ./scripts/catmaid_skeleton_batch_import
 Then prepare and run one ingestion:
 
 ```bash
+# Append only: capture the associated target stacks before offline planning.
 DJANGO_SETTINGS_MODULE=mysite.settings \
+catmaid-skeleton-import preflight \
+  --request /staging/request.json \
+  --state-dir /staging/state
+
 catmaid-skeleton-import plan \
   --request /staging/request.json \
   --state-dir /staging/state
@@ -49,9 +54,12 @@ The rebuild first invalidates the cache and verification checkpoints. If it is
 interrupted, an ordinary later `run` resumes at cache creation without changing
 skeleton rows.
 
-`plan` never mutates the database. New-project planning needs no database;
-append planning uses the configured Django connection to read the target's
-associated stacks and database identity. `run` reads only the durable state directory
+`plan` needs no database or Django initialization for either target mode. For
+append requests, first run `preflight` with the same request and state directory.
+It reads associated stack metadata and database identity into the local
+`state/stack-geometry.json` snapshot, without reading SWCs or changing CATMAID.
+New-project requests do not need preflight; calling it is a no-op.
+`run` reads only the durable state directory
 and the unchanged local input files recorded there. Run the command from a
 CATMAID application environment where `mysite.settings` and the `catmaid`
 package are importable.
@@ -140,15 +148,19 @@ X = 100.001 µm is rejected. All invalid members are collected in
 check runs when loading a planned member, including plans from older versions.
 Radius `-1` (unknown) and parent `-1` (root) remain valid. Positions are not
 clipped or translated.
-Append requests use the target project's associated stack geometry from CATMAID.
+Append requests use the target project's associated stack geometry captured by
+the separate, read-only `preflight` step.
 Planning computes each stack's project-space bounds from its dimensions,
 resolution, XY/XZ/ZY orientation and translation. Every incoming node must lie
 within at least one associated stack, including the boundary. Gaps between
 disjoint stacks are outside their coverage. Negative incoming XYZ remains
 rejected. Missing stacks or invalid stack geometry also prevent planning.
 
-The hashed `stack-geometry.json` artifact saves these definitions and the database
-identity. They are rechecked before loading and final verification; a changed
+`plan` reads this snapshot locally and registers its hash alongside the plan.
+Preflight may refresh the snapshot before planning; afterward it only checks
+that the saved metadata still matches. To use changed metadata, create a new
+state directory and repeat preflight and planning. The stack definitions and database
+identity are rechecked before loading and final verification; a changed
 target stops the run. Older append plans without this artifact are rescanned
 against the current stacks before any IDs are reserved or batches loaded.
 Existing stacks and morphology, including existing out-of-bounds or negative
@@ -206,7 +218,8 @@ Example files visible to the importer:
 /staging/
   request.json
   skeletons.zip
-  state/                 # created by plan; use the same directory for resume
+  state/                 # created by preflight/plan; reuse for resume
+    stack-geometry.json  # append metadata snapshot from preflight
 ```
 
 Example members **inside** `skeletons.zip`:
@@ -486,6 +499,10 @@ add viewer code or append all identifiers to visible labels.
 The CATMAID image includes the package and a headless runtime wrapper:
 
 ```bash
+# Append only; skip this step for a new project.
+SKELETON_INGESTION_WORKSPACE=/staging \
+/home/env/bin/python /home/scripts/docker/run_catmaid_skeleton_import.py preflight
+
 SKELETON_INGESTION_WORKSPACE=/staging \
 /home/env/bin/python /home/scripts/docker/run_catmaid_skeleton_import.py plan
 
@@ -494,8 +511,9 @@ SKELETON_INGESTION_WORKSPACE=/staging \
 ```
 
 The existing absolute workspace must contain `request.json`; the wrapper creates
-or resumes its `state` directory. New-project `plan` needs no database.
-Append `plan` and every `run` require
+or resumes its `state` directory. `plan` needs no database for either mode and
+uses environment/default import settings without loading Django settings.
+Append `preflight` and every `run` require
 `DB_HOST`, `DB_NAME`, `DB_USER` and `DB_PASS`, with optional `DB_PORT` (default
 5432), and use `mysite.ingestion_settings` without starting the web server or
 applying migrations. `CATMAID_INGESTION_DB_WAIT_SECONDS` controls the bounded
@@ -504,7 +522,7 @@ failed ingestion automatically.
 
 Apply CATMAID migration `0126_fix_single_node_selective_summary` through the
 normal deployment migration process before running this importer. It fixes
-selective summary rebuilding for single-node skeletons. Preflight rejects
+selective summary rebuilding for single-node skeletons. The runtime database preflight rejects
 unapplied migrations. Finish active imports before upgrading the database:
 their saved migration/database fingerprint is immutable across retries.
 
@@ -519,8 +537,9 @@ publication and failure cleanup remain the caller's responsibility.
 
 ## Deployment settings
 
-The importer reads a Django setting first, then the same-name environment
-variable, then its module default:
+`plan` reads the environment variables below, then their defaults. During `run`,
+the two operational timeouts prefer Django settings, then the same-name
+environment variables, then defaults; other values come from the saved plan:
 
 | Setting | Default |
 |---|---:|
@@ -541,7 +560,9 @@ The viewer requests the sole spatial profile at 100% LOD, so the bucket contains
 all entries without progressive subdivision. Bucket size and strategy remain
 configurable for explicit multi-level overrides.
 
-Planning snapshots all result-affecting settings. Existing plans retain their
+Planning resolves import settings from the environment and defaults, without
+loading Django settings, and snapshots all result-affecting settings. Supply
+planning overrides as the environment variables above. Existing plans retain their
 recorded LOD count when resumed or rebuilt. Database timeouts are resolved
 again for each `run` and recorded with its metrics.
 

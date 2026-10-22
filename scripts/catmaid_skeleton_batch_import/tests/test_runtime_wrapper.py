@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 WRAPPER = Path(__file__).parents[2] / "docker" / "run_catmaid_skeleton_import.py"
 
@@ -39,7 +41,8 @@ def _base_environment(tmp_path: Path, importer: Path) -> dict[str, str]:
     }
 
 
-def test_plan_uses_workspace_contract_without_initializing_django(tmp_path: Path) -> None:
+@pytest.mark.parametrize("payload", [{}, {"target": {"project_id": 123}}])
+def test_plan_uses_workspace_contract_without_initializing_django(tmp_path: Path, payload) -> None:
     calls = tmp_path / "calls"
     importer = tmp_path / "importer"
     _write_executable(
@@ -51,9 +54,12 @@ exit 0
     )
     environment = _base_environment(tmp_path, importer)
     workspace = Path(environment["SKELETON_INGESTION_WORKSPACE"])
-    (workspace / "request.json").write_text("{}", encoding="utf-8")
+    (workspace / "request.json").write_text(json.dumps(payload), encoding="utf-8")
     environment["CALLS_FILE"] = str(calls)
     environment["DJANGO_SETTINGS_MODULE"] = "must.not.be.loaded"
+    for name in ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASS"):
+        environment.pop(name, None)
+    _write_executable(Path(environment["CATMAID_PG_ISREADY_BIN"]), "#!/bin/bash\nexit 99\n")
 
     result = subprocess.run(
         [sys.executable, str(WRAPPER), "plan"],
@@ -69,7 +75,7 @@ exit 0
     )
 
 
-def test_append_plan_sets_up_the_database_environment_for_read_only_stack_lookup(tmp_path):
+def test_preflight_sets_up_the_database_environment_for_read_only_stack_lookup(tmp_path):
     calls = tmp_path / "calls"
     importer = tmp_path / "importer"
     _write_executable(importer, """#!/bin/bash
@@ -81,12 +87,12 @@ exit 0
     (workspace / "request.json").write_text(json.dumps({"target": {"project_id": 123}}))
     environment["CALLS_FILE"] = str(calls)
     environment.pop("PYTHONPATH", None)
-    result = subprocess.run([sys.executable, str(WRAPPER), "plan"], env=environment,
+    result = subprocess.run([sys.executable, str(WRAPPER), "preflight"], env=environment,
                             text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
     assert calls.read_text().strip() == (
         f"mysite.ingestion_settings|{environment['CATMAID_PROJECTS_DIRECTORY']}|"
-        f"plan --request {workspace}/request.json --state-dir {workspace}/state"
+        f"preflight --request {workspace}/request.json --state-dir {workspace}/state"
     )
 
 

@@ -2,8 +2,8 @@
 """Run the skeleton importer safely inside a short-lived CATMAID job.
 
 The importer CLI deliberately knows nothing about Kubernetes or CATMAID image
-startup. This entrypoint supplies that boundary: new-project ``plan`` stays
-independent from Django; append ``plan`` and ``run`` wait for PostgreSQL and
+startup. This entrypoint supplies that boundary: ``plan`` stays independent
+from Django; ``preflight`` and ``run`` wait for PostgreSQL and
 select the ingestion-only Django settings. It forwards termination signals and
 records a failed run as terminal for the workflow notifier. Argo invokes this script rather than
 starting CATMAID's web process.
@@ -162,34 +162,28 @@ def _clear_terminal_marker(state_directory: Path) -> None:
         ) from exc
 
 
-def _plan(workspace: Path, importer: str, environ: Mapping[str, str]) -> int:
+def _prepare(workspace: Path, importer: str, environ: Mapping[str, str], *, action: str) -> int:
     request = workspace / REQUEST_FILENAME
     if not request.is_file():
         raise EntrypointError(
             f"Ingestion request does not exist: {request}",
             EX_NOINPUT,
         )
-    plan_environment = dict(environ)
-    try:
-        value = json.loads(request.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        # Leave input diagnostics and their JSON error format to the CLI.
-        value = None
-    if isinstance(value, dict) and "target" in value:
-        # Append planning reads its associated stacks without changing them.
-        _projects_directory, plan_environment = _database_environment(environ)
+    child_environment = dict(environ)
+    if action == "preflight":
+        _projects_directory, child_environment = _database_environment(environ)
     else:
-        plan_environment.pop("DJANGO_SETTINGS_MODULE", None)
+        child_environment.pop("DJANGO_SETTINGS_MODULE", None)
     return _run_child(
         (
             importer,
-            "plan",
+            action,
             "--request",
             str(request),
             "--state-dir",
             str(workspace / STATE_DIRECTORY),
         ),
-        environ=plan_environment,
+        environ=child_environment,
     )
 
 
@@ -334,7 +328,7 @@ def execute(
     environ: Mapping[str, str] | None = None,
 ) -> int:
     parser = argparse.ArgumentParser(prog="run-catmaid-skeleton-import")
-    parser.add_argument("action", choices=("plan", "run"))
+    parser.add_argument("action", choices=("preflight", "plan", "run"))
     arguments = parser.parse_args(argv)
     environment = os.environ if environ is None else environ
     try:
@@ -343,8 +337,8 @@ def execute(
             _environment_value(environment, "CATMAID_SKELETON_IMPORTER_BIN")
             or "/home/env/bin/catmaid-skeleton-import"
         )
-        if arguments.action == "plan":
-            return _plan(workspace, importer, environment)
+        if arguments.action in {"preflight", "plan"}:
+            return _prepare(workspace, importer, environment, action=arguments.action)
         return _run(workspace, importer, environment)
     except EntrypointError as exc:
         print(str(exc), file=sys.stderr)

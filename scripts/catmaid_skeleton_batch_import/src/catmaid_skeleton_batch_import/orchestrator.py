@@ -1,4 +1,4 @@
-"""The single plan/run lifecycle for CATMAID skeleton ingestion."""
+"""The preflight/plan/run lifecycle for CATMAID skeleton ingestion."""
 
 from __future__ import annotations
 
@@ -104,12 +104,65 @@ def _same_normalized_request(request: IngestionRequest, store: StateStore) -> bo
     )
 
 
+def preflight_ingestion(request_path: Path, state_dir: Path) -> dict[str, object]:
+    """Capture append stack metadata without reading SWCs or modifying CATMAID."""
+    store = StateStore(state_dir)
+    with store.lock():
+        request = load_request(request_path)
+        state = store.verify_immutable() if store.state_path.exists() else None
+        if state is not None and not _same_normalized_request(request, store):
+            raise ImmutableStateError(
+                "Existing state directory contains a different normalized request"
+            )
+        geometry = _append_geometry(request)
+        if geometry is not None:
+            if state is not None and "stack_geometry" in state.get("artifacts", {}):
+                _check_saved_geometry(store, state, geometry)
+            else:
+                # Planning later hashes this snapshot. Once registered, preflight
+                # must never refresh it underneath an existing executable plan.
+                atomic_write_json(store.state_dir / STACK_GEOMETRY_FILENAME, geometry)
+        return _write_result(store.state_dir, _success_result(
+            "preflight", store.state_dir,
+            required=geometry is not None,
+            project_id=request.target_project_id,
+            stack_count=len(geometry["stacks"]) if geometry is not None else 0,
+        ))
+
+
+def _planning_geometry(request: IngestionRequest, store: StateStore) -> dict[str, Any] | None:
+    """Read only the local preflight snapshot; planning must not bootstrap Django."""
+    if request.target_project_id is None:
+        return None
+    path = store.state_dir / STACK_GEOMETRY_FILENAME
+    if not path.is_file():
+        raise InvalidInputError(
+            "Append planning requires stack-geometry.json; run preflight with the "
+            "same --request and --state-dir first"
+        )
+    try:
+        geometry = load_json(path)
+        if (not isinstance(geometry, dict) or geometry.get("schema_version") != 1
+                or geometry.get("project_id") != request.target_project_id
+                or not isinstance(geometry.get("database_target"), dict)
+                or not geometry["database_target"].get("sha256")
+                or not isinstance(geometry.get("stacks"), list)
+                or not all(isinstance(stack, dict) for stack in geometry["stacks"])):
+            raise ValueError("invalid metadata or different target project")
+        geometry_bounds(geometry)
+    except (OSError, ValueError, TypeError) as exc:
+        raise InvalidInputError(f"Invalid preflight stack snapshot: {exc}") from exc
+    return geometry
+
+
 def plan_ingestion(request_path: Path, state_dir: Path) -> dict[str, object]:
     store = StateStore(state_dir)
     with store.lock():
         request = load_request(request_path)
-        settings = load_settings()
-        geometry = _append_geometry(request)
+        # Deployment limits are explicit environment values/defaults here.
+        # Even an inherited DJANGO_SETTINGS_MODULE must not initialize Django.
+        settings = load_settings(use_django=False)
+        geometry = _planning_geometry(request, store)
         bounds = geometry_bounds(geometry) if geometry is not None else None
 
         if store.state_path.exists():

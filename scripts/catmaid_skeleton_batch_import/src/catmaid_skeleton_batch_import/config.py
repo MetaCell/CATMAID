@@ -170,9 +170,9 @@ def _django_value(name: str) -> Any:
         ) from exc
 
 
-def _raw_setting(field_name: str) -> Any:
+def _raw_setting(field_name: str, *, use_django: bool = True) -> Any:
     name = SETTING_NAMES[field_name]
-    django_value = _django_value(name)
+    django_value = _django_value(name) if use_django else _MISSING
     if django_value is not _MISSING:
         return django_value
     if name in os.environ:
@@ -197,10 +197,10 @@ def _parse_int(value: Any, name: str, *, allow_none: bool = False) -> int | None
     return parsed
 
 
-def load_settings() -> ImportSettings:
+def load_settings(*, use_django: bool = True) -> ImportSettings:
     values: dict[str, Any] = {}
     for field in fields(ImportSettings):
-        raw = _raw_setting(field.name)
+        raw = _raw_setting(field.name, use_django=use_django)
         name = SETTING_NAMES[field.name]
         if field.name == "lod_strategy":
             strategy = str(raw)
