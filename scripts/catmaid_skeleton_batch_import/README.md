@@ -716,17 +716,20 @@ importer version, including local legacy-state resumes.
 
 The importer saves per-batch manifests and node maps in its local state directory.
 It has no NeuroGlass dependency, network callback or mapping-table migration.
-An external orchestrator can persist these maps after a successful, fully
-verified run. MNP does that once after the CATMAID subprocess exits with code 0,
-using bounded uploads into relational NeuroGlass rows. There is no pre-commit
-staging/post-commit acknowledgement hook in CATMAID.
+MNP mounts a dedicated retained RWX volume into its finite processing and exit
+reporting pods. Maps remain files on that volume; NeuroGlass stores only the
+compact terminal result, not node mapping rows. Future microtask creation is
+deferred. The exit reporter reads the retained evidence and publishes bounded
+errors/results through Kafka; maps never travel through that callback.
 
-MNP provides **no recovery after processing-pod loss** and never automatically
-reimports a partial project. Losing the pod before the final upload can lose
-maps for committed nodes; a failed upload requires operator review. Standalone
-filesystem-state resume and uncertain-commit safeguards remain available when
-the complete local workspace is retained. Losing that workspace is not
-permission to start another import into the same project.
+MNP provides **no automatic recovery after processing-pod loss** and never
+reimports a partial project. Retained files support inspection, not automatic
+replacement-pod resume. Standalone filesystem-state resume and uncertain-commit
+safeguards remain available when the complete local workspace is retained.
+Losing that workspace is not permission to start another import into the same
+project. Successful reporting may remove the source ZIP, so a standalone rerun
+must first restore the exact checksum-matching source archive.
+
 
 The source-only benchmark performs one warm-up plus three measured trials by
 default; it creates no database connection. Use identical Python/runtime and
