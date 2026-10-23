@@ -640,8 +640,16 @@ state to skip committed work, reuse reservations and block uncertain commits.
 Metrics are observational: completed counts are reconciled with committed state
 on resume and after each batch. Loading progress advances after a batch commits.
 Cache rebuilding has a running phase in `state.json` and optional live cell
-counters in `cache-progress.json` (see measured cache progress below). The metrics `active_phase` field is not consistently
-populated by the orchestrator; most operation timings are recorded on completion.
+counters in `cache-progress.json` (see measured cache progress below).
+The orchestrator measures operation durations with its monotonic clock and
+appends completed records through `record_phase()`. This is the sole timing
+writer: the unused phase context manager, timer class, begin/finish methods and
+injected clock have been removed. Schema-1 metrics and existing timing/count
+records remain unchanged. The legacy `active_phase` field is retained only for
+compatibility; if an older interrupted run left it populated, standalone resume
+preserves its history, appends a retryable interruption record and clears it
+before new timing records are appended. Live phase progress comes from
+`state.json` and `cache-progress.json`, independently of metrics.
 All planned nodes can therefore be loaded while cache rebuilding or final
 verification is still running.
 

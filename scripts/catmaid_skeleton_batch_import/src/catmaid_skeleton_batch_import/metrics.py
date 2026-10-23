@@ -7,12 +7,10 @@ attributed reliably to one ingestion on an active CATMAID database.
 
 from __future__ import annotations
 
-import contextlib
 import copy
 import math
-import time
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Mapping
 
 from . import __version__
 from .errors import ImmutableStateError, InvalidInputError
@@ -124,15 +122,9 @@ class MetricsStore:
     never observe a partially written metrics document.
     """
 
-    def __init__(
-        self,
-        state_dir: Path,
-        *,
-        clock: Callable[[], float] | None = None,
-    ):
+    def __init__(self, state_dir: Path):
         self.state_dir = state_dir.resolve()
         self.path = self.state_dir / METRICS_FILENAME
-        self._clock = clock or time.monotonic
 
     def initialize(
         self,
@@ -284,65 +276,6 @@ class MetricsStore:
         atomic_write_json(self.path, metrics)
         return copy.deepcopy(metrics)
 
-    def begin_phase(
-        self,
-        name: str,
-        *,
-        batch_index: int | None = None,
-        batch_node_count: int | None = None,
-        batch_skeleton_count: int | None = None,
-    ) -> dict[str, Any]:
-        metrics = self.load()
-        if metrics["active_phase"] is not None:
-            raise ImmutableStateError(
-                f"Metrics already have an active phase: "
-                f"{metrics['active_phase']['name']}"
-            )
-        active = {
-            **_phase_identity(
-                name,
-                batch_index=batch_index,
-                batch_node_count=batch_node_count,
-                batch_skeleton_count=batch_skeleton_count,
-            ),
-            "status": "running",
-        }
-        metrics["active_phase"] = active
-        metrics["status"] = "in_progress"
-        atomic_write_json(self.path, metrics)
-        return copy.deepcopy(active)
-
-    def finish_phase(
-        self,
-        name: str,
-        *,
-        duration_seconds: float,
-        status: str = "complete",
-        node_count: int | None = None,
-        row_counts: Mapping[str, object] | None = None,
-        error: str | None = None,
-    ) -> dict[str, Any]:
-        metrics = self.load()
-        active = metrics["active_phase"]
-        if active is None or active["name"] != name:
-            raise ImmutableStateError(f"Phase is not active: {name}")
-        identity = {key: value for key, value in active.items() if key != "status"}
-        record = _completed_phase_record(
-            metrics,
-            identity,
-            duration_seconds=duration_seconds,
-            status=status,
-            node_count=node_count,
-            row_counts=row_counts,
-            error=error,
-        )
-        metrics["phases"].append(record)
-        metrics["active_phase"] = None
-        if status in ("failed", "operator_attention"):
-            metrics["status"] = status
-        atomic_write_json(self.path, metrics)
-        return copy.deepcopy(record)
-
     def record_phase(
         self,
         name: str,
@@ -388,7 +321,7 @@ class MetricsStore:
         return copy.deepcopy(record)
 
     def recover_active_phase(self) -> dict[str, Any] | None:
-        """Durably clear a phase left active by an interrupted process."""
+        """Retain compatibility with active timing records written by older versions."""
 
         metrics = self.load()
         active = metrics["active_phase"]
@@ -413,98 +346,3 @@ class MetricsStore:
             metrics["status"] = "in_progress"
         atomic_write_json(self.path, metrics)
         return copy.deepcopy(record)
-
-    @contextlib.contextmanager
-    def phase(
-        self,
-        name: str,
-        *,
-        batch_index: int | None = None,
-        batch_node_count: int | None = None,
-        batch_skeleton_count: int | None = None,
-        node_count: int | None = None,
-        row_counts: Mapping[str, object] | None = None,
-    ) -> Iterator["PhaseTimer"]:
-        timer = PhaseTimer(
-            self,
-            name,
-            clock=self._clock,
-            batch_index=batch_index,
-            batch_node_count=batch_node_count,
-            batch_skeleton_count=batch_skeleton_count,
-            node_count=node_count,
-            row_counts=row_counts,
-        )
-        with timer:
-            yield timer
-
-
-class PhaseTimer:
-    """Context manager recording elapsed monotonic time and attributable counts."""
-
-    def __init__(
-        self,
-        store: MetricsStore,
-        name: str,
-        *,
-        clock: Callable[[], float],
-        batch_index: int | None,
-        batch_node_count: int | None,
-        batch_skeleton_count: int | None,
-        node_count: int | None,
-        row_counts: Mapping[str, object] | None,
-    ):
-        self.store = store
-        self.name = name
-        self.clock = clock
-        self.batch_index = batch_index
-        self.batch_node_count = batch_node_count
-        self.batch_skeleton_count = batch_skeleton_count
-        self.node_count = node_count
-        self.row_counts = dict(row_counts or {})
-        self._started: float | None = None
-        self.record: dict[str, Any] | None = None
-
-    def set_counts(
-        self,
-        *,
-        node_count: int | None = None,
-        row_counts: Mapping[str, object] | None = None,
-    ) -> None:
-        if node_count is not None:
-            self.node_count = node_count
-        if row_counts is not None:
-            self.row_counts = dict(row_counts)
-
-    def __enter__(self) -> "PhaseTimer":
-        self.store.begin_phase(
-            self.name,
-            batch_index=self.batch_index,
-            batch_node_count=self.batch_node_count,
-            batch_skeleton_count=self.batch_skeleton_count,
-        )
-        self._started = self.clock()
-        return self
-
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
-        if self._started is None:
-            raise RuntimeError("Phase timer was not started")
-        elapsed = self.clock() - self._started
-        if exc is None:
-            self.record = self.store.finish_phase(
-                self.name,
-                duration_seconds=elapsed,
-                status="complete",
-                node_count=self.node_count,
-                row_counts=self.row_counts,
-            )
-        else:
-            self.record = self.store.finish_phase(
-                self.name,
-                duration_seconds=elapsed,
-                status="failed",
-                node_count=self.node_count,
-                row_counts=self.row_counts,
-                error=str(exc),
-            )
-        return False

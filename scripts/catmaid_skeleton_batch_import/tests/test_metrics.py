@@ -11,14 +11,6 @@ from catmaid_skeleton_batch_import.metrics import MetricsStore, SCHEMA_VERSION
 from catmaid_skeleton_batch_import.util import canonical_json_bytes
 
 
-class FakeClock:
-    def __init__(self, *values: float):
-        self.values = iter(values)
-
-    def __call__(self) -> float:
-        return next(self.values)
-
-
 def test_metrics_initialize_canonically_and_idempotently(tmp_path: Path) -> None:
     store = MetricsStore(tmp_path)
     metrics = store.initialize(
@@ -59,67 +51,37 @@ def test_progress_counts_are_attributable_and_monotonic(tmp_path: Path) -> None:
         store.update_progress(completed_batches=3)
 
 
-def test_phase_context_uses_monotonic_duration_and_records_batch_sizes(
-    tmp_path: Path,
-) -> None:
-    store = MetricsStore(tmp_path, clock=FakeClock(100.0, 102.25))
+def test_completed_phase_keeps_duration_and_batch_metadata(tmp_path: Path) -> None:
+    store = MetricsStore(tmp_path)
     store.initialize(planned_batches=1, planned_nodes=8, planned_skeletons=2)
-
-    with store.phase(
-        "batch.transaction",
-        batch_index=1,
-        batch_node_count=8,
-        batch_skeleton_count=2,
-    ) as phase:
-        phase.set_counts(
-            node_count=8,
-            row_counts={"treenode": 8, "treenode_edge": 8},
-        )
-
-    record = store.load()["phases"][0]
+    record = store.record_phase(
+        "batch.transaction", duration_seconds=2.25, batch_index=1,
+        batch_node_count=8, batch_skeleton_count=2, node_count=8,
+        row_counts={"treenode": 8, "treenode_edge": 8},
+    )
+    assert store.load()["phases"] == [record]
     assert record == {
-        "sequence": 1,
-        "name": "batch.transaction",
-        "batch_index": 1,
-        "batch_node_count": 8,
-        "batch_skeleton_count": 2,
-        "status": "complete",
-        "duration_seconds": 2.25,
-        "node_count": 8,
+        "sequence": 1, "name": "batch.transaction", "batch_index": 1,
+        "batch_node_count": 8, "batch_skeleton_count": 2, "status": "complete",
+        "duration_seconds": 2.25, "node_count": 8,
         "row_counts": {"treenode": 8, "treenode_edge": 8},
     }
-    assert phase.record == record
 
 
-def test_failed_phase_is_recorded_and_exception_is_not_swallowed(tmp_path: Path) -> None:
-    store = MetricsStore(tmp_path, clock=FakeClock(10.0, 10.5))
+def test_failed_phase_keeps_failure_details(tmp_path: Path) -> None:
+    store = MetricsStore(tmp_path)
     store.initialize()
-
-    with pytest.raises(RuntimeError, match="database unavailable"):
-        with store.phase("project.create"):
-            raise RuntimeError("database unavailable")
-
+    record = store.record_phase(
+        "project.create", duration_seconds=0.5, status="failed",
+        error="database unavailable",
+    )
     metrics = store.load()
     assert metrics["active_phase"] is None
     assert metrics["status"] == "failed"
-    assert metrics["phases"][0]["status"] == "failed"
-    assert metrics["phases"][0]["duration_seconds"] == 0.5
-    assert metrics["phases"][0]["error"] == "database unavailable"
-
-
-def test_active_phase_is_orchestrator_visible(tmp_path: Path) -> None:
-    store = MetricsStore(tmp_path)
-    store.initialize()
-    active = store.begin_phase("archive.scan", batch_node_count=100)
-
-    assert active == {
-        "name": "archive.scan",
-        "status": "running",
-        "batch_node_count": 100,
-    }
-    assert store.load()["active_phase"] == active
-    with pytest.raises(ImmutableStateError, match="already have an active phase"):
-        store.begin_phase("another.phase")
+    assert metrics["phases"] == [record]
+    assert record["status"] == "failed"
+    assert record["duration_seconds"] == 0.5
+    assert record["error"] == "database unavailable"
 
 
 def test_direct_phase_record_and_status_contract(tmp_path: Path) -> None:
@@ -144,13 +106,17 @@ def test_direct_phase_record_does_not_create_an_active_checkpoint(
     store = MetricsStore(tmp_path)
     store.initialize()
 
-    def unexpected(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("record_phase must not use begin_phase or finish_phase")
+    from catmaid_skeleton_batch_import import metrics as metrics_module
+    write = metrics_module.atomic_write_json
+    writes = []
 
-    monkeypatch.setattr(store, "begin_phase", unexpected)
-    monkeypatch.setattr(store, "finish_phase", unexpected)
+    def observe_write(path, value):
+        writes.append(path)
+        write(path, value)
+
+    monkeypatch.setattr(metrics_module, "atomic_write_json", observe_write)
     record = store.record_phase("archive.hash", duration_seconds=0.25)
-
+    assert writes == [store.path]
     assert record["status"] == "complete"
     assert store.load()["active_phase"] is None
 
@@ -160,12 +126,14 @@ def test_interrupted_active_phase_is_recovered_durably_and_idempotently(
 ) -> None:
     store = MetricsStore(tmp_path)
     store.initialize(planned_batches=1, planned_nodes=8, planned_skeletons=2)
-    store.begin_phase(
-        "batch.transaction",
-        batch_index=1,
-        batch_node_count=8,
-        batch_skeleton_count=2,
-    )
+    # Reproduce a historical schema-1 file without using the retired timing API.
+    historical = store.record_phase("archive.scan", duration_seconds=1.5)
+    metrics = store.load()
+    metrics["active_phase"] = {
+        "name": "batch.transaction", "status": "running", "batch_index": 1,
+        "batch_node_count": 8, "batch_skeleton_count": 2,
+    }
+    store.path.write_bytes(canonical_json_bytes(metrics))
 
     recovered = MetricsStore(tmp_path).recover_active_phase()
     assert recovered is not None
@@ -175,9 +143,11 @@ def test_interrupted_active_phase_is_recovered_durably_and_idempotently(
     assert recovered["node_count"] == 8
     metrics = store.load()
     assert metrics["active_phase"] is None
-    assert metrics["phases"] == [recovered]
+    assert metrics["phases"] == [historical, recovered]
     assert MetricsStore(tmp_path).recover_active_phase() is None
-    assert store.load()["phases"] == [recovered]
+    assert store.load()["phases"] == [historical, recovered]
+    current = store.record_phase("batch.transaction", duration_seconds=2.0)
+    assert store.load()["phases"] == [historical, recovered, current]
 
 
 def test_effective_operational_settings_are_recorded_per_run(tmp_path: Path) -> None:
