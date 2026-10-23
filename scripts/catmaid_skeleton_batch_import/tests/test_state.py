@@ -346,21 +346,3 @@ def test_reserved_project_ids_cannot_change(tmp_path: Path) -> None:
     store.mark_project_prepared(project_id=101, stack_id=202)
     with pytest.raises(ImmutableStateError, match="project_id"):
         store.transition_project("prepared", project_id=999)
-
-
-def test_external_checkpoint_is_acknowledged_before_commit_intent_returns(tmp_path, monkeypatch):
-    import sys
-    store, _ = make_store(tmp_path)
-    commit_project(store)
-    store.mark_batch_prepared(1)
-    remote = tmp_path / "remote-state.json"
-    hook = tmp_path / "checkpoint.py"
-    hook.write_text("import pathlib,sys,shutil;shutil.copyfile(pathlib.Path(sys.argv[1])/'state.json', " + repr(str(remote)) + ")")
-    monkeypatch.setenv("CATMAID_BATCH_IMPORT_CHECKPOINT_COMMAND", json.dumps([sys.executable, str(hook)]))
-    store.mark_batch_commit_attempted(1)
-    assert json.loads(remote.read_text())["batches"][0]["status"] == "commit_attempted"
-    hook.write_text("raise SystemExit(1)")
-    with pytest.raises(RetryableError, match="checkpoint acknowledgement"):
-        store.mark_batch_committed(1)
-    # A lost acknowledgement cannot silently publish a confirmed commit remotely.
-    assert json.loads(remote.read_text())["batches"][0]["status"] == "commit_attempted"

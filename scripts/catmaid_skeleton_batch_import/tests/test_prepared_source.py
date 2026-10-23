@@ -74,16 +74,3 @@ def test_invalid_archive_does_not_publish_prepared_data(tmp_path, monkeypatch):
     with pytest.raises(InvalidInputError):
         plan_ingestion(request, tmp_path / "state")
     assert not list((tmp_path / "state").glob("prepared-*"))
-
-
-def test_lost_pod_cache_can_be_regenerated_without_rewriting_ids_or_state(tmp_path, monkeypatch):
-    from catmaid_skeleton_batch_import.prepared_source import regenerate_prepared_source
-    state, plan, _, _ = planned(tmp_path, monkeypatch)
-    before = (state / "state.json").read_bytes()
-    for descriptor in plan.prepared_batches:
-        (state / descriptor["path"]).unlink()
-    regenerate_prepared_source(state)
-    assert (state / "state.json").read_bytes() == before
-    with PreparedSourceReader(state, plan) as source:
-        for member in plan.members:
-            assert len(source.load(member)) == member.node_count

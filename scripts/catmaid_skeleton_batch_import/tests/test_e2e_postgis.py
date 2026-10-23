@@ -496,3 +496,55 @@ def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_c
     assert new_row["fragment_id"] == imported["fragment_id"]
     assert new_row["skeleton_id"] != imported["skeleton_id"]
     assert old_derived_rows() == old_derived
+
+
+@pytest.mark.parametrize("failure_phase", ["stage", "committed"])
+def test_node_map_transport_guards_batch_writes(
+    tmp_path, monkeypatch, isolated_database, failure_phase,
+):
+    from catmaid_skeleton_batch_import import provenance
+    from catmaid_skeleton_batch_import.errors import RetryableError, OperatorAttentionError
+    from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, run_ingestion
+    from catmaid_skeleton_batch_import.state import StateStore
+
+    archive_path = tmp_path / "input.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        for name in ("alpha", "beta"):
+            archive.writestr(name + ".swc", "1 1 1 1 1 1 -1\n2 3 2 1 1 1 1\n")
+    request = tmp_path / "request.json"
+    request.write_text(json.dumps({"schema_version": 1, "source": {
+        "archive_path": str(archive_path), "coordinate_unit": "um"},
+        "stack": {"dimension": [100] * 3, "resolution_nm": [1000] * 3}}))
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("CATMAID_BATCH_IMPORT_MAX_NODES_PER_BATCH", "2")
+    plan_ingestion(request, state_dir)
+    observed = []
+
+    def transport(directory, index, *, committed=False):
+        state = StateStore(directory).load()
+        descriptor = state["batches"][index - 1]["artifacts"]["node_map"]
+        with gzip.open(directory / descriptor["path"], "rt") as source:
+            ids = [int(row["treenode_id"]) for row in csv.DictReader(source)]
+        with isolated_database.cursor() as cursor:
+            cursor.execute("SELECT count(*) FROM treenode WHERE id=ANY(%s::bigint[])", [ids])
+            assert cursor.fetchone()[0] == (2 if committed else 0)
+        phase = "committed" if committed else "stage"
+        observed.append((index, phase))
+        if index == 2 and phase == failure_phase:
+            error = OperatorAttentionError if committed else RetryableError
+            raise error("injected mapping transport failure")
+
+    monkeypatch.setattr(provenance, "publish_node_map", transport)
+    error = OperatorAttentionError if failure_phase == "committed" else RetryableError
+    with pytest.raises(error, match="injected mapping transport failure"):
+        run_ingestion(state_dir)
+    state = StateStore(state_dir).load()
+    assert state["batches"][0]["status"] == "committed"
+    assert state["batches"][1]["status"] == ("committed" if failure_phase == "committed" else "retryable")
+    assert observed[:2] == [(1, "stage"), (1, "committed")]
+    if failure_phase == "committed":
+        with pytest.raises(OperatorAttentionError):
+            run_ingestion(state_dir)
+    else:
+        monkeypatch.setattr(provenance, "publish_node_map", lambda *args, **kwargs: None)
+        assert run_ingestion(state_dir)["nodes"] == 4
