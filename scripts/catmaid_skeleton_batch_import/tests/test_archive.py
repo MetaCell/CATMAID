@@ -33,7 +33,6 @@ def settings(**overrides: int | None) -> ImportSettings:
         "max_nodes_per_batch": 10,
         "max_archive_bytes": 1_000_000,
         "max_swc_bytes": 100_000,
-        "max_swc_count": 10,
         "max_total_nodes": None,
         "cache_cell_size_nm": 1_500_000,
         "lod_levels": 7,
@@ -126,7 +125,6 @@ def test_rejects_encrypted_member_before_opening(tmp_path: Path) -> None:
     [
         ({"max_archive_bytes": 1}, "archive is"),
         ({"max_swc_bytes": 1}, "limit is 1"),
-        ({"max_swc_count": 1}, "more than 1 SWC"),
         ({"max_total_nodes": 3}, "total node limit 3"),
         ({"max_nodes_per_batch": 1}, "exceeds 1 nodes"),
     ],
@@ -277,3 +275,26 @@ def test_reports_member_metadata_errors_and_fragment_collisions_together(tmp_pat
     assert "not a regular file" in errors["bad-link.swc"]
     assert "no SWC nodes" in errors["empty.swc"]
     assert "limit is 90" in errors["oversize.swc"]
+
+
+def test_collect_swc_infos_accepts_more_than_the_previous_file_count_limit():
+    from catmaid_skeleton_batch_import.archive import _collect_swc_infos
+    from types import SimpleNamespace
+    count = 250_001
+    archive = SimpleNamespace(infolist=lambda: (zipfile.ZipInfo(f"{i:06d}.swc") for i in range(count)))
+    infos = _collect_swc_infos(archive)
+    assert len(infos) == count
+    assert infos[0].filename == "000000.swc"
+    assert infos[-1].filename == "250000.swc"
+
+
+def test_scan_and_plan_do_not_limit_files_to_the_batch_node_budget(tmp_path):
+    from catmaid_skeleton_batch_import.planner import plan_archive
+    archive = tmp_path / "many-small.swc.zip"
+    write_zip(archive, [(f"{i}.swc", VALID_SWC) for i in range(101)])
+    scanned = scan_archive(request(archive), settings(max_nodes_per_batch=10))
+    plan = plan_archive(scanned, settings(max_nodes_per_batch=10))
+    assert scanned.swc_count == 101
+    assert plan.member_count == 101
+    assert len(plan.batches) > 1
+    assert all(batch.node_count <= 10 for batch in plan.batches)

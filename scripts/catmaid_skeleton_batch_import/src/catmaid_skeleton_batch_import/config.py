@@ -17,7 +17,6 @@ SETTING_NAMES = {
     "max_nodes_per_batch": "CATMAID_BATCH_IMPORT_MAX_NODES_PER_BATCH",
     "max_archive_bytes": "CATMAID_BATCH_IMPORT_MAX_ARCHIVE_BYTES",
     "max_swc_bytes": "CATMAID_BATCH_IMPORT_MAX_SWC_BYTES",
-    "max_swc_count": "CATMAID_BATCH_IMPORT_MAX_SWC_COUNT",
     "max_total_nodes": "CATMAID_BATCH_IMPORT_MAX_TOTAL_NODES",
     "cache_cell_size_nm": "CATMAID_BATCH_IMPORT_CACHE_CELL_SIZE_NM",
     "lod_levels": "CATMAID_BATCH_IMPORT_LOD_LEVELS",
@@ -32,7 +31,6 @@ DEFAULTS: dict[str, int | str | None] = {
     "max_nodes_per_batch": 250_000,
     "max_archive_bytes": 2 * 1024**3,
     "max_swc_bytes": 2 * 1024**3,
-    "max_swc_count": 250_000,
     "max_total_nodes": None,
     "cache_cell_size_nm": 1_500_000,
     "lod_levels": 1,
@@ -233,6 +231,11 @@ def settings_from_state(
     plan_values: dict[str, Any], operational: dict[str, int]
 ) -> ImportSettings:
     """Combine immutable planned settings with current operational timeouts."""
+    # Earlier state files retain this obsolete immutable key. Ignore it at
+    # execution time without changing their recorded settings or digests.
+    plan_values = {
+        key: value for key, value in plan_values.items() if key != "max_swc_count"
+    }
     return ImportSettings(
         **plan_values,
         statement_timeout_ms=operational["statement_timeout_ms"],

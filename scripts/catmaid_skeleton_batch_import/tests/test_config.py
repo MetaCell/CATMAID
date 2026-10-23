@@ -81,7 +81,6 @@ def test_settings_use_module_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
         "CATMAID_BATCH_IMPORT_MAX_NODES_PER_BATCH",
         "CATMAID_BATCH_IMPORT_MAX_ARCHIVE_BYTES",
         "CATMAID_BATCH_IMPORT_MAX_SWC_BYTES",
-        "CATMAID_BATCH_IMPORT_MAX_SWC_COUNT",
         "CATMAID_BATCH_IMPORT_MAX_TOTAL_NODES",
         "CATMAID_BATCH_IMPORT_CACHE_CELL_SIZE_NM",
         "CATMAID_BATCH_IMPORT_LOD_LEVELS",
@@ -119,7 +118,7 @@ def test_run_resolves_only_operational_timeout_settings(
 ) -> None:
     monkeypatch.delenv("DJANGO_SETTINGS_MODULE", raising=False)
     monkeypatch.setenv("CATMAID_BATCH_IMPORT_LOD_STRATEGY", "not-a-strategy")
-    monkeypatch.setenv("CATMAID_BATCH_IMPORT_MAX_SWC_COUNT", "not-an-integer")
+    monkeypatch.setenv("CATMAID_BATCH_IMPORT_MAX_NODES_PER_BATCH", "not-an-integer")
     monkeypatch.setenv("CATMAID_BATCH_IMPORT_STATEMENT_TIMEOUT_MS", "123")
     monkeypatch.setenv("CATMAID_BATCH_IMPORT_LOCK_TIMEOUT_MS", "456")
 
@@ -127,3 +126,21 @@ def test_run_resolves_only_operational_timeout_settings(
         "statement_timeout_ms": 123,
         "lock_timeout_ms": 456,
     }
+
+
+def test_removed_swc_count_environment_setting_has_no_effect(monkeypatch):
+    monkeypatch.delenv("DJANGO_SETTINGS_MODULE", raising=False)
+    monkeypatch.setenv("CATMAID_BATCH_IMPORT_MAX_SWC_COUNT", "1")
+    settings = load_settings()
+    assert not hasattr(settings, "max_swc_count")
+    assert "max_swc_count" not in settings.plan_dict()
+
+
+def test_legacy_settings_are_read_without_rewriting_obsolete_metadata(monkeypatch):
+    from catmaid_skeleton_batch_import.config import settings_from_state
+    monkeypatch.delenv("DJANGO_SETTINGS_MODULE", raising=False)
+    settings = load_settings()
+    legacy = {**settings.plan_dict(), "max_swc_count": 1}
+    restored = settings_from_state(legacy, settings.operational_dict())
+    assert restored == settings
+    assert legacy["max_swc_count"] == 1

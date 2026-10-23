@@ -55,7 +55,6 @@ class ImportSettings:
     max_nodes_per_batch: int
     max_archive_bytes: int
     max_swc_bytes: int
-    max_swc_count: int
     max_total_nodes: int | None
     cache_cell_size_nm: int
     lod_levels: int
@@ -70,7 +69,6 @@ class ImportSettings:
             "max_nodes_per_batch": self.max_nodes_per_batch,
             "max_archive_bytes": self.max_archive_bytes,
             "max_swc_bytes": self.max_swc_bytes,
-            "max_swc_count": self.max_swc_count,
             "max_total_nodes": self.max_total_nodes,
             "cache_cell_size_nm": self.cache_cell_size_nm,
             "lod_levels": self.lod_levels,

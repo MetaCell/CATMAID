@@ -79,7 +79,7 @@ Planning checks every readable SWC and reports all invalid files together in
 
 An invalid archive produces no executable plan, even if some SWCs are valid.
 Fix the reported files and rerun `plan`. Archive-wide failures such as an
-unreadable ZIP, duplicate ZIP paths, encryption, or archive/count limits still
+unreadable ZIP, duplicate ZIP paths, encryption, or archive-size limits still
 stop immediately; per-file size/type checks and fragment-ID collisions are
 reported with the other member errors.
 
@@ -549,7 +549,6 @@ environment variables, then defaults; other values come from the saved plan:
 | `CATMAID_BATCH_IMPORT_MAX_NODES_PER_BATCH` | `250000` |
 | `CATMAID_BATCH_IMPORT_MAX_ARCHIVE_BYTES` | `2147483648` (2 GiB) |
 | `CATMAID_BATCH_IMPORT_MAX_SWC_BYTES` | `2147483648` (2 GiB) |
-| `CATMAID_BATCH_IMPORT_MAX_SWC_COUNT` | `250000` |
 | `CATMAID_BATCH_IMPORT_MAX_TOTAL_NODES` | disabled |
 | `CATMAID_BATCH_IMPORT_CACHE_CELL_SIZE_NM` | `1500000` |
 | `CATMAID_BATCH_IMPORT_LOD_LEVELS` | `1` |
@@ -557,6 +556,12 @@ environment variables, then defaults; other values come from the saved plan:
 | `CATMAID_BATCH_IMPORT_LOD_STRATEGY` | `quadratic` |
 | `CATMAID_BATCH_IMPORT_STATEMENT_TIMEOUT_MS` | `0` |
 | `CATMAID_BATCH_IMPORT_LOCK_TIMEOUT_MS` | `30000` |
+
+There is no SWC file-count cap. The ZIP size, each SWC's uncompressed byte
+limit and the per-batch node budget remain enforced. The former
+`CATMAID_BATCH_IMPORT_MAX_SWC_COUNT` environment variable is ignored. Existing
+state files may retain `max_swc_count`; it is ignored at execution time without
+rewriting their immutable settings, reserved IDs or plan digests.
 
 For newly created projects, the default cache is one 1.5 mm XY MessagePack grid with a single LOD bucket.
 The viewer requests the sole spatial profile at 100% LOD, so the bucket contains

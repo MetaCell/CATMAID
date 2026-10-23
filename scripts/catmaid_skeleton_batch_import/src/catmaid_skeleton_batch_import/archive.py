@@ -104,9 +104,7 @@ def _is_regular_zip_member(info: zipfile.ZipInfo) -> bool:
     return file_type == 0 or stat.S_ISREG(mode)
 
 
-def _collect_swc_infos(
-    archive: zipfile.ZipFile, settings: ImportSettings
-) -> list[zipfile.ZipInfo]:
+def _collect_swc_infos(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
     seen_names: set[str] = set()
     swc_infos: list[zipfile.ZipInfo] = []
     for info in archive.infolist():
@@ -122,10 +120,6 @@ def _collect_swc_infos(
         if not info.filename.lower().endswith(".swc"):
             continue
         swc_infos.append(info)
-        if len(swc_infos) > settings.max_swc_count:
-            raise InvalidInputError(
-                f"Archive contains more than {settings.max_swc_count} SWC members"
-            )
     if not swc_infos:
         raise InvalidInputError("Archive contains no regular .swc members")
     return sorted(swc_infos, key=lambda info: info.filename)
@@ -157,7 +151,7 @@ def scan_archive(
     total_nodes = 0
     try:
         with zipfile.ZipFile(archive_path, "r") as archive:
-            infos = _collect_swc_infos(archive, settings)
+            infos = _collect_swc_infos(archive)
             for info in infos:
                 label = f"{archive_path.name}:{info.filename}"
                 try:

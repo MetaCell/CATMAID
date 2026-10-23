@@ -169,16 +169,22 @@ def plan_ingestion(request_path: Path, state_dir: Path) -> dict[str, object]:
         geometry = _planning_geometry(request, store)
         bounds = geometry_bounds(geometry) if geometry is not None else None
 
+        plan_settings = settings.plan_dict()
         if store.state_path.exists():
             state = store.verify_immutable()
             if not _same_normalized_request(request, store):
                 raise ImmutableStateError(
                     "Existing state directory contains a different normalized request"
                 )
-            if state["settings"] != settings.plan_dict():
+            persisted_settings = settings_from_state(
+                state["settings"], settings.operational_dict()
+            )
+            if persisted_settings.plan_dict() != settings.plan_dict():
                 raise ImmutableStateError(
                     "Existing state directory was planned with different deployment settings"
                 )
+            # Preserve every immutable legacy key when completing plan setup.
+            plan_settings = state["settings"]
             if "plan" in state.get("artifacts", {}):
                 store.verify_artifact("plan")
                 if geometry is None or "stack_geometry" in state.get("artifacts", {}):
@@ -207,7 +213,7 @@ def plan_ingestion(request_path: Path, state_dir: Path) -> dict[str, object]:
         state = store.initialize_plan(
             request,
             _archive_metadata(scan),
-            settings,
+            plan_settings,
             plan.batches,
             plan_digest=plan_digest,
             planner_version=plan.schema_version,

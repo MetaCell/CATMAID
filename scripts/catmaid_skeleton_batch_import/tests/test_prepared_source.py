@@ -74,3 +74,21 @@ def test_invalid_archive_does_not_publish_prepared_data(tmp_path, monkeypatch):
     with pytest.raises(InvalidInputError):
         plan_ingestion(request, tmp_path / "state")
     assert not list((tmp_path / "state").glob("prepared-*"))
+
+
+def test_legacy_file_count_metadata_survives_idempotent_planning(tmp_path, monkeypatch):
+    from catmaid_skeleton_batch_import.config import load_operational_settings, settings_from_state
+    from catmaid_skeleton_batch_import.state import StateStore
+    state_dir, plan, _text, request = planned(tmp_path, monkeypatch)
+    store = StateStore(state_dir)
+    state = store.load()
+    # Simulate a plan made before removal, preserving its old immutable setting.
+    state["settings"]["max_swc_count"] = 250_000
+    store._persist(state)
+    before = store.state_path.read_bytes()
+    result = plan_ingestion(request, state_dir)
+    assert result["ok"]
+    assert store.state_path.read_bytes() == before
+    restored = settings_from_state(store.load()["settings"], load_operational_settings())
+    assert "max_swc_count" not in restored.plan_dict()
+    assert read_plan(state_dir / "plan.jsonl.gz") == plan
