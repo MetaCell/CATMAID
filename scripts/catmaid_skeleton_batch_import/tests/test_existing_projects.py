@@ -510,3 +510,50 @@ def test_old_project_contexts_remain_readable():
     value.update(stack_id=2, project_stack_id=3)
     assert ProjectContext.from_dict(value).existing_project is False
     assert ProjectContext.from_dict(ProjectContext.from_dict(CONTEXT).to_dict()).existing_project is True
+
+
+@pytest.mark.parametrize("interrupted", [False, True], ids=["explicit-rebuild", "resume"])
+def test_cache_observation_is_reset_before_coverage_planning(tmp_path, monkeypatch, interrupted):
+    connection = Connection()
+    configure_run(monkeypatch, connection)
+    state_dir = tmp_path / "state"
+    plan_append(request_file(tmp_path), state_dir)
+    commits = []
+
+    def commit(prepared, _context, _settings, before_commit, _timings):
+        commits.append(prepared.batch.index)
+        before_commit()
+        return dict(COUNTS)
+
+    monkeypatch.setattr(orchestrator, "execute_batch_transaction", commit)
+    monkeypatch.setattr(loader, "verify_exact_treenodes", lambda *_args: None)
+    assert orchestrator.run_ingestion(state_dir)["status"] == "complete"
+
+    observation_path = state_dir / "cache-progress.json"
+    previous = {"schema_version": 1, "completed": 90, "total": 90}
+    observation_path.write_text(json.dumps(previous))
+    # A completed import that only verifies must not reset diagnostic counters.
+    assert orchestrator.run_ingestion(state_dir)["status"] == "complete"
+    assert json.loads(observation_path.read_text()) == previous
+
+    store = StateStore(state_dir)
+    if interrupted:
+        store.prepare_cache_rebuild(reset_plan=True)
+        store.mark_phase_running("cache")
+        store.mark_phase_retryable("cache", "interrupted coverage planning")
+
+    original_plan = offline_cache.OfflineGridCache.plan
+    observations = []
+
+    def check_before_planning(cache):
+        assert store.load()["phases"]["cache"]["status"] == "running"
+        current = json.loads(observation_path.read_text())
+        observations.append(current)
+        assert current == {"schema_version": 1, "completed": 0, "total": 0}
+        return original_plan(cache)
+
+    monkeypatch.setattr(offline_cache.OfflineGridCache, "plan", check_before_planning)
+    assert orchestrator.run_ingestion(state_dir, rebuild_cache=not interrupted)["status"] == "complete"
+    assert len(observations) == 1
+    assert commits == [1]
+    assert store.load()["phases"]["verification"]["status"] == "complete"

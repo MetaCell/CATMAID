@@ -760,7 +760,10 @@ Cache rebuilding optionally writes `state/cache-progress.json` containing
 `schema_version: 1`, `completed` and `total`. Total is the sum of the planned
 cell ranges across all configured grids. Completed increments only after a cell
 refresh succeeds, including empty cells that intentionally leave no stored row.
-It resets to zero when a rebuild starts. No configured coverage reports 0/0.
+Before a cache attempt starts, the orchestrator resets the observation to 0/0,
+including before potentially slow coverage planning. Once coverage is known,
+rebuilding publishes 0/total and then successful cell counts. A completed
+import that only verifies retains its counters. No configured coverage reports 0/0.
 
 This bounded observational file is replaced atomically at most once per second,
 plus the initial and final updates. A progress-file IO failure is nonfatal.

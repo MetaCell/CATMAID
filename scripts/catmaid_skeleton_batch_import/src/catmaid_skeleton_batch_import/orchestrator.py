@@ -25,6 +25,7 @@ from .artifacts import (
     write_manifest,
     write_node_map,
 )
+from .cache_progress import CacheProgressWriter
 from .config import (
     load_operational_settings,
     load_request,
@@ -1338,18 +1339,20 @@ def run_ingestion(
         )
         # Interrupted cache phases restart from their saved coverage plan.
         cache_state = store.load()
+        cache_progress = CacheProgressWriter(store.state_dir)
         if (rebuild_cache or cache_state["phases"]["cache"]["status"] != "complete"
                 or "cache_rebuild" not in cache_state["artifacts"]):
             _progress("Invalidating cache and verification checkpoints")
             store.prepare_cache_rebuild(reset_plan=rebuild_cache)
+            # Clear the old attempt before marking cache running or planning coverage.
+            cache_progress(0, 0)
         def build_cache() -> Mapping[str, Any]:
             state = store.load()
             if "cache_plan" not in state["artifacts"]:
                 _write_registered_json(store, "cache_plan", "cache-plan.json", grid_cache.plan())
             cache_plan = load_json(_artifact_path(store, store.load(), "cache_plan"))
-            from .cache_progress import CacheProgressWriter
             receipt = grid_cache.rebuild(
-                log=_progress, plan=cache_plan, progress=CacheProgressWriter(store.state_dir),
+                log=_progress, plan=cache_plan, progress=cache_progress,
             )
             _write_registered_json(
                 store, "cache_rebuild", "cache-rebuild.json", receipt,
