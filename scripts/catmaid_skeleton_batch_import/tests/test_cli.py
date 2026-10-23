@@ -6,7 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from catmaid_skeleton_batch_import import cli, orchestrator
-from catmaid_skeleton_batch_import.errors import VerificationError
+from catmaid_skeleton_batch_import.errors import InvalidInputError, VerificationError
 from catmaid_skeleton_batch_import.util import atomic_write_json
 
 
@@ -40,6 +40,9 @@ def test_failure_result_is_json_safe_and_replaces_stale_success(
         "path": "artifact.json",
     }
     assert json.loads((state_dir / "result.json").read_text()) == result
+    assert result["error"]["details_file"] == "error-details.json"
+    diagnostics = json.loads((state_dir / "error-details.json").read_text())
+    assert diagnostics["error"]["details"] == result["error"]["details"]
 
 
 def test_argument_error_has_stable_versioned_json(capsys) -> None:
@@ -127,7 +130,90 @@ def test_invalid_archive_reports_all_members_without_writing_a_partial_plan(
     result = json.loads(capsys.readouterr().out)
     assert result["error"]["category"] == "invalid_input"
     assert result["error"]["details"]["invalid_swc_count"] == 2
+    assert "member_errors" not in result["error"]["details"]
+    diagnostics = json.loads((state_dir / result["error"]["details_file"]).read_text())
     assert [error["member_path"] for error in
-            result["error"]["details"]["member_errors"]] == ["a.swc", "b.swc"]
+            diagnostics["error"]["details"]["member_errors"]] == ["a.swc", "b.swc"]
     assert not (state_dir / "plan.jsonl.gz").exists()
     assert not (state_dir / "state.json").exists()
+
+
+def test_large_validation_result_keeps_every_error_outside_the_terminal_summary(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    errors = [
+        {"member_path": f"fragment-{i:06d}.swc", "message": "missing parent 9999 " * 5}
+        for i in range(30000)
+    ]
+
+    def fail(*_args):
+        raise InvalidInputError(
+            "30000 SWC file(s) failed validation. First error: missing parent 9999",
+            details={"invalid_swc_count": len(errors), "member_errors": errors},
+        )
+
+    monkeypatch.setattr(orchestrator, "plan_ingestion", fail)
+    assert cli.execute(["plan", "--request", str(tmp_path / "request.json"),
+                        "--state-dir", str(state_dir)]) == 2
+    stdout = capsys.readouterr().out
+    result = json.loads(stdout)
+    assert len(stdout.encode()) < 16 * 1024
+    assert (state_dir / "result.json").stat().st_size < 16 * 1024
+    assert result["error"]["category"] == "invalid_input"
+    assert result["error"]["details"] == {"invalid_swc_count": 30000}
+    assert "missing parent 9999" in result["error"]["message"]
+    diagnostics = state_dir / result["error"]["details_file"]
+    assert diagnostics.stat().st_size > 4 * 1024 * 1024
+    assert json.loads(diagnostics.read_text())["error"]["details"]["member_errors"] == errors
+    assert json.loads((state_dir / "result.json").read_text()) == result
+
+
+def test_large_generic_diagnostics_and_message_do_not_expand_terminal_result(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    message = "verification mismatch " * 1000
+    details = {"unexpected_nodes": list(range(100000))}
+
+    def fail(*_args, **_kwargs):
+        raise VerificationError(message, details=details)
+
+    monkeypatch.setattr(orchestrator, "run_ingestion", fail)
+    assert cli.execute(["run", "--state-dir", str(state_dir)]) == 6
+    result = json.loads(capsys.readouterr().out)
+    assert len(result["error"]["message"]) == cli.MAX_ERROR_MESSAGE_CHARS
+    assert result["error"]["details"] == {}
+    assert (state_dir / "result.json").stat().st_size < 16 * 1024
+    diagnostics = json.loads((state_dir / result["error"]["details_file"]).read_text())
+    assert diagnostics["error"]["message"] == message
+    assert diagnostics["error"]["details"] == details
+
+
+def test_diagnostic_write_failure_still_reports_original_error(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    write = cli.atomic_write_json
+
+    def disk_failure(path, value):
+        if path.name == cli.ERROR_DETAILS_FILENAME:
+            raise OSError("no space for full diagnostics")
+        write(path, value)
+
+    def fail(*_args, **_kwargs):
+        raise InvalidInputError("missing parent 9999")
+
+    monkeypatch.setattr(cli, "atomic_write_json", disk_failure)
+    monkeypatch.setattr(orchestrator, "run_ingestion", fail)
+    assert cli.execute(["run", "--state-dir", str(state_dir)]) == 2
+    output = capsys.readouterr()
+    result = json.loads(output.out)
+    assert result["error"]["category"] == "invalid_input"
+    assert result["error"]["message"] == "missing parent 9999"
+    assert "details_file" not in result["error"]
+    assert "Could not persist full failure details" in output.err
+    assert json.loads((state_dir / "result.json").read_text()) == result

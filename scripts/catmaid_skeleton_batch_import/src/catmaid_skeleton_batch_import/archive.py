@@ -238,7 +238,7 @@ def scan_archive(
                   for path, message in sorted(member_errors.items())]
         raise InvalidInputError(
             f"{len(errors)} SWC file(s) failed validation; "
-            f"see error.details.member_errors. First error: {errors[0]['message']}",
+            f"see error-details.json for all files. First error: {errors[0]['message']}",
             details={"invalid_swc_count": len(errors), "member_errors": errors},
         )
 

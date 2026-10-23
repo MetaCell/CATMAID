@@ -13,7 +13,12 @@ from typing import Sequence
 
 from . import __version__
 from .errors import ImporterError, InvalidInputError, RetryableError
-from .util import atomic_write_json
+from .util import atomic_write_json, canonical_json_bytes
+
+
+MAX_ERROR_MESSAGE_CHARS = 2000
+MAX_ERROR_DETAILS_BYTES = 8 * 1024
+ERROR_DETAILS_FILENAME = "error-details.json"
 
 
 class ImportArgumentParser(argparse.ArgumentParser):
@@ -80,6 +85,13 @@ def _error_result(
     command: str | None,
     state_dir: Path | None,
 ) -> dict[str, object]:
+    # Per-member errors can be larger than the caller's result-file limit.
+    # Keep only small metadata here; full diagnostics are persisted separately.
+    details = _json_safe({
+        key: value for key, value in exc.details.items() if key != "member_errors"
+    })
+    if len(canonical_json_bytes(details)) > MAX_ERROR_DETAILS_BYTES:
+        details = {}
     result: dict[str, object] = {
         "schema_version": 1,
         "ok": False,
@@ -87,8 +99,8 @@ def _error_result(
         "importer_version": __version__,
         "error": {
             "category": exc.category,
-            "message": str(exc),
-            "details": _json_safe(exc.details),
+            "message": str(exc)[:MAX_ERROR_MESSAGE_CHARS],
+            "details": details,
         },
     }
     if state_dir is not None:
@@ -96,9 +108,24 @@ def _error_result(
     return result
 
 
-def _persist_error(state_dir: Path | None, result: dict[str, object]) -> None:
+def _persist_error(
+    state_dir: Path | None, result: dict[str, object], error: ImporterError
+) -> None:
     if state_dir is None or not state_dir.is_dir():
         return
+    try:
+        atomic_write_json(state_dir / ERROR_DETAILS_FILENAME, {
+            "schema_version": 1,
+            "command": result["command"],
+            "error": {
+                "category": error.category,
+                "message": str(error),
+                "details": _json_safe(error.details),
+            },
+        })
+        result["error"]["details_file"] = ERROR_DETAILS_FILENAME
+    except OSError as exc:
+        print(f"Could not persist full failure details: {exc}", file=sys.stderr)
     try:
         atomic_write_json(state_dir / "result.json", _json_safe(result))
     except OSError as exc:
@@ -128,14 +155,14 @@ def execute(argv: Sequence[str] | None = None) -> int:
     except ImporterError as exc:
         print(str(exc), file=sys.stderr)
         result = _error_result(exc, command=command, state_dir=state_dir)
-        _persist_error(state_dir, result)
+        _persist_error(state_dir, result, exc)
         _emit(result)
         return exc.exit_code
     except KeyboardInterrupt:
         exc = RetryableError("Interrupted")
         print(str(exc), file=sys.stderr)
         result = _error_result(exc, command=command, state_dir=state_dir)
-        _persist_error(state_dir, result)
+        _persist_error(state_dir, result, exc)
         _emit(result)
         return exc.exit_code
     except Exception as exc:
@@ -146,7 +173,7 @@ def execute(argv: Sequence[str] | None = None) -> int:
             command=command,
             state_dir=state_dir,
         )
-        _persist_error(state_dir, result)
+        _persist_error(state_dir, result, failure)
         _emit(result)
         return 1
 

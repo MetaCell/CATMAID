@@ -64,18 +64,43 @@ and the unchanged local input files recorded there. Run the command from a
 CATMAID application environment where `mysite.settings` and the `catmaid`
 package are importable.
 
-Planning checks every readable SWC and reports all invalid files together in
-`error.details.member_errors`, with one useful reason per file. For example:
+Planning checks every readable SWC and reports all invalid files together.
+The CLI stdout and `state/result.json` contain a bounded summary, for example:
 
 ```json
 {
-  "invalid_swc_count": 2,
-  "member_errors": [
-    {"member_path": "a.swc", "message": "skeletons.zip:a.swc: expected exactly one root, found 5"},
-    {"member_path": "b.swc", "message": "skeletons.zip:b.swc:2: expected 7 columns, got 6"}
-  ]
+  "schema_version": 1,
+  "ok": false,
+  "command": "plan",
+  "importer_version": "0.7.0",
+  "error": {
+    "category": "invalid_input",
+    "message": "2 SWC file(s) failed validation; see error-details.json for all files. First error: skeletons.zip:a.swc: expected exactly one root, found 5",
+    "details": {"invalid_swc_count": 2},
+    "details_file": "error-details.json"
+  },
+  "state_dir": "/staging/state"
 }
 ```
+
+`state/error-details.json` retains the full error message and details. Its
+`error.details.member_errors` list contains one useful reason per invalid file:
+
+```json
+[
+  {"member_path": "a.swc", "message": "skeletons.zip:a.swc: expected exactly one root, found 5"},
+  {"member_path": "b.swc", "message": "skeletons.zip:b.swc:2: expected 7 columns, got 6"}
+]
+```
+
+The summary never embeds that list. Error messages are capped at 2,000
+characters and other detail metadata at 8 KiB; larger details remain only in
+`error-details.json`. A file reference is included only after that file was
+written successfully. Failure to save full diagnostics is logged, while the
+original category/message is still emitted and saving `result.json` is attempted.
+Without a writable state directory, stdout still carries the bounded error.
+These files describe the latest failed command; a later successful result is
+authoritative over any retained older error-details file.
 
 An invalid archive produces no executable plan, even if some SWCs are valid.
 Fix the reported files and rerun `plan`. Archive-wide failures such as an
@@ -143,7 +168,7 @@ must satisfy `0 <= coordinate_nm <= dimension[i] * resolution_nm[i]` on every
 axis; the physical extents must be positive and finite. Positions exactly on
 the boundary are accepted. In the example above, X = 100 µm is valid but
 X = 100.001 µm is rejected. All invalid members are collected in
-`error.details.member_errors`, and no executable plan is produced. The same
+`error.details.member_errors` inside `error-details.json`, and no executable plan is produced. The same
 check runs when loading a planned member, including plans from older versions.
 Radius `-1` (unknown) and parent `-1` (root) remain valid. Positions are not
 clipped or translated.
@@ -609,12 +634,13 @@ state to skip committed work, reuse reservations and block uncertain commits.
 | --- | --- |
 | `state.json` | Authoritative recovery checkpoints and phase/batch statuses. |
 | `metrics.json` | Planned/completed batch, skeleton and node counts; operation durations, per-operation row counts and run settings history. |
-| `result.json` | JSON outcome of the most recent completed or failed CLI command. |
+| `result.json` | Outcome of the most recent CLI command; failures contain a bounded summary and optional diagnostic-file reference. |
+| `error-details.json` | Full diagnostics of the latest failed CLI command, including all invalid SWC members; never sent through the terminal callback. |
 
 Metrics are observational: completed counts are reconciled with committed state
 on resume and after each batch. Loading progress advances after a batch commits.
-Cache rebuilding has a running phase in `state.json`, but no structured live
-cell-by-cell percentage. The metrics `active_phase` field is not consistently
+Cache rebuilding has a running phase in `state.json` and optional live cell
+counters in `cache-progress.json` (see measured cache progress below). The metrics `active_phase` field is not consistently
 populated by the orchestrator; most operation timings are recorded on completion.
 All planned nodes can therefore be loaded while cache rebuilding or final
 verification is still running.
