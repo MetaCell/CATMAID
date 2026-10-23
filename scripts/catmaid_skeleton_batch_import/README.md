@@ -752,3 +752,19 @@ PYTHONPATH=scripts/catmaid_skeleton_batch_import/src python \
 This measures source planning and two subsequent source reads, not total import,
 database/cache performance or cluster speedup. Trial totals should be compared
 directly; sums of independently computed component medians can differ.
+
+
+## Measured cache progress
+
+Cache rebuilding optionally writes `state/cache-progress.json` containing
+`schema_version: 1`, `completed` and `total`. Total is the sum of the planned
+cell ranges across all configured grids. Completed increments only after a cell
+refresh succeeds, including empty cells that intentionally leave no stored row.
+It resets to zero when a rebuild starts. No configured coverage reports 0/0.
+
+This bounded observational file is replaced atomically at most once per second,
+plus the initial and final updates. A progress-file IO failure is nonfatal.
+The file is not registered as an immutable artifact or used to skip work on
+resume. Cache receipts, state transitions and final verification still decide
+completion. MNP translates these observations and confirmed batch states into
+native Argo progress; the importer has no Argo or NeuroGlass dependency.

@@ -1347,7 +1347,10 @@ def run_ingestion(
             if "cache_plan" not in state["artifacts"]:
                 _write_registered_json(store, "cache_plan", "cache-plan.json", grid_cache.plan())
             cache_plan = load_json(_artifact_path(store, store.load(), "cache_plan"))
-            receipt = grid_cache.rebuild(log=_progress, plan=cache_plan)
+            from .cache_progress import CacheProgressWriter
+            receipt = grid_cache.rebuild(
+                log=_progress, plan=cache_plan, progress=CacheProgressWriter(store.state_dir),
+            )
             _write_registered_json(
                 store, "cache_rebuild", "cache-rebuild.json", receipt,
             )

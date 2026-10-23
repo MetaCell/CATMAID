@@ -144,7 +144,7 @@ class OfflineGridCache:
         return {"schema_version": 1, "project_id": self.project_id,
                 "node_limit": None, "grids": records}
 
-    def rebuild(self, log=lambda _message: None, *, plan=None):
+    def rebuild(self, log=lambda _message: None, *, plan=None, progress=None):
         """A failed rebuild is restarted on resume; committed batches are skipped."""
         if self.connection.in_atomic_block:
             raise RuntimeError("Cache rebuilding requires its own transactions")
@@ -154,6 +154,12 @@ class OfflineGridCache:
                 or plan.get("node_limit") is not None
                 or [record["definition"] for record in plan["grids"]] != self.grids):
             raise VerificationError("Cache rebuild plan changed; resume with --rebuild-cache")
+        # Count all cells evaluated, including intentionally empty results.
+        total = sum(math.prod(high - low + 1 for low, high in record["ranges"])
+                    for record in plan["grids"] if record["ranges"] is not None)
+        completed = 0
+        if progress is not None:
+            progress(0, total)
         records = []
         for planned in plan["grids"]:
             grid, ranges = planned["definition"], planned["ranges"]
@@ -167,6 +173,9 @@ class OfflineGridCache:
             if ranges is not None:
                 for cell in product(*(range(low, high + 1) for low, high in ranges)):
                     self._refresh(grid, cell)
+                    completed += 1
+                    if progress is not None:
+                        progress(completed, total)
             with self.connection.cursor() as cursor:
                 cursor.execute("SELECT count(*) FROM node_grid_cache_cell WHERE grid_id=%s", [grid["id"]])
                 cell_count = cursor.fetchone()[0]

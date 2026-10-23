@@ -239,3 +239,40 @@ def test_rebuild_passes_original_formats_lod_filters_and_grid_id(monkeypatch):
 def test_invalid_grid_is_rejected_before_loading_any_batches():
     with pytest.raises(VerificationError, match="invalid dimensions"):
         tracker(Connection([grid(cell_width=0)]))
+
+
+
+def test_cache_progress_counts_successful_cells_across_grids_including_empty(monkeypatch):
+    connection = Connection([grid(), grid(12, cell_width=20)])
+    cache = tracker(connection)
+    plan = cache.plan()
+    expected = sum(__import__("math").prod(high-low+1 for low,high in record["ranges"]) for record in plan["grids"])
+    observed = []
+    # An empty cell is still processed work even if no payload row is stored.
+    monkeypatch.setattr(cache, "_refresh", lambda *_: None)
+    cache.rebuild(plan=plan, progress=lambda done,total: observed.append((done,total)))
+    assert observed == [(done,expected) for done in range(expected+1)]
+    assert all(not rows for rows in connection.cells.values())
+
+
+def test_cache_progress_does_not_count_failed_cell_and_resets_on_retry(monkeypatch):
+    connection = Connection([grid()]); cache = tracker(connection)
+    plan=cache.plan(); observed=[]; calls=[]
+    def refresh(*_):
+        calls.append(1)
+        if len(calls)==2:
+            raise RetryableError("cell failure")
+    monkeypatch.setattr(cache,"_refresh",refresh)
+    with pytest.raises(RetryableError, match="cell failure"):
+        cache.rebuild(plan=plan, progress=lambda d,t:observed.append((d,t)))
+    assert [d for d,t in observed] == [0,1]
+    observed.clear(); monkeypatch.setattr(cache,"_refresh",lambda *_:None)
+    cache.rebuild(plan=plan,progress=lambda d,t:observed.append((d,t)))
+    assert observed[0][0] == 0
+    assert observed[-1][0] == observed[-1][1]
+
+
+def test_no_cache_grids_reports_zero_work():
+    observed=[]
+    tracker(Connection()).rebuild(progress=lambda d,t:observed.append((d,t)))
+    assert observed == [(0,0)]
