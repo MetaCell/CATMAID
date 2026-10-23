@@ -9,7 +9,7 @@ from typing import Any, Dict, DefaultDict, List, Optional, Tuple
 
 from django.http import HttpRequest, JsonResponse
 from django.shortcuts import get_object_or_404
-from django.db import connection
+from django.db import connection, transaction
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 
@@ -19,6 +19,8 @@ from catmaid.control.common import insert_into_log, get_request_list, \
         get_class_to_id_map
 from catmaid.models import UserRole, Project, Class, ClassInstance, \
         ClassInstanceClassInstance, Relation, Treenode
+
+from catmaid.source_fragments import reject_reserved_annotation_rename
 
 from rest_framework.decorators import api_view
 
@@ -130,6 +132,36 @@ def get_skeleton_ids_for_neurons(project_id:int, neuron_ids:List) -> Dict[int, L
     return skeleton_map
 
 
+@transaction.atomic
+def _delete_neuron_and_unused_annotations(neuron) -> None:
+    """Delete a neuron and annotations whose last use disappears with it."""
+    project_id = neuron.project_id
+    # Link IDs and annotation object IDs differ. Capture the objects before the
+    # cascade removes their links, so orphan provenance cannot block reimport.
+    annotation_ids = set(ClassInstanceClassInstance.objects.filter(
+            project_id=project_id, class_instance_a_id=neuron.id,
+            relation__relation_name='annotated_with').values_list(
+                    'class_instance_b_id', flat=True))
+    neuron.delete()
+    if annotation_ids:
+        # Two split results can lose their last links concurrently. Serialize
+        # cleanup on annotation objects, in one order, without locking classes.
+        # Evaluate the lock query before a separate usage query: a waiter must
+        # see the preceding cleanup's commit rather than its old link snapshot.
+        list(ClassInstance.objects.filter(project_id=project_id,
+                class_column__class_name='annotation', id__in=annotation_ids)
+                .order_by('id').select_for_update(of=('self',))
+                .values_list('id', flat=True))
+        # Split results can share provenance; retain it while any entity uses it.
+        used_annotation_ids = set(ClassInstanceClassInstance.objects.filter(
+                class_instance_b_id__in=annotation_ids,
+                relation__relation_name='annotated_with').values_list(
+                        'class_instance_b_id', flat=True))
+        ClassInstance.objects.filter(project_id=project_id,
+                class_column__class_name='annotation',
+                id__in=annotation_ids - used_annotation_ids).delete()
+
+
 def _delete_if_empty(neuron_id) -> bool:
     """ Delete this neuron if no class_instance is a model_of it;
     which is to say, it contains no skeletons. """
@@ -137,7 +169,11 @@ def _delete_if_empty(neuron_id) -> bool:
             class_instance_b=neuron_id,
             relation__relation_name='model_of').exists()
     if is_empty:
-        ClassInstance.objects.filter(pk=neuron_id).delete()
+        neuron = ClassInstance.objects.filter(pk=neuron_id).first()
+        if neuron is not None:
+            # Final-node deletion and merge cleanup need the same provenance
+            # cleanup as explicit whole-neuron deletion.
+            _delete_neuron_and_unused_annotations(neuron)
     return is_empty
 
 
@@ -156,12 +192,14 @@ def delete_neuron(request:HttpRequest, project_id=None, neuron_id=None) -> JsonR
 
 
 def _delete_neuron_as_user(user, project_id, neuron_id):
+    candidate = get_object_or_404(ClassInstance.objects.select_related('class_column'),
+            pk=neuron_id)
+    # This generic endpoint must not delete a reserved annotation passed as a neuron.
+    reject_reserved_annotation_rename(candidate, candidate.name)
     # Make sure the user can edit the neuron in general
     can_edit_class_instance_or_fail(user, neuron_id, 'neuron')
 
-    # Create class and relation dictionaries
-    classes = dict(Class.objects.filter(
-            project_id=project_id).values_list('class_name', 'id'))
+    # Resolve relation IDs for permission checks and skeleton ownership.
     relations = dict(Relation.objects.filter(
             project_id=project_id).values_list('relation_name', 'id'))
 
@@ -182,13 +220,13 @@ def _delete_neuron_as_user(user, project_id, neuron_id):
                         "neuron won't be deleted." % skid)
 
     # Make sure the user has permission to edit all annotations of this neuron
-    annotation_ids = set(ClassInstanceClassInstance.objects.filter(
+    annotation_link_ids = set(ClassInstanceClassInstance.objects.filter(
             class_instance_a_id=neuron_id,
             relation_id=relations['annotated_with']).values_list(
                     'id', flat=True))
-    if annotation_ids:
+    if annotation_link_ids:
         try:
-            can_edit_all_or_fail(user, annotation_ids,
+            can_edit_all_or_fail(user, annotation_link_ids,
                     'class_instance_class_instance')
         except Exception:
             raise Exception("You don't have permission to remove all " \
@@ -210,15 +248,7 @@ def _delete_neuron_as_user(user, project_id, neuron_id):
     # Delete neuron (and implicitely all annotation links due to Django's
     # cascading deletion)
     neuron = get_object_or_404(ClassInstance, pk=neuron_id)
-    neuron.delete()
-
-    # Delete all annotations that are not used anymore
-    used_annotation_ids = set(ClassInstanceClassInstance.objects.filter(
-            class_instance_b_id__in=annotation_ids,
-            relation_id=relations['annotated_with']).values_list(
-                    'id', flat=True))
-    unused_annotation_ids = annotation_ids.difference(used_annotation_ids)
-    ClassInstance.objects.filter(id__in=unused_annotation_ids).delete()
+    _delete_neuron_and_unused_annotations(neuron)
 
     # Delete the skeletons (and their treenodes through cascading delete)
     cursor = connection.cursor()
@@ -339,6 +369,9 @@ def rename_neuron(request:HttpRequest, project_id=None, neuron_id=None) -> JsonR
 
     # Update neuron name
     neuron = ClassInstance.objects.get(id=neuron_id)
+    # Legacy rename routes accept ClassInstance IDs, including annotations.
+    # Inspect the actual class so they cannot rename protected source objects.
+    reject_reserved_annotation_rename(neuron, new_name)
     old_name = neuron.name
     neuron.name=new_name
     neuron.save()
@@ -388,6 +421,12 @@ def rename_neurons(request:HttpRequest, project_id=None) -> JsonResponse:
         raise ValueError('Need at least one neuron ID / name mapping')
     neuron_ids = [int(k) for k, _ in neuron_name_pairs]
     neuron_names = [v for _, v in neuron_name_pairs]
+    # Preflight the whole batch before a generic rename can touch source metadata.
+    candidates = ClassInstance.objects.select_related('class_column').in_bulk(neuron_ids)
+    for neuron_id, new_name in zip(neuron_ids, neuron_names):
+        candidate = candidates.get(neuron_id)
+        if candidate is not None:
+            reject_reserved_annotation_rename(candidate, new_name)
 
     # Make sure the user can edit the neuron
     can_edit_all_or_fail(request.user, neuron_ids, 'class_instance')

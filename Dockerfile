@@ -23,7 +23,7 @@ RUN apt-get update -y \
     && wget --quiet -O - "https://cloud.r-project.org/bin/linux/ubuntu/marutter_pubkey.asc" | gpg --dearmor | tee /usr/share/keyrings/cran.gpg > /dev/null \
     && echo "deb [signed-by=/usr/share/keyrings/cran.gpg] https://cloud.r-project.org/bin/linux/ubuntu noble-cran40/" >> /etc/apt/sources.list.d/cran.list \
     && apt-get update -y \
-    && apt-get install -y python3.10 python3.10-venv python3.10-dev git python3-pip \
+    && apt-get install -y python3.11 python3.11-venv python3.11-dev git python3-pip \
     && apt-get install -y rabbitmq-server \
     && apt-get install -y postgresql-17 postgresql-17-postgis-3 \
     && apt-get install -y rabbitmq-server \
@@ -46,7 +46,7 @@ ENV LC_ALL=en_US.UTF-8
 
 COPY django/requirements.txt django/requirements-async.txt django/requirements-doc.txt django/requirements-optional.txt django/requirements-production.txt /home/django/
 
-RUN /usr/bin/python3.10 -m venv --upgrade-deps --prompt catmaid /home/env \
+RUN /usr/bin/python3.11 -m venv --upgrade-deps --prompt catmaid /home/env \
     && /home/env/bin/pip install -U pip \
     && /home/env/bin/pip install -r /home/django/requirements.txt \
     && /home/env/bin/pip install -r /home/django/requirements-async.txt \
@@ -54,6 +54,12 @@ RUN /usr/bin/python3.10 -m venv --upgrade-deps --prompt catmaid /home/env \
     && /home/env/bin/pip install -r /home/django/requirements-production.txt
 
 COPY . /home/
+
+# The standalone importer uses the same dependencies and Django environment as
+# CATMAID. Keep its console command available to ingestion workers.
+RUN /home/env/bin/pip install --no-deps --no-build-isolation /home/scripts/catmaid_skeleton_batch_import \
+    && /home/env/bin/catmaid-skeleton-import --version \
+    && /home/env/bin/python -m py_compile /home/scripts/docker/run_catmaid_skeleton_import.py /home/django/projects/mysite/ingestion_settings.py
 
 # Add Git commit build information to container by copying the Git repo (.git
 # folder) into the container to run "git describe" and pipe its result in the

@@ -34,6 +34,24 @@ jobs:
       - run: npm run jsdoc
         name: Ensure that docs are valid
 
+  test-skeleton-importer:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11']
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-python@v2
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: |
+          pip install "$(grep -E '^pytest==' django/requirements-test.txt)"
+          pip install --no-deps ./scripts/catmaid_skeleton_batch_import
+        name: Install importer and test tools
+      - run: python -m pytest -q scripts/catmaid_skeleton_batch_import/tests
+        name: Run standalone importer and runtime wrapper tests
+
   test-backend:
     runs-on: ubuntu-22.04
     strategy:
