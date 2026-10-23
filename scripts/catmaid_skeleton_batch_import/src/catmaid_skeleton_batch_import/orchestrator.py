@@ -969,8 +969,6 @@ def _run_batch(
     try:
         with prepared_context as prepared:
             _ensure_batch_node_map(store, prepared)
-            from .provenance import publish_node_map
-            publish_node_map(store.state_dir, batch.index)
             counts = execute_batch_transaction(
                 prepared,
                 project,
@@ -1035,15 +1033,6 @@ def _run_batch(
         raise
 
     store.mark_batch_committed(batch.index)
-    try:
-        publish_node_map(store.state_dir, batch.index, committed=True)
-    except OperatorAttentionError as exc:
-        store.mark_operator_attention(
-            str(exc), entity="batch", batch_index=batch.index,
-            details={"commit_confirmed": True},
-        )
-        metrics.set_status("operator_attention")
-        raise
     _flush_loader_timings(metrics, batch.index, loader_timings)
     metrics.record_phase(
         f"batch_{batch.index:06d}_transaction",
@@ -1191,8 +1180,6 @@ def _verify_database_by_batch(
             # Also backfill mappings for batches committed by an older importer,
             # but only after verifying their exact database rows and reservations.
             _ensure_batch_node_map(store, prepared)
-            from .provenance import publish_node_map
-            publish_node_map(store.state_dir, batch.index)
         for key, value in counts.items():
             imported_counts[key] = imported_counts.get(key, 0) + value
         if (
