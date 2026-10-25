@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 import os
 from pathlib import Path
 import zipfile
@@ -40,7 +41,7 @@ def project(local_database):
 def prepared(project):
     from catmaid_skeleton_batch_import.database import allocate_batch_ids
     from catmaid_skeleton_batch_import.domain import IngestionRequest, PlannedBatch, PlannedMember, SwcNode
-    from catmaid_skeleton_batch_import.loader import prepare_copy_rows, _source_cable_nm
+    from catmaid_skeleton_batch_import.loader import prepare_copy_rows
     # Unordered, noncontiguous source AND allocated IDs; two roots, branches,
     # coincident coordinates, and float32 boundaries at 1 and 2**24.
     nodes = (
@@ -49,7 +50,9 @@ def prepared(project):
         SwcNode(902, 3, 16777217, 1.00000005, 3, .4, 10),
         SwcNode(80, 3, 16777219, 2, 4, .3, 51),
     )
-    members = tuple(PlannedMember(name, 4, 0, 0, name, _source_cable_nm(nodes, 1), name[:-4])
+    positions = {node.source_id: (node.x, node.y, node.z) for node in nodes}
+    cable_length = math.dist(positions[51], positions[10]) + math.dist(positions[80], positions[51])
+    members = tuple(PlannedMember(name, 4, 0, 0, name, cable_length, name[:-4])
                     for name in ("a.swc", "b.swc"))
     batch = PlannedBatch(1, members)
     ids = allocate_batch_ids(2, 16)
@@ -259,7 +262,6 @@ def make_request(tmp_path):
 @pytest.mark.parametrize("phase", ["edge_staging", "edge_creation", "summary_refresh"])
 def test_phase_failure_rolls_back_second_batch_and_is_terminal(local_database, tmp_path, monkeypatch, phase):
     from catmaid_skeleton_batch_import import materialization
-    from catmaid_skeleton_batch_import.config import load_settings
     from catmaid_skeleton_batch_import.errors import OperationalFailureError
     from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, run_ingestion
     from catmaid_skeleton_batch_import.state import StateStore

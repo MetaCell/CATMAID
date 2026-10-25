@@ -183,7 +183,7 @@ class OfflineGridCache:
         result = {"schema_version": 1, "project_id": self.project_id,
                   "strategy": "offline_full_grid_rebuild", "node_limit": None,
                   "grids": records}
-        self.verify(result)
+        # The orchestrator verifies payloads once, in its final verification phase.
         return result
 
     def verify(self, receipt):

@@ -321,6 +321,7 @@ The sample root becomes `(10000, 20000, 30000)` nm with radius `2000` nm.
    the bulk load. A project with no grids requires no cache generation.
 4. Verify imported IDs and exact node values, unchanged grid definitions, payload
    formats, LOD counts, rebuild timestamps and absence of dirty cache markers.
+   Cache payload verification runs once in this final phase.
    Reactivate the Neuroglass layer only after successful completion.
 
 For existing targets, grid IDs, dimensions, orientation, filters, ordering, LOD,
@@ -726,8 +727,11 @@ gzip JSON-lines files, one bounded file per whole-SWC batch:
 `source-snapshot-000001.jsonl.gz`, `source-snapshot-000002.jsonl.gz`, and so on.
 The plan's `source_snapshots` descriptors bind each file's SHA-256, byte size and
 node count. Loading and final verification reuse these values instead of
-reparsing SWCs. Source-unit double precision, normal conversion and stored
-float32 checks remain. Both steps require the snapshot files.
+reparsing SWCs. Source-unit double precision and normal conversion remain.
+Snapshot hashes establish source identity; summary verification calculates cable
+length from stored float32 coordinates. It does not compare cable lengths computed
+before and after unit conversion, whose floating-point rounding can differ.
+Both loading and final verification require the snapshot files.
 
 The feature is unpublished and supports only the current plan/state format.
 

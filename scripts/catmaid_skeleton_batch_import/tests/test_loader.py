@@ -216,3 +216,45 @@ def test_expected_cable_uses_catmaid_float4_coordinates(tmp_path: Path) -> None:
     ) as prepared:
         # Both X coordinates round to 100,000,000 in PostgreSQL real columns.
         assert prepared.expected_skeletons[0].cable_length_nm == 0.0
+
+
+def test_planned_micrometre_snapshot_prepares_rows_at_large_coordinate_offsets(
+    tmp_path, monkeypatch, micrometre_zigzag_swc,
+):
+    import json
+    import math
+
+    from catmaid_skeleton_batch_import.config import load_request
+    from catmaid_skeleton_batch_import.orchestrator import plan_ingestion
+    from catmaid_skeleton_batch_import.planner import read_plan
+    from catmaid_skeleton_batch_import.source_snapshot import SourceSnapshotReader
+
+    monkeypatch.setenv("CATMAID_BATCH_IMPORT_MAX_NODES_PER_BATCH", "250000")
+    archive = tmp_path / "input.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("zigzag.swc", micrometre_zigzag_swc)
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps({
+        "schema_version": 1,
+        "source": {"archive_path": str(archive), "coordinate_unit": "um"},
+        "stack": {"dimension": [17797, 30801, 10826], "resolution_nm": [350, 350, 1000]},
+    }))
+    state_dir = tmp_path / "state"
+    assert plan_ingestion(request_path, state_dir)["nodes"] == 10001
+    plan = read_plan(state_dir / "plan.jsonl.gz")
+    project = ProjectContext(5, 6, 7, 1, 8, 9, 10, 11, 12)
+
+    with SourceSnapshotReader(state_dir, plan) as source:
+        with prepare_copy_rows(
+            plan.batches[0], load_request(request_path), project,
+            list(range(100, 105)), list(range(200, 10201)), source.load,
+        ) as prepared:
+            rows = list(csv.reader(prepared.treenode_file))
+            assert len(rows) == 10001
+            assert rows[0][2:5] == ["6000000.0", "0.0", "0.0"]
+            assert rows[1][2:5] == ["6000350.0", "10.0", "0.0"]
+            assert rows[-1][2:5] == ["6000000.0", "100000.0", "0.0"]
+            # Stored float32 coordinates give 10,000 equal-length edges.
+            assert prepared.expected_skeletons[0].cable_length_nm == pytest.approx(
+                10000 * math.hypot(350, 10), rel=1e-12,
+            )

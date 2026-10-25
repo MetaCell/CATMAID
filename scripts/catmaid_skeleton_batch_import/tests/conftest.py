@@ -32,3 +32,13 @@ def isolated_database():
         )
         assert cursor.fetchone() == (expected["NAME"], expected["SYSTEM_IDENTIFIER"])
     return connection
+
+
+@pytest.fixture
+def micrometre_zigzag_swc():
+    """Valid source geometry that exposed the redundant cable-length comparison."""
+    return "".join(
+        f"{index + 1} 3 {6000 + (index % 2) * 0.35:.8f} "
+        f"{index * 0.01:.8f} 0 1 {-1 if index == 0 else index}" + chr(10)
+        for index in range(10001)
+    )

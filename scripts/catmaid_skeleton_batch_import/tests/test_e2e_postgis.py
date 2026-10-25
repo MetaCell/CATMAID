@@ -500,3 +500,60 @@ def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_c
     assert new_row["fragment_id"] == imported["fragment_id"]
     assert new_row["skeleton_id"] != imported["skeleton_id"]
     assert old_derived_rows() == old_derived
+
+
+def test_micrometre_rounding_regression_completes_import_and_final_cache_verification(
+    tmp_path, monkeypatch, isolated_database, micrometre_zigzag_swc,
+):
+    import math
+
+    from catmaid_skeleton_batch_import.artifacts import read_manifest
+    from catmaid_skeleton_batch_import.offline_cache import OfflineGridCache
+    from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, run_ingestion
+    from catmaid_skeleton_batch_import.state import StateStore
+
+    monkeypatch.setenv("CATMAID_BATCH_IMPORT_MAX_NODES_PER_BATCH", "250000")
+    archive = tmp_path / "input.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("zigzag.swc", micrometre_zigzag_swc)
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps({
+        "schema_version": 1,
+        "source": {"archive_path": str(archive), "coordinate_unit": "um"},
+        "stack": {"dimension": [17797, 30801, 10826], "resolution_nm": [350, 350, 1000]},
+    }))
+    state_dir = tmp_path / "state"
+    assert plan_ingestion(request_path, state_dir)["nodes"] == 10001
+    verification_phases = []
+    original_verify = OfflineGridCache.verify
+
+    def verify(cache, receipt):
+        verification_phases.append(
+            StateStore(state_dir).load()["phases"]["verification"]["status"]
+        )
+        return original_verify(cache, receipt)
+
+    monkeypatch.setattr(OfflineGridCache, "verify", verify)
+    result = run_ingestion(state_dir)
+
+    assert result["status"] == "ready_for_publication"
+    assert verification_phases == ["running"]
+    manifest = read_manifest(Path(result["manifest"]))[0]
+    with isolated_database.cursor() as cursor:
+        cursor.execute(
+            "SELECT num_nodes, cable_length FROM catmaid_skeleton_summary WHERE skeleton_id=%s",
+            [int(manifest["skeleton_id"])],
+        )
+        count, cable_length = cursor.fetchone()
+        assert count == 10001
+        assert cable_length == pytest.approx(10000 * math.hypot(350, 10), rel=1e-9)
+        cursor.execute(
+            "SELECT count(*), min(location_x), max(location_x) FROM treenode WHERE project_id=%s",
+            [result["project_id"]],
+        )
+        assert cursor.fetchone() == (10001, 6000000.0, 6000350.0)
+    report = json.loads(Path(result["verification"]).read_text())
+    assert report["database"]["treenode_count"] == 10001
+    assert report["cache"]["verified"]
+    assert report["cache"]["cell_count"] > 0
+    assert StateStore(state_dir).load()["run"]["status"] == "complete"

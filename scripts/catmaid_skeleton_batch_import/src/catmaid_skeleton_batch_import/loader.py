@@ -130,22 +130,6 @@ def _scaled_radius(radius: float, scale_nm: float) -> float:
     return -1.0 if radius == -1 else radius * scale_nm
 
 
-def _source_cable_nm(nodes: Sequence[SwcNode], scale_nm: float) -> float:
-    by_id = {node.source_id: node for node in nodes}
-    lengths: list[float] = []
-    for node in nodes:
-        if node.parent_source_id == -1:
-            continue
-        parent = by_id[node.parent_source_id]
-        lengths.append(
-            math.dist(
-                (node.x * scale_nm, node.y * scale_nm, node.z * scale_nm),
-                (parent.x * scale_nm, parent.y * scale_nm, parent.z * scale_nm),
-            )
-        )
-    return math.fsum(lengths)
-
-
 def _postgres_real(value: float) -> float:
     """Return the value PostgreSQL stores in a ``real`` (float4) column."""
 
@@ -215,18 +199,6 @@ def prepare_copy_rows(
                     f"{member.member_path}: plan has {member.node_count} nodes, "
                     f"archive now yields {len(nodes)}"
                 )
-            source_cable = _source_cable_nm(nodes, request.scale_nm)
-            tolerance = max(1e-6, abs(member.cable_length_nm) * 1e-12)
-            if not math.isclose(
-                source_cable,
-                member.cable_length_nm,
-                rel_tol=1e-12,
-                abs_tol=tolerance,
-            ):
-                raise InvalidInputError(
-                    f"{member.member_path}: cable length no longer matches the plan"
-                )
-
             neuron_id, skeleton_id, link_id, annotation_id, annotation_link_id = concept_ids[
                 concept_offset : concept_offset + 5
             ]
@@ -306,6 +278,9 @@ def prepare_copy_rows(
                     ]
                 )
 
+            # Snapshot hashes establish source identity. Summary expectations use
+            # stored float32 coordinates, avoiding comparisons across differently
+            # rounded source-unit and nanometre cable calculations.
             expected_skeletons.append(
                 ExpectedSkeleton(
                     member_path=member.member_path,

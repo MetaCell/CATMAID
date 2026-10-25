@@ -216,33 +216,10 @@ def _write_registered_json(
     name: str,
     relative_path: str,
     value: Mapping[str, Any],
-    *,
-    batch_index: int | None = None,
 ) -> dict[str, Any]:
-    state = store.load()
-    if batch_index is None:
-        existing = state.get("artifacts", {}).get(name)
-    else:
-        existing = _batch_state(state, batch_index).get("artifacts", {}).get(name)
     normalized = dict(value)
-    if existing is not None:
-        persisted = _load_registered_json(
-            store, state, name, batch_index=batch_index
-        )
-        if persisted != normalized:
-            raise ImmutableStateError(
-                f"Registered {name} artifact cannot be replaced with different content"
-            )
-        return normalized
-
-    path = store.state_dir / relative_path
-    atomic_write_json(path, normalized)
-    store.register_artifact(
-        name,
-        relative_path,
-        count=1,
-        batch_index=batch_index,
-    )
+    atomic_write_json(store.state_dir / relative_path, normalized)
+    store.register_artifact(name, relative_path, count=1)
     return normalized
 
 
@@ -250,10 +227,8 @@ def _load_registered_json(
     store: StateStore,
     state: Mapping[str, Any],
     name: str,
-    *,
-    batch_index: int | None = None,
 ) -> dict[str, Any]:
-    value = load_json(_artifact_path(store, state, name, batch_index=batch_index))
+    value = load_json(_artifact_path(store, state, name))
     if not isinstance(value, dict) or value.get("schema_version") != 1:
         raise ImmutableStateError(f"Unsupported {name} artifact schema")
     return value
@@ -326,8 +301,8 @@ def _database_context(
             raise classified from exc
         raise
 
-    # Bind a fresh run to the database used for append planning before writing
-    # its runtime fingerprint, so a mistaken connection cannot poison retries.
+    # Bind this run to the database used for append planning before recording
+    # its runtime fingerprint.
     if "stack_geometry" in state.get("artifacts", {}):
         geometry = _load_registered_json(store, state, "stack_geometry")
         if geometry["database_target"] != current["target"]:

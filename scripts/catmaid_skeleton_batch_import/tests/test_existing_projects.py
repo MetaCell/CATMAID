@@ -457,11 +457,17 @@ def test_cache_is_rebuilt_once_after_all_batches(tmp_path, monkeypatch):
         events.append("cache")
         return original(self, **kwargs) | {"rebuild_serial": events.count("cache")}
     monkeypatch.setattr(offline_cache.OfflineGridCache, "rebuild", rebuild)
+    original_verify = offline_cache.OfflineGridCache.verify
+    def verify(self, receipt):
+        assert StateStore(state_dir).load()["phases"]["verification"]["status"] == "running"
+        events.append("verify_cache")
+        return original_verify(self, receipt)
+    monkeypatch.setattr(offline_cache.OfflineGridCache, "verify", verify)
     assert orchestrator.run_ingestion(state_dir)["status"] == "complete"
-    assert events == ["commit_1", "commit_2", "cache"]
+    assert events == ["commit_1", "commit_2", "cache", "verify_cache"]
     with pytest.raises(InvalidInputError, match="terminal"):
         orchestrator.run_ingestion(state_dir)
-    assert events == ["commit_1", "commit_2", "cache"]
+    assert events == ["commit_1", "commit_2", "cache", "verify_cache"]
 
 
 def test_project_context_round_trips():
