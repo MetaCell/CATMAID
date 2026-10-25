@@ -35,7 +35,7 @@ class ProjectContext:
             field: None if value[field] is None else int(value[field])
             for field in cls.__dataclass_fields__ if field != "existing_project"
         }
-        return cls(**fields, existing_project=bool(value.get("existing_project", False)))
+        return cls(**fields, existing_project=bool(value["existing_project"]))
 
     def to_dict(self) -> dict[str, int | bool | None]:
         return {

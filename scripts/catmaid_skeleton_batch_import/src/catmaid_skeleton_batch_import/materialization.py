@@ -526,8 +526,7 @@ def materialize_and_verify_batch(
     annotation_class_id: int,
     model_of_relation_id: int,
     annotated_with_relation_id: int,
-    skeletons: Sequence[Mapping[str, Any]] | None = None,
-    expected_skeletons: Sequence[Mapping[str, Any]] | None = None,
+    skeletons: Sequence[Mapping[str, Any]],
     location_ids: Sequence[int],
     connection: Any | None = None,
     cursor: Any | None = None,
@@ -543,12 +542,7 @@ def materialize_and_verify_batch(
     only the prepared batch; summaries retain CATMAID's canonical function.
     """
 
-    if skeletons is not None and expected_skeletons is not None:
-        raise ValueError("pass skeletons or expected_skeletons, not both")
-    supplied_skeletons = skeletons if skeletons is not None else expected_skeletons
-    if supplied_skeletons is None:
-        raise ValueError("expected skeleton values are required")
-    normalized = _normalize_expected_skeletons(supplied_skeletons)
+    normalized = _normalize_expected_skeletons(skeletons)
     _normalize_location_ids(
         location_ids, sum(item["node_count"] for item in normalized)
     )

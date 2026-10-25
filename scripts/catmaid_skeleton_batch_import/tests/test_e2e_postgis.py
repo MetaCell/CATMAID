@@ -331,12 +331,6 @@ def test_known_rollback_preserves_prior_batch_and_resumes(
                        [[int(row["treenode_id"]) for row in saved_rows[1]]])
         assert cursor.fetchall() == []  # A saved mapping alone does not mean COMMIT.
 
-    # A workspace from the previous importer can already have committed batches
-    # without node maps. Resume derives these from its original reserved IDs.
-    del state["batches"][0]["artifacts"]["node_map"]
-    (state_dir / maps_before[0]["path"]).unlink()
-    (state_dir / "state.json").write_text(json.dumps(state))
-
     monkeypatch.setattr(materialization, "materialize_and_verify_batch", original)
     result = run_ingestion(state_dir)
     assert result["status"] == "ready_for_publication"

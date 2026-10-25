@@ -76,7 +76,6 @@ def test_failed_phase_keeps_failure_details(tmp_path: Path) -> None:
         error="database unavailable",
     )
     metrics = store.load()
-    assert metrics["active_phase"] is None
     assert metrics["status"] == "failed"
     assert metrics["phases"] == [record]
     assert record["status"] == "failed"
@@ -118,36 +117,6 @@ def test_direct_phase_record_does_not_create_an_active_checkpoint(
     record = store.record_phase("archive.hash", duration_seconds=0.25)
     assert writes == [store.path]
     assert record["status"] == "complete"
-    assert store.load()["active_phase"] is None
-
-
-def test_interrupted_active_phase_is_recovered_durably_and_idempotently(
-    tmp_path: Path,
-) -> None:
-    store = MetricsStore(tmp_path)
-    store.initialize(planned_batches=1, planned_nodes=8, planned_skeletons=2)
-    # Reproduce a historical schema-1 file without using the retired timing API.
-    historical = store.record_phase("archive.scan", duration_seconds=1.5)
-    metrics = store.load()
-    metrics["active_phase"] = {
-        "name": "batch.transaction", "status": "running", "batch_index": 1,
-        "batch_node_count": 8, "batch_skeleton_count": 2,
-    }
-    store.path.write_bytes(canonical_json_bytes(metrics))
-
-    recovered = MetricsStore(tmp_path).recover_active_phase()
-    assert recovered is not None
-    assert recovered["name"] == "batch.transaction"
-    assert recovered["status"] == "retryable"
-    assert recovered["recovered_after_interruption"] is True
-    assert recovered["node_count"] == 8
-    metrics = store.load()
-    assert metrics["active_phase"] is None
-    assert metrics["phases"] == [historical, recovered]
-    assert MetricsStore(tmp_path).recover_active_phase() is None
-    assert store.load()["phases"] == [historical, recovered]
-    current = store.record_phase("batch.transaction", duration_seconds=2.0)
-    assert store.load()["phases"] == [historical, recovered, current]
 
 
 def test_effective_operational_settings_are_recorded_per_run(tmp_path: Path) -> None:
@@ -185,16 +154,3 @@ def test_metrics_schema_contains_no_wal_measurement(tmp_path: Path) -> None:
     )
 
     assert "wal" not in store.path.read_text().lower()
-
-
-def test_historical_runs_without_version_remain_readable(tmp_path: Path) -> None:
-    store = MetricsStore(tmp_path)
-    store.initialize()
-    legacy = store.record_operational_settings(statement_timeout_ms=0, lock_timeout_ms=30000)
-    data = store.load()
-    del data["runs"][0]["importer_version"]
-    store.path.write_text(json.dumps(data))
-    historical = dict(data["runs"][0])
-    new = store.record_operational_settings(statement_timeout_ms=120000, lock_timeout_ms=5000)
-    assert store.load()["runs"] == [historical, new]
-    assert new["importer_version"] == __version__

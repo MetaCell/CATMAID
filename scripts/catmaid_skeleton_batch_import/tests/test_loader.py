@@ -22,7 +22,7 @@ from catmaid_skeleton_batch_import.loader import (
     _treenode_row_matches,
     prepare_copy_rows,
 )
-from catmaid_skeleton_batch_import.planner import plan_archive, read_plan, write_plan
+from catmaid_skeleton_batch_import.planner import plan_archive
 from catmaid_skeleton_batch_import.swc import parse_swc
 
 
@@ -42,9 +42,7 @@ def test_display_name_sanitization_matches_copy_expectations_and_manifest(
     settings = ImportSettings(**DEFAULTS)
     plan = plan_archive(scan_archive(request, settings,
                                     bounds_nm=(((0, 0, 0), (1000, 1000, 1000)),)), settings)
-    plan_path = tmp_path / "plan.jsonl.gz"
-    write_plan(plan_path, plan)
-    batch = read_plan(plan_path).batches[0]
+    batch = plan.batches[0]
     assert batch.members[0].display_name == source_name
     project = ProjectContext(project_id=5, stack_id=None, project_stack_id=None,
                              user_id=1, neuron_class_id=8, skeleton_class_id=9,

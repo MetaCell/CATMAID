@@ -55,6 +55,17 @@ def _verification_inputs(tmp_path, plan, *, existing=False, unit="nm"):
     return store, state, project, request, connection
 
 
+def _save_node_maps(store, plan, request, project, load_nodes):
+    for batch in plan.batches:
+        with prepare_copy_rows(
+            batch, request, project,
+            list(range(batch.index * 100, batch.index * 100 + batch.skeleton_count * 5)),
+            list(range(batch.index * 1000, batch.index * 1000 + batch.node_count)),
+            load_nodes,
+        ) as prepared:
+            orchestrator._ensure_batch_node_map(store, prepared)
+
+
 def _counts(skeletons, nodes):
     return {
         "class_instance_count": skeletons * 3, "neuron_count": skeletons,
@@ -91,6 +102,8 @@ def test_final_verification_reads_each_swc_once_and_finishes_one_batch_at_a_time
     monkeypatch.setattr(loader, "verify_exact_treenodes", exact)
     monkeypatch.setattr(project_checks, "verify_project_aggregate_counts", aggregate_counts)
 
+    _save_node_maps(store, plan, request, project, load_nodes)
+    events.clear()
     result = orchestrator._verify_database_by_batch(
         store, plan, state, project, connection, load_nodes, request)
 
@@ -127,13 +140,15 @@ def test_final_verification_uses_stored_float4_cable_and_exact_node_checks(tmp_p
     monkeypatch.setattr(materialization, "validate_batch", validate_batch)
     monkeypatch.setattr(loader, "verify_exact_treenodes", exact)
 
+    _save_node_maps(store, plan, request, project, load_nodes)
+    loads.clear()
     assert orchestrator._verify_database_by_batch(
         store, plan, state, project, connection, load_nodes, request) == _counts(1, 2)
     assert loads == ["cell.swc"]
     assert exact_checks == [True]
 
 
-@pytest.mark.parametrize("damage", ["contents", "count", "hash"])
+@pytest.mark.parametrize("damage", ["missing", "contents", "count", "hash"])
 def test_saved_mapping_is_checked_against_reservations_and_artifact_metadata(
     tmp_path, damage,
 ):
@@ -147,7 +162,9 @@ def test_saved_mapping_is_checked_against_reservations_and_artifact_metadata(
         orchestrator._ensure_batch_node_map(store, prepared)
         descriptor = state["batches"][0]["artifacts"]["node_map"]
         path = tmp_path / descriptor["path"]
-        if damage == "count":
+        if damage == "missing":
+            del state["batches"][0]["artifacts"]["node_map"]
+        elif damage == "count":
             descriptor["count"] = 1
         elif damage == "hash":
             path.write_bytes(path.read_bytes() + b"changed")
@@ -157,4 +174,4 @@ def test_saved_mapping_is_checked_against_reservations_and_artifact_metadata(
             state["batches"][0]["artifacts"]["node_map"] = artifact_descriptor(
                 tmp_path, path, count=2)
         with pytest.raises(ImmutableStateError):
-            orchestrator._ensure_batch_node_map(store, prepared)
+            orchestrator._verify_batch_node_map(store, prepared)

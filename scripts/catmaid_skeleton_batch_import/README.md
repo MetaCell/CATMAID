@@ -168,8 +168,9 @@ must satisfy `0 <= coordinate_nm <= dimension[i] * resolution_nm[i]` on every
 axis; the physical extents must be positive and finite. Positions exactly on
 the boundary are accepted. In the example above, X = 100 µm is valid but
 X = 100.001 µm is rejected. All invalid members are collected in
-`error.details.member_errors` inside `error-details.json`, and no executable plan is produced. The same
-check runs when loading a planned member, including plans from older versions.
+`error.details.member_errors` inside `error-details.json`, and no executable plan
+is produced. Loading and final verification reuse the validated source snapshots,
+checking their size and SHA-256 against the plan before decoding.
 Radius `-1` (unknown) and parent `-1` (root) remain valid. Positions are not
 clipped or translated.
 Append requests use the target project's associated stack geometry captured by
@@ -188,8 +189,8 @@ Preflight may refresh the snapshot before planning; afterward it only checks
 that the saved metadata still matches. To use changed metadata, create a new
 state directory and repeat preflight and planning. The stack definitions and database
 identity are rechecked before loading and final verification; a changed
-target stops the run. Older append plans without this artifact are rescanned
-against the current stacks before any IDs are reserved or batches loaded.
+target stops the run. A missing stack snapshot also stops the run before IDs
+are reserved or batches loaded.
 Existing stacks and morphology, including existing out-of-bounds or negative
 coordinates, remain unchanged. Choose metadata consistent with the intended
 coordinate frame and viewer.
@@ -471,8 +472,8 @@ The mapping is streamed, gzip-compressed, atomically written and registered
 with its row count and SHA-256 in `state.json` before the batch transaction.
 Only a batch with status `committed` confirms that its mapped nodes were loaded;
 `prepared` or `retryable` mappings describe reserved IDs. Resume checks saved
-mappings against those same source rows and reserved IDs. For older workspaces,
-final verification creates missing mappings after verifying the database rows.
+mappings against those same source rows and reserved IDs. Final verification
+requires these saved mappings and checks them against the exact database rows.
 Retain the state directory on durable storage after the import if a review
 queue will need these mappings. They add no per-node CATMAID labels or new
 database table. They record import-time identity: merges and splits retain node
@@ -583,10 +584,7 @@ environment variables, then defaults; other values come from the saved plan:
 | `CATMAID_BATCH_IMPORT_LOCK_TIMEOUT_MS` | `30000` |
 
 There is no SWC file-count cap. The ZIP size, each SWC's uncompressed byte
-limit and the per-batch node budget remain enforced. The former
-`CATMAID_BATCH_IMPORT_MAX_SWC_COUNT` environment variable is ignored. Existing
-state files may retain `max_swc_count`; it is ignored at execution time without
-rewriting their immutable settings, reserved IDs or plan digests.
+limit and the per-batch node budget remain enforced.
 
 For newly created projects, the default cache is one 1.5 mm XY MessagePack grid with a single LOD bucket.
 The viewer requests the sole spatial profile at 100% LOD, so the bucket contains
@@ -630,6 +628,14 @@ input and artifact hashes, saved settings, ID reservations, project and batch
 statuses, and maintenance/cache/verification phases. The orchestrator uses this
 state to skip committed work, reuse reservations and block uncertain commits.
 
+Database maintenance runs after every batch has committed and before cache rebuilding.
+It executes PostgreSQL `ANALYZE` on `class_instance`,
+`class_instance_class_instance`, `treenode`, `treenode_edge` and
+`catmaid_skeleton_summary`. This refreshes query-planner statistics after the
+bulk load so subsequent queries can choose appropriate execution plans. It
+does not alter skeletons, rebuild indexes or run `VACUUM`. The phase is
+checkpointed, so a completed maintenance phase is skipped on retry.
+
 | File in the state directory | Purpose |
 | --- | --- |
 | `state.json` | Authoritative recovery checkpoints and phase/batch statuses. |
@@ -643,12 +649,7 @@ Cache rebuilding has a running phase in `state.json` and optional live cell
 counters in `cache-progress.json` (see measured cache progress below).
 The orchestrator measures operation durations with its monotonic clock and
 appends completed records through `record_phase()`. This is the sole timing
-writer: the unused phase context manager, timer class, begin/finish methods and
-injected clock have been removed. Schema-1 metrics and existing timing/count
-records remain unchanged. The legacy `active_phase` field is retained only for
-compatibility; if an older interrupted run left it populated, standalone resume
-preserves its history, appends a retryable interruption record and clears it
-before new timing records are appended. Live phase progress comes from
+writer. Live phase progress comes from
 `state.json` and `cache-progress.json`, independently of metrics.
 All planned nodes can therefore be loaded while cache rebuilding or final
 verification is still running.
@@ -733,7 +734,7 @@ uncertain commit outcomes continue to block further writes.
 
 Metrics record `edge_staging`, `edge_creation`, and `summary_refresh` within the
 existing `materialization` aggregate, plus the executing importer version for
-each run. Historical metrics remain readable. Do not add these child timings
+each run. Do not add these child timings
 to `materialization`, because they overlap.
 
 Paired local benchmarks on a populated 42.5-million-node database measured
@@ -743,15 +744,17 @@ and full 171-batch rehearsal passed. These are local measurements and do not
 establish a cluster speedup.
 
 
-## Prepared source and local node maps (0.7)
+## Source snapshots and local node maps
 
-New plans retain validated source nodes in deterministic gzip JSON-lines files,
-one bounded file per whole-SWC batch. Version-4 plans bind their SHA-256, sizes
-and node counts. Loading and final verification reuse those values instead of
+Planning retains validated source nodes through `source_snapshot.py` in deterministic
+gzip JSON-lines files, one bounded file per whole-SWC batch:
+`source-snapshot-000001.jsonl.gz`, `source-snapshot-000002.jsonl.gz`, and so on.
+The plan's `source_snapshots` descriptors bind each file's SHA-256, byte size and
+node count. Loading and final verification reuse these values instead of
 reparsing SWCs. Source-unit double precision, normal conversion and stored
-float32 checks remain. Version-3 plans retain the original ZIP-reader path and
-immutable settings/IDs/digest. State schema stays 3; metrics record the executing
-importer version, including local legacy-state resumes.
+float32 checks remain. Both steps require the snapshot files.
+
+The feature is unpublished and supports only the current plan/state format.
 
 The importer saves per-batch manifests and node maps in its local state directory.
 It has no NeuroGlass dependency, network callback or mapping-table migration.
@@ -768,24 +771,6 @@ safeguards remain available when the complete local workspace is retained.
 Losing that workspace is not permission to start another import into the same
 project. Successful reporting may remove the source ZIP, so a standalone rerun
 must first restore the exact checksum-matching source archive.
-
-
-The source-only benchmark performs one warm-up plus three measured trials by
-default; it creates no database connection. Use identical Python/runtime and
-resource limits for both modes, and discard trial 0 when computing medians:
-
-```bash
-PYTHONPATH=scripts/catmaid_skeleton_batch_import/src python \
-  scripts/catmaid_skeleton_batch_import/benchmarks/benchmark_prepared_source.py \
-  /path/to/aind-191805-two-batches.zip --mode baseline --coordinate-unit um
-PYTHONPATH=scripts/catmaid_skeleton_batch_import/src python \
-  scripts/catmaid_skeleton_batch_import/benchmarks/benchmark_prepared_source.py \
-  /path/to/aind-191805-two-batches.zip --mode prepared --coordinate-unit um
-```
-
-This measures source planning and two subsequent source reads, not total import,
-database/cache performance or cluster speedup. Trial totals should be compared
-directly; sums of independently computed component medians can differ.
 
 
 ## Measured cache progress

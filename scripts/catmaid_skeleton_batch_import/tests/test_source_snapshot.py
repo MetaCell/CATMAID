@@ -1,17 +1,15 @@
 import json
 from io import BytesIO
 from dataclasses import replace
-from pathlib import Path
 from zipfile import ZipFile
 from unittest.mock import patch
 
 import pytest
 
-from catmaid_skeleton_batch_import.config import load_request
 from catmaid_skeleton_batch_import.errors import ImmutableStateError, InvalidInputError
 from catmaid_skeleton_batch_import.orchestrator import plan_ingestion
 from catmaid_skeleton_batch_import.planner import read_plan, write_plan
-from catmaid_skeleton_batch_import.prepared_source import PreparedSourceReader
+from catmaid_skeleton_batch_import.source_snapshot import SourceSnapshotReader
 from catmaid_skeleton_batch_import.swc import parse_swc
 
 
@@ -35,9 +33,9 @@ def test_plan_retains_exact_validated_nodes_in_two_bounded_batches(tmp_path, mon
     assert plan.schema_version == 4
     assert [b.node_count for b in plan.batches] == [4, 2]
     expected = parse_swc(BytesIO(text), "test", max_bytes=1000, max_nodes=4, scale_nm=1, max_nm=(100, 100, 100)).nodes
-    with patch("catmaid_skeleton_batch_import.orchestrator.parse_swc", side_effect=AssertionError("SWCs must not be reparsed")):
+    with patch("catmaid_skeleton_batch_import.archive.parse_swc", side_effect=AssertionError("SWCs must not be reparsed")):
         for _ in range(2):  # loading and final verification use the same immutable input
-            with PreparedSourceReader(state, plan) as source:
+            with SourceSnapshotReader(state, plan) as source:
                 for member in plan.members:
                     assert source.load(member) == expected
     original = (state / "state.json").read_bytes()
@@ -45,24 +43,32 @@ def test_plan_retains_exact_validated_nodes_in_two_bounded_batches(tmp_path, mon
     assert (state / "state.json").read_bytes() == original
 
 
-def test_cache_tampering_fails_before_values_are_used(tmp_path, monkeypatch):
+def test_snapshot_tampering_fails_before_values_are_used(tmp_path, monkeypatch):
     state, plan, _, _ = planned(tmp_path, monkeypatch)
-    path = state / plan.prepared_batches[0]["path"]
+    path = state / plan.source_snapshots[0]["path"]
     path.write_bytes(path.read_bytes() + b"tampered")
-    with PreparedSourceReader(state, plan) as source, pytest.raises(ImmutableStateError):
+    with SourceSnapshotReader(state, plan) as source, pytest.raises(ImmutableStateError):
         source.load(plan.members[0])
 
 
-def test_legacy_v3_plan_still_round_trips_without_immutable_rewrite(tmp_path, monkeypatch):
+@pytest.mark.parametrize("damage", ["missing", "path", "count", "hash"])
+def test_plan_requires_valid_source_snapshot_descriptors(tmp_path, monkeypatch, damage):
     state, plan, _, _ = planned(tmp_path, monkeypatch)
-    legacy = replace(plan, schema_version=3, prepared_batches=())
-    path = state / "legacy.jsonl.gz"
-    digest = write_plan(path, legacy)
-    assert read_plan(path) == legacy
-    assert write_plan(path, read_plan(path)) == digest
+    descriptors = [dict(item) for item in plan.source_snapshots]
+    if damage == "missing":
+        descriptors = []
+    else:
+        key, value = {"path": ("path", "unexpected.jsonl.gz"),
+                      "count": ("node_count", 999),
+                      "hash": ("sha256", "invalid")}[damage]
+        descriptors[0][key] = value
+    path = state / "invalid.jsonl.gz"
+    write_plan(path, replace(plan, source_snapshots=tuple(descriptors)))
+    with pytest.raises(InvalidInputError, match="source snapshot"):
+        read_plan(path)
 
 
-def test_invalid_archive_does_not_publish_prepared_data(tmp_path, monkeypatch):
+def test_invalid_archive_does_not_publish_source_snapshots(tmp_path, monkeypatch):
     monkeypatch.setenv("CATMAID_BATCH_IMPORT_MAX_NODES_PER_BATCH", "4")
     archive = tmp_path / "source.zip"
     with ZipFile(archive, "w") as output:
@@ -73,22 +79,4 @@ def test_invalid_archive_does_not_publish_prepared_data(tmp_path, monkeypatch):
                                    "stack": {"dimension": [100, 100, 100], "resolution_nm": [1, 1, 1]}}))
     with pytest.raises(InvalidInputError):
         plan_ingestion(request, tmp_path / "state")
-    assert not list((tmp_path / "state").glob("prepared-*"))
-
-
-def test_legacy_file_count_metadata_survives_idempotent_planning(tmp_path, monkeypatch):
-    from catmaid_skeleton_batch_import.config import load_operational_settings, settings_from_state
-    from catmaid_skeleton_batch_import.state import StateStore
-    state_dir, plan, _text, request = planned(tmp_path, monkeypatch)
-    store = StateStore(state_dir)
-    state = store.load()
-    # Simulate a plan made before removal, preserving its old immutable setting.
-    state["settings"]["max_swc_count"] = 250_000
-    store._persist(state)
-    before = store.state_path.read_bytes()
-    result = plan_ingestion(request, state_dir)
-    assert result["ok"]
-    assert store.state_path.read_bytes() == before
-    restored = settings_from_state(store.load()["settings"], load_operational_settings())
-    assert "max_swc_count" not in restored.plan_dict()
-    assert read_plan(state_dir / "plan.jsonl.gz") == plan
+    assert not list((tmp_path / "state").glob("source-snapshot-*"))

@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import json
-import math
 import sys
 import time
-import zipfile
 from contextlib import ExitStack
 from dataclasses import replace
 import tempfile
@@ -44,10 +42,9 @@ from .errors import (
 from .loader import PreparedBatch, ProjectContext, execute_batch_transaction, prepare_copy_rows
 from .metrics import MetricsStore
 from .planner import ImportPlan, plan_archive, read_plan, write_plan
-from .prepared_source import PreparedSourceReader, PreparedSourceWriter
+from .source_snapshot import SourceSnapshotReader, SourceSnapshotWriter
 from .state import ArchiveMetadata, StateStore
-from .stack_bounds import StackBounds, geometry_bounds, read_project_stack_geometry
-from .swc import parse_swc
+from .stack_bounds import geometry_bounds, read_project_stack_geometry
 from .util import atomic_write_json, canonical_json_bytes, load_json, sha256_file
 
 
@@ -170,43 +167,34 @@ def plan_ingestion(request_path: Path, state_dir: Path) -> dict[str, object]:
         geometry = _planning_geometry(request, store)
         bounds = geometry_bounds(geometry) if geometry is not None else None
 
-        plan_settings = settings.plan_dict()
         if store.state_path.exists():
             state = store.verify_immutable()
             if not _same_normalized_request(request, store):
                 raise ImmutableStateError(
                     "Existing state directory contains a different normalized request"
                 )
-            persisted_settings = settings_from_state(
-                state["settings"], settings.operational_dict()
-            )
-            if persisted_settings.plan_dict() != settings.plan_dict():
+            if state["settings"] != settings.plan_dict():
                 raise ImmutableStateError(
                     "Existing state directory was planned with different deployment settings"
                 )
-            # Preserve every immutable legacy key when completing plan setup.
-            plan_settings = state["settings"]
             if "plan" in state.get("artifacts", {}):
                 store.verify_artifact("plan")
-                if geometry is None or "stack_geometry" in state.get("artifacts", {}):
-                    _check_saved_geometry(store, state, geometry)
-                    result = _plan_result(store, state)
-                    return _write_result(store.state_dir, result)
+                _check_saved_geometry(store, state, geometry)
+                result = _plan_result(store, state)
+                return _write_result(store.state_dir, result)
 
         _progress(f"Scanning and validating local archive {request.archive_path}")
         planning_started = time.monotonic()
-        with tempfile.TemporaryDirectory(prefix=".prepared-", dir=store.state_dir) as staging:
-            writer = PreparedSourceWriter(Path(staging), settings.max_nodes_per_batch)
+        with tempfile.TemporaryDirectory(prefix=".source-snapshot-", dir=store.state_dir) as staging:
+            writer = SourceSnapshotWriter(Path(staging), settings.max_nodes_per_batch)
             try:
                 scan = scan_archive(request, settings, bounds_nm=bounds, on_member=writer.add)
             finally:
                 writer.close()
             plan = plan_archive(scan, settings)
-            # Never change the immutable digest of an existing legacy checkpoint.
-            if not store.state_path.exists():
-                plan = replace(plan, schema_version=4, prepared_batches=tuple(writer.descriptors))
-                for descriptor in plan.prepared_batches:
-                    os.replace(Path(staging) / descriptor["path"], store.state_dir / descriptor["path"])
+            plan = replace(plan, source_snapshots=tuple(writer.descriptors))
+            for descriptor in plan.source_snapshots:
+                os.replace(Path(staging) / descriptor["path"], store.state_dir / descriptor["path"])
         plan_path = store.state_dir / PLAN_FILENAME
         plan_digest = write_plan(plan_path, plan)
         planning_duration = time.monotonic() - planning_started
@@ -214,7 +202,7 @@ def plan_ingestion(request_path: Path, state_dir: Path) -> dict[str, object]:
         state = store.initialize_plan(
             request,
             _archive_metadata(scan),
-            plan_settings,
+            settings.plan_dict(),
             plan.batches,
             plan_digest=plan_digest,
             planner_version=plan.schema_version,
@@ -226,8 +214,8 @@ def plan_ingestion(request_path: Path, state_dir: Path) -> dict[str, object]:
             compression="gzip",
             expected_sha256=plan_digest,
         )
-        for batch, descriptor in zip(plan.batches, plan.prepared_batches):
-            store.register_artifact("prepared_source", descriptor["path"], count=batch.node_count,
+        for batch, descriptor in zip(plan.batches, plan.source_snapshots):
+            store.register_artifact("source_snapshot", descriptor["path"], count=batch.node_count,
                                     batch_index=batch.index, expected_sha256=descriptor["sha256"])
         if geometry is not None:
             _write_registered_json(store, "stack_geometry", STACK_GEOMETRY_FILENAME, geometry)
@@ -759,75 +747,6 @@ def _prepare_batch_artifacts(
     return concept_ids, location_ids
 
 
-class _RunArchive:
-    def __init__(
-        self,
-        request: IngestionRequest,
-        settings: ImportSettings,
-        *, bounds_nm: tuple[StackBounds, ...] | None = None,
-    ) -> None:
-        if request.target_project_id is not None and bounds_nm is None:
-            raise InvalidInputError("Append validation requires associated target stack bounds")
-        self.request = request
-        self.settings = settings
-        self.bounds_nm = bounds_nm
-        self.archive: zipfile.ZipFile | None = None
-
-    def __enter__(self) -> "_RunArchive":
-        try:
-            self.archive = zipfile.ZipFile(self.request.archive_path, "r")
-        except (OSError, zipfile.BadZipFile) as exc:
-            raise ImmutableStateError(f"Could not reopen immutable archive: {exc}") from exc
-        return self
-
-    def __exit__(self, *_args: object) -> None:
-        if self.archive is not None:
-            self.archive.close()
-
-    def load(self, member: PlannedMember) -> Sequence[SwcNode]:
-        assert self.archive is not None
-        try:
-            info = self.archive.getinfo(member.member_path)
-        except KeyError as exc:
-            raise ImmutableStateError(
-                f"Planned archive member is missing: {member.member_path}"
-            ) from exc
-        if info.file_size != member.uncompressed_bytes or info.CRC != member.crc32:
-            raise ImmutableStateError(
-                f"Planned archive member metadata changed: {member.member_path}"
-            )
-        try:
-            with self.archive.open(info, "r") as source:
-                parsed = parse_swc(
-                    source,
-                    f"{self.request.archive_path.name}:{member.member_path}",
-                    max_bytes=self.settings.max_swc_bytes,
-                    max_nodes=self.settings.max_nodes_per_batch,
-                    scale_nm=self.request.scale_nm,
-                    max_nm=self.request.max_nm if self.request.target_project_id is None else None,
-                    bounds_nm=self.bounds_nm,
-                )
-        except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
-            raise ImmutableStateError(
-                f"Could not read planned archive member {member.member_path}: {exc}"
-            ) from exc
-        if parsed.summary.node_count != member.node_count:
-            raise ImmutableStateError(
-                f"Planned node count changed for {member.member_path}"
-            )
-        expected_cable = parsed.summary.cable_length_source_units * self.request.scale_nm
-        if not math.isclose(
-            expected_cable,
-            member.cable_length_nm,
-            rel_tol=1e-12,
-            abs_tol=max(1e-6, abs(member.cable_length_nm) * 1e-12),
-        ):
-            raise ImmutableStateError(
-                f"Planned cable length changed for {member.member_path}"
-            )
-        return parsed.nodes
-
-
 def _buffer_loader_timing(
     records: list[tuple[str, float, dict[str, int]]],
 ) -> Callable[[str, float, dict[str, int]], None]:
@@ -877,16 +796,23 @@ def _reconcile_completed_progress(
     )
 
 
+def _verify_batch_node_map(store: StateStore, prepared: PreparedBatch) -> None:
+    """Require the mapping saved before the batch's database transaction."""
+    state = store.load()
+    path = _artifact_path(store, state, "node_map", batch_index=prepared.batch.index)
+    descriptor = _batch_state(state, prepared.batch.index)["artifacts"]["node_map"]
+    if descriptor["count"] != prepared.batch.node_count:
+        raise ImmutableStateError(f"Node mapping count changed for batch {prepared.batch.index}")
+    verify_node_map(path, prepared.node_map_file)
+
+
 def _ensure_batch_node_map(store: StateStore, prepared: PreparedBatch) -> None:
     """Save reserved identities before COMMIT and check them on every retry."""
     batch = prepared.batch
     state = store.load()
     descriptor = _batch_state(state, batch.index)["artifacts"].get("node_map")
     if descriptor is not None:
-        if descriptor["count"] != batch.node_count:
-            raise ImmutableStateError(f"Node mapping count changed for batch {batch.index}")
-        path = _artifact_path(store, state, "node_map", batch_index=batch.index)
-        verify_node_map(path, prepared.node_map_file)
+        _verify_batch_node_map(store, prepared)
         return
     relative = Path("batches") / f"{batch.index:06d}" / "node-map.csv.gz"
     write_node_map(store.state_dir / relative, prepared.node_map_file)
@@ -903,7 +829,7 @@ def _run_batch(
     settings: ImportSettings,
     project: ProjectContext,
     connection: Any,
-    archive: _RunArchive,
+    archive: SourceSnapshotReader,
     metrics: MetricsStore,
 ) -> None:
     state = store.load()
@@ -1184,9 +1110,7 @@ def _verify_database_by_batch(
             )
             with connection.cursor() as cursor:
                 verify_exact_treenodes(cursor, prepared)
-            # Also backfill mappings for batches committed by an older importer,
-            # but only after verifying their exact database rows and reservations.
-            _ensure_batch_node_map(store, prepared)
+            _verify_batch_node_map(store, prepared)
         for key, value in counts.items():
             imported_counts[key] = imported_counts.get(key, 0) + value
         if (
@@ -1261,12 +1185,6 @@ def run_ingestion(
             planned_nodes=plan.total_nodes,
             planned_skeletons=plan.member_count,
         )
-        recovered_phase = metrics.recover_active_phase()
-        if recovered_phase is not None:
-            _progress(
-                f"Recovered interrupted metrics phase "
-                f"{recovered_phase['name']}"
-            )
         metrics.record_operational_settings(
             statement_timeout_ms=settings.statement_timeout_ms,
             lock_timeout_ms=settings.lock_timeout_ms,
@@ -1282,16 +1200,7 @@ def run_ingestion(
                 existing_project_import_lock(request.target_project_id, connection)
             )
         geometry = _append_geometry(request, connection)
-        bounds = geometry_bounds(geometry) if geometry is not None else None
-        if geometry is not None:
-            state = store.load()
-            if "stack_geometry" in state.get("artifacts", {}):
-                _check_saved_geometry(store, state, geometry)
-            else:
-                # Older plans must pass the same bounds check before reserving
-                # IDs or loading any batch. Preserve already committed data.
-                scan_archive(request, settings, bounds_nm=bounds)
-                _write_registered_json(store, "stack_geometry", STACK_GEOMETRY_FILENAME, geometry)
+        _check_saved_geometry(store, store.load(), geometry)
         state = store.load()
         project = _ensure_project(
             store, state, request, settings, connection, metrics
@@ -1311,8 +1220,7 @@ def run_ingestion(
             )
         _progress("Offline import: keep the Neuroglass managed layer inactive until verification succeeds")
 
-        with (PreparedSourceReader(store.state_dir, plan) if plan.prepared_batches
-              else _RunArchive(request, settings, bounds_nm=bounds)) as archive:
+        with SourceSnapshotReader(store.state_dir, plan) as archive:
             for batch in plan.batches:
                 _run_batch(
                     store,
@@ -1394,8 +1302,7 @@ def run_ingestion(
                     cache_cell_size_nm=settings.cache_cell_size_nm,
                     connection=connection,
                 )
-            with (PreparedSourceReader(store.state_dir, plan) if plan.prepared_batches
-                  else _RunArchive(request, settings, bounds_nm=bounds)) as verification_archive:
+            with SourceSnapshotReader(store.state_dir, plan) as verification_archive:
                 database_result = _verify_database_by_batch(
                     store,
                     plan,

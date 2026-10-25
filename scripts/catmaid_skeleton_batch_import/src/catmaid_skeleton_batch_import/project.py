@@ -199,6 +199,7 @@ def create_hidden_project(
         "annotation_class_id": int(class_map["annotation"]),
         "annotated_with_relation_id": int(relation_map["annotated_with"]),
         "metadata": metadata,
+        "existing_project": False,
     }
 
 

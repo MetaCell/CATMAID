@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from catmaid_skeleton_batch_import.archive import scan_archive
-from catmaid_skeleton_batch_import.domain import ImportSettings, IngestionRequest, PlannedMember
+from catmaid_skeleton_batch_import.domain import ImportSettings, IngestionRequest
 from catmaid_skeleton_batch_import.errors import InvalidInputError
 
 
@@ -224,33 +224,12 @@ def test_planning_reports_all_members_beyond_declared_stack_without_a_partial_pl
     assert not (state_dir / "state.json").exists()
 
 
-def test_run_rechecks_declared_extent_for_previously_planned_members(tmp_path):
-    from catmaid_skeleton_batch_import.orchestrator import _RunArchive
-
-    archive_path = tmp_path / "old-plan.zip"
-    content = b"1 1 10.001 0 0 -1 -1\n"
-    write_zip(archive_path, [("cell.swc", content)])
-    with zipfile.ZipFile(archive_path) as archive:
-        info = archive.getinfo("cell.swc")
-    member = PlannedMember(
-        member_path=info.filename, node_count=1, uncompressed_bytes=info.file_size,
-        crc32=info.CRC, display_name="cell", fragment_id="cell", cable_length_nm=0,
-    )
-    with _RunArchive(request(archive_path), settings()) as archive:
-        with pytest.raises(InvalidInputError, match="exceeds declared stack extent"):
-            archive.load(member)
-
-
 def test_append_requires_resolved_target_stack_bounds(tmp_path):
-    from catmaid_skeleton_batch_import.orchestrator import _RunArchive
-
     archive_path = tmp_path / "append.zip"
     write_zip(archive_path, [("cell.swc", b"1 1 1000000000 0 0 -1 -1\n")])
     ingestion_request = IngestionRequest(1, archive_path, "um", target_project_id=123)
     with pytest.raises(InvalidInputError, match="requires associated target stack bounds"):
         scan_archive(ingestion_request, settings())
-    with pytest.raises(InvalidInputError, match="requires associated target stack bounds"):
-        _RunArchive(ingestion_request, settings())
     with pytest.raises(InvalidInputError, match="outside all associated target stack bounds"):
         scan_archive(ingestion_request, settings(), bounds_nm=(((0, 0, 0), (1000, 1000, 1000)),))
 

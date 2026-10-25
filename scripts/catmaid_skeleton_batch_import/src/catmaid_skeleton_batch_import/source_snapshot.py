@@ -1,7 +1,7 @@
 """Hash-bound validated source nodes, grouped by the same whole-SWC batches as planning.
 
-Coordinates remain source-unit Python doubles. Stored float4 rounding still happens
-in the loader, exactly as for the legacy ZIP reader. No database rows are cached.
+Coordinates remain source-unit Python doubles. Unit conversion and stored float4
+rounding happen in the loader. Snapshots contain source nodes, not database rows.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from .errors import ImmutableStateError
 from .util import sha256_file
 
 
-class PreparedSourceWriter:
+class SourceSnapshotWriter:
     def __init__(self, root: Path, maximum_nodes: int):
         self.root = root
         self.maximum_nodes = maximum_nodes
@@ -26,7 +26,7 @@ class PreparedSourceWriter:
     def add(self, member, nodes):
         if self.output is None or self.nodes + member.node_count > self.maximum_nodes:
             self.close_batch()
-            path = self.root / f"prepared-{len(self.descriptors) + 1:06d}.jsonl.gz"
+            path = self.root / f"source-snapshot-{len(self.descriptors) + 1:06d}.jsonl.gz"
             self.root.mkdir(parents=True, exist_ok=True)
             self.raw = path.open("wb")
             self.output = gzip.GzipFile(filename="", mode="wb", fileobj=self.raw, mtime=0, compresslevel=1)
@@ -51,7 +51,7 @@ class PreparedSourceWriter:
         self.close_batch()
 
 
-class PreparedSourceReader:
+class SourceSnapshotReader:
     """Keep only one bounded batch in memory; verify its bytes before decoding."""
     def __init__(self, root, plan):
         self.root = root
@@ -67,14 +67,14 @@ class PreparedSourceReader:
 
     def load(self, member):
         if self.batch_index != member.batch_index:
-            descriptor = self.plan.prepared_batches[member.batch_index - 1]
+            descriptor = self.plan.source_snapshots[member.batch_index - 1]
             path = self.root / descriptor["path"]
             try:
                 valid = path.stat().st_size == descriptor["size_bytes"] and sha256_file(path) == descriptor["sha256"]
             except OSError as exc:
-                raise ImmutableStateError("Prepared source is missing; restore it from the hash-pinned archive") from exc
+                raise ImmutableStateError("Source snapshot is missing; restore the retained state files") from exc
             if not valid:
-                raise ImmutableStateError("Prepared source bytes differ from the immutable plan")
+                raise ImmutableStateError("Source snapshot bytes differ from the immutable plan")
             expected = {m.member_path: m for m in self.plan.batches[member.batch_index - 1].members}
             decoded = {}
             try:
@@ -87,7 +87,7 @@ class PreparedSourceReader:
                 if set(decoded) != set(expected):
                     raise ValueError("missing members")
             except (ValueError, TypeError, OSError, EOFError) as exc:
-                raise ImmutableStateError(f"Invalid prepared source: {exc}") from exc
+                raise ImmutableStateError(f"Invalid source snapshot: {exc}") from exc
             self.members = decoded
             self.batch_index = member.batch_index
         return self.members[member.member_path]

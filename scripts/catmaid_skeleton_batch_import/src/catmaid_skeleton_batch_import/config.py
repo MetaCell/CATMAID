@@ -231,11 +231,6 @@ def settings_from_state(
     plan_values: dict[str, Any], operational: dict[str, int]
 ) -> ImportSettings:
     """Combine immutable planned settings with current operational timeouts."""
-    # Earlier state files retain this obsolete immutable key. Ignore it at
-    # execution time without changing their recorded settings or digests.
-    plan_values = {
-        key: value for key, value in plan_values.items() if key != "max_swc_count"
-    }
     return ImportSettings(
         **plan_values,
         statement_timeout_ms=operational["statement_timeout_ms"],

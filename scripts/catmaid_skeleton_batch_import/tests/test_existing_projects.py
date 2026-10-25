@@ -308,7 +308,7 @@ def test_changed_append_geometry_or_database_is_rejected_before_reserving_ids(tm
     assert StateStore(state_dir).load()["batches"][0]["status"] == "planned"
 
 
-def test_older_append_plan_is_checked_before_loading_or_reserving_ids(tmp_path, monkeypatch):
+def test_missing_stack_snapshot_fails_before_loading_or_reserving_ids(tmp_path, monkeypatch):
     from catmaid_skeleton_batch_import.util import atomic_write_json
 
     connection = Connection()
@@ -322,7 +322,7 @@ def test_older_append_plan_is_checked_before_loading_or_reserving_ids(tmp_path, 
     connection.geometry["stacks"][0]["dimension"] = [1, 100, 100]
     monkeypatch.setattr(database, "allocate_sequence_ids", forbidden)
     monkeypatch.setattr(orchestrator, "execute_batch_transaction", forbidden)
-    with pytest.raises(InvalidInputError, match="outside all associated target stack bounds"):
+    with pytest.raises(ImmutableStateError, match="Missing state artifact: stack_geometry"):
         orchestrator.run_ingestion(state_dir)
     assert store.load()["batches"][0]["status"] == "planned"
 
@@ -340,26 +340,6 @@ def test_wrong_database_does_not_persist_a_conflicting_runtime_fingerprint(tmp_p
     with pytest.raises(ImmutableStateError, match="differs from append planning"):
         database_context(store, store.load())
     assert "database" not in store.load()["artifacts"]
-
-
-def test_valid_older_append_plan_gains_geometry_checkpoint_and_can_finish(tmp_path, monkeypatch):
-    from catmaid_skeleton_batch_import.util import atomic_write_json
-
-    connection = Connection()
-    configure_run(monkeypatch, connection)
-    state_dir = tmp_path / "state"
-    plan_append(request_file(tmp_path), state_dir)
-    store = StateStore(state_dir)
-    state = store.load()
-    del state["artifacts"]["stack_geometry"]
-    atomic_write_json(store.state_path, state)
-    def commit(_prepared, _context, _settings, before_commit, _timings):
-        before_commit()
-        return dict(COUNTS)
-    monkeypatch.setattr(orchestrator, "execute_batch_transaction", commit)
-    monkeypatch.setattr(loader, "verify_exact_treenodes", lambda *_args: None)
-    assert orchestrator.run_ingestion(state_dir)["status"] == "complete"
-    assert "stack_geometry" in store.load()["artifacts"]
 
 
 def test_geometry_change_during_import_prevents_completion(tmp_path, monkeypatch):
@@ -505,11 +485,8 @@ def test_cache_is_rebuilt_once_after_all_batches(tmp_path, monkeypatch):
     assert events == ["commit_1", "commit_2", "cache", "cache"]
 
 
-def test_old_project_contexts_remain_readable():
-    value = {key: item for key, item in CONTEXT.items() if key != "existing_project"}
-    value.update(stack_id=2, project_stack_id=3)
-    assert ProjectContext.from_dict(value).existing_project is False
-    assert ProjectContext.from_dict(ProjectContext.from_dict(CONTEXT).to_dict()).existing_project is True
+def test_project_context_round_trips():
+    assert ProjectContext.from_dict(CONTEXT).to_dict() == CONTEXT
 
 
 @pytest.mark.parametrize("interrupted", [False, True], ids=["explicit-rebuild", "resume"])

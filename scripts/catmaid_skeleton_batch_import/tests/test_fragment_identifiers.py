@@ -16,7 +16,7 @@ from catmaid_skeleton_batch_import.fragments import (
 )
 from catmaid_skeleton_batch_import.planner import build_plan, read_plan, serialize_plan, write_plan
 from catmaid_skeleton_batch_import.state import StateStore
-from test_planner import member
+from test_planner import member, with_source_snapshots
 
 
 @pytest.mark.parametrize(("filename", "expected"), [
@@ -66,11 +66,11 @@ def test_plan_rejects_fragment_identifier_inconsistent_with_filename():
 
 
 def test_new_plan_and_manifest_preserve_identifier_and_five_id_layout(tmp_path):
-    plan = build_plan([member("191805/ 0021814 .swc", 2)], 2)
+    plan = with_source_snapshots(build_plan([member("191805/ 0021814 .swc", 2)], 2))
     path = tmp_path / "plan.jsonl.gz"
     write_plan(path, plan)
     loaded = read_plan(path)
-    assert loaded.schema_version == 3
+    assert loaded.schema_version == 4
     assert loaded.members[0].fragment_id == "0021814"
     rows = manifest_rows(loaded.batches[0], [10, 11, 12, 13, 14])
     assert rows[0]["fragment_id"] == "0021814"
@@ -94,12 +94,12 @@ def test_old_plan_with_untrimmed_identifiers_is_rejected_instead_of_renormalized
         read_plan(path)
 
 
-@pytest.mark.parametrize("schema_version", [1, 2])
+@pytest.mark.parametrize("schema_version", [1, 2, 3])
 def test_rejects_old_development_plan_before_reading_old_member_layout(tmp_path, schema_version):
     path = tmp_path / "old.jsonl.gz"
     with gzip.open(path, "wt") as target:
         target.write(json.dumps({"record_type": "header", "schema_version": schema_version}) + "\n")
-    with pytest.raises(InvalidInputError, match="old development workspaces cannot be resumed"):
+    with pytest.raises(InvalidInputError, match="unsupported plan schema version"):
         read_plan(path)
 
 

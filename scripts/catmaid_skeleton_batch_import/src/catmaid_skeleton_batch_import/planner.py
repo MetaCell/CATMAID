@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -21,8 +22,7 @@ from .util import (
 )
 
 
-PLAN_SCHEMA_VERSION = 3  # Summary-only plans remain byte-compatible.
-PREPARED_PLAN_SCHEMA_VERSION = 4
+PLAN_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -33,7 +33,7 @@ class ImportPlan:
     max_nodes_per_batch: int
     members: tuple[PlannedMember, ...]
     batches: tuple[PlannedBatch, ...]
-    prepared_batches: tuple[dict[str, Any], ...] = ()
+    source_snapshots: tuple[dict[str, Any], ...] = ()
 
     @property
     def member_count(self) -> int:
@@ -55,9 +55,8 @@ class ImportPlan:
             "member_count": self.member_count,
             "batch_count": self.batch_count,
             "total_nodes": self.total_nodes,
+            "source_snapshots": list(self.source_snapshots),
         }
-        if self.prepared_batches:
-            result["prepared_batches"] = list(self.prepared_batches)
         return result
 
 
@@ -273,10 +272,9 @@ def read_plan(path: Path) -> ImportPlan:
         if not header_line.strip():
             raise InvalidInputError(f"Plan contains an empty record: {path}")
         header = _load_json_record(header_line, path, 1)
-        if header.get("schema_version") not in (3, 4):
+        if header.get("schema_version") != PLAN_SCHEMA_VERSION:
             raise InvalidInputError(
-                f"{path}: unsupported plan schema version {header.get('schema_version')}; "
-                "old development workspaces cannot be resumed; start a new state directory"
+                f"{path}: unsupported plan schema version {header.get('schema_version')}"
             )
         persisted_members: list[PlannedMember] = []
         for line_number, line in enumerate(lines, 2):
@@ -301,9 +299,8 @@ def read_plan(path: Path) -> ImportPlan:
         "member_count",
         "batch_count",
         "total_nodes",
+        "source_snapshots",
     }
-    if header.get("schema_version") == 4:
-        expected_header.add("prepared_batches")
     if set(header) != expected_header or header.get("record_type") != "header":
         raise InvalidInputError(f"{path}: invalid plan header")
     schema_version = _record_int(header, "schema_version", path, 1)
@@ -311,7 +308,7 @@ def read_plan(path: Path) -> ImportPlan:
     expected_member_count = _record_int(header, "member_count", path, 1)
     expected_batch_count = _record_int(header, "batch_count", path, 1)
     expected_total_nodes = _record_int(header, "total_nodes", path, 1)
-    if schema_version not in (3, 4):
+    if schema_version != PLAN_SCHEMA_VERSION:
         raise InvalidInputError(
             f"{path}: unsupported plan schema version {schema_version}"
         )
@@ -332,17 +329,14 @@ def read_plan(path: Path) -> ImportPlan:
         or rebuilt.total_nodes != expected_total_nodes
     ):
         raise InvalidInputError(f"{path}: plan header counts do not match records")
-    if schema_version == 4:
-        descriptors = header["prepared_batches"]
-        if not isinstance(descriptors, list) or len(descriptors) != rebuilt.batch_count:
-            raise InvalidInputError(f"{path}: invalid prepared batch count")
-        import re
-        for batch, item in zip(rebuilt.batches, descriptors):
-            if (not isinstance(item, dict) or set(item) != {"path", "sha256", "size_bytes", "node_count"}
-                    or item["path"] != f"prepared-{batch.index:06d}.jsonl.gz"
-                    or not isinstance(item["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])
-                    or type(item["size_bytes"]) is not int or item["size_bytes"] <= 0
-                    or type(item["node_count"]) is not int or item["node_count"] != batch.node_count):
-                raise InvalidInputError(f"{path}: invalid prepared batch descriptor")
-        return replace(rebuilt, schema_version=4, prepared_batches=tuple(descriptors))
-    return rebuilt
+    descriptors = header["source_snapshots"]
+    if not isinstance(descriptors, list) or len(descriptors) != rebuilt.batch_count:
+        raise InvalidInputError(f"{path}: invalid source snapshot count")
+    for batch, item in zip(rebuilt.batches, descriptors):
+        if (not isinstance(item, dict) or set(item) != {"path", "sha256", "size_bytes", "node_count"}
+                or item["path"] != f"source-snapshot-{batch.index:06d}.jsonl.gz"
+                or not isinstance(item["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])
+                or type(item["size_bytes"]) is not int or item["size_bytes"] <= 0
+                or type(item["node_count"]) is not int or item["node_count"] != batch.node_count):
+            raise InvalidInputError(f"{path}: invalid source snapshot descriptor")
+    return replace(rebuilt, source_snapshots=tuple(descriptors))

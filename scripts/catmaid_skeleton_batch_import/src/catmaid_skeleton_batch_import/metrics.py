@@ -161,7 +161,6 @@ class MetricsStore:
             "schema_version": SCHEMA_VERSION,
             "status": "pending",
             "counts": expected,
-            "active_phase": None,
             "phases": [],
             "runs": [],
         }
@@ -292,11 +291,6 @@ class MetricsStore:
         """Append a completed phase with one atomic metrics-file replacement."""
 
         metrics = self.load()
-        if metrics["active_phase"] is not None:
-            raise ImmutableStateError(
-                f"Metrics already have an active phase: "
-                f"{metrics['active_phase']['name']}"
-            )
         identity = _phase_identity(
             name,
             batch_index=batch_index,
@@ -317,32 +311,5 @@ class MetricsStore:
             metrics["status"] = "in_progress"
         if status in ("failed", "operator_attention"):
             metrics["status"] = status
-        atomic_write_json(self.path, metrics)
-        return copy.deepcopy(record)
-
-    def recover_active_phase(self) -> dict[str, Any] | None:
-        """Retain compatibility with active timing records written by older versions."""
-
-        metrics = self.load()
-        active = metrics["active_phase"]
-        if active is None:
-            return None
-        if not isinstance(active, dict) or not isinstance(active.get("name"), str):
-            raise ImmutableStateError("Metrics active phase is malformed")
-        identity = {key: value for key, value in active.items() if key != "status"}
-        record = _completed_phase_record(
-            metrics,
-            identity,
-            duration_seconds=0.0,
-            status="retryable",
-            node_count=None,
-            row_counts=None,
-            error="Importer process ended before phase metrics were completed",
-        )
-        record["recovered_after_interruption"] = True
-        metrics["phases"].append(record)
-        metrics["active_phase"] = None
-        if metrics["status"] == "pending":
-            metrics["status"] = "in_progress"
         atomic_write_json(self.path, metrics)
         return copy.deepcopy(record)

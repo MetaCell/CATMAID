@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,13 @@ def member(path: str, nodes: int) -> PlannedMember:
     )
 
 
+def with_source_snapshots(plan):
+    return replace(plan, source_snapshots=tuple({
+        "path": f"source-snapshot-{batch.index:06d}.jsonl.gz",
+        "sha256": "a" * 64, "size_bytes": 100, "node_count": batch.node_count,
+    } for batch in plan.batches))
+
+
 def test_sorts_exact_paths_and_greedily_builds_hard_batches() -> None:
     plan = build_plan(
         [member("c.swc", 80), member("a.swc", 100), member("b.swc", 120)],
@@ -55,6 +63,7 @@ def test_gzip_jsonl_is_deterministic_and_round_trips(tmp_path: Path) -> None:
         [member("b.swc", 3), member("a.swc", 2)],
         4,
     )
+    plan = with_source_snapshots(plan)
     first = serialize_plan(plan)
     second = serialize_plan(plan)
     assert first == second

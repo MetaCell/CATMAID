@@ -38,7 +38,6 @@ def make_store(tmp_path: Path, *, batch_count: int = 2) -> tuple[StateStore, dic
         "max_nodes_per_batch": 10,
         "max_archive_bytes": 1_000_000,
         "max_swc_bytes": 10_000,
-        "max_swc_count": 100,
         "max_total_nodes": None,
         "cache_cell_size_nm": 1_500_000,
         "lod_levels": 7,
