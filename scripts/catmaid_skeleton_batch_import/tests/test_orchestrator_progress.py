@@ -43,9 +43,19 @@ def test_records_confirmed_committed_progress(tmp_path: Path) -> None:
     assert reconciled["counts"]["skeletons"]["completed"] == 5
 
 
-def test_loader_timing_is_buffered_until_after_transaction(tmp_path: Path) -> None:
+def test_loader_timings_are_flushed_together_after_transaction(tmp_path: Path, monkeypatch) -> None:
+    from catmaid_skeleton_batch_import import metrics as metrics_module
+
     metrics = MetricsStore(tmp_path)
     metrics.initialize(planned_batches=1, planned_nodes=8, planned_skeletons=2)
+    write = metrics_module.atomic_write_json
+    writes = []
+
+    def observe_write(path, value):
+        writes.append(path)
+        write(path, value)
+
+    monkeypatch.setattr(metrics_module, "atomic_write_json", observe_write)
     records: list[tuple[str, float, dict[str, int]]] = []
     callback = _buffer_loader_timing(records)
 
@@ -60,9 +70,22 @@ def test_loader_timing_is_buffered_until_after_transaction(tmp_path: Path) -> No
         },
     )
 
+    callback("edge_creation", 0.5, {"nodes": 8, "skeletons": 2, "edge_rows": 8})
+    callback("summary_refresh", 0.25, {"nodes": 8, "skeletons": 2, "summary_rows": 2})
+
     assert metrics.load()["phases"] == []
+    assert writes == []
     _flush_loader_timings(metrics, 1, records)
-    phase = metrics.load()["phases"][0]
+    assert writes == [metrics.path]
+    phases = metrics.load()["phases"]
+    assert [phase["name"] for phase in phases] == [
+        "batch_000001_copy", "batch_000001_edge_creation", "batch_000001_summary_refresh",
+    ]
+    assert [phase["sequence"] for phase in phases] == [1, 2, 3]
+    assert [phase["duration_seconds"] for phase in phases] == [1.25, 0.5, 0.25]
+    assert phases[1]["row_counts"] == {"edge_rows": 8}
+    assert phases[2]["row_counts"] == {"summary_rows": 2}
+    phase = phases[0]
     assert phase["name"] == "batch_000001_copy"
     assert phase["duration_seconds"] == 1.25
     assert phase["row_counts"] == {"treenode_rows": 8}

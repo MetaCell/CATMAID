@@ -519,20 +519,22 @@ def _flush_loader_timings(
     batch_index: int,
     records: Sequence[tuple[str, float, dict[str, int]]],
 ) -> None:
-    for name, duration, counts in records:
-        metrics.record_phase(
-            f"batch_{batch_index:06d}_{name}",
-            duration_seconds=duration,
-            batch_index=batch_index,
-            batch_node_count=counts["nodes"],
-            batch_skeleton_count=counts["skeletons"],
-            node_count=counts["nodes"],
-            row_counts={
+    metrics.record_phases([
+        {
+            "name": f"batch_{batch_index:06d}_{name}",
+            "duration_seconds": duration,
+            "batch_index": batch_index,
+            "batch_node_count": counts["nodes"],
+            "batch_skeleton_count": counts["skeletons"],
+            "node_count": counts["nodes"],
+            "row_counts": {
                 key: value
                 for key, value in counts.items()
                 if key.endswith("_rows")
             },
-        )
+        }
+        for name, duration, counts in records
+    ])
 
 
 def _record_completed_progress(

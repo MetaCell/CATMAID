@@ -141,29 +141,6 @@ def database_target_fingerprint(connection: Any | None = None) -> dict[str, Any]
     }
 
 
-def _migration_status(connection: Any, executor_factory: Any | None) -> dict[str, Any]:
-    if executor_factory is None:
-        from django.db.migrations.executor import MigrationExecutor
-
-        executor_factory = MigrationExecutor
-    executor = executor_factory(connection)
-    targets = executor.loader.graph.leaf_nodes()
-    plan = executor.migration_plan(targets)
-    if plan:
-        unapplied = [f"{migration.app_label}.{migration.name}" for migration, _ in plan]
-        raise DatabasePreflightError(
-            "Unapplied Django migrations: " + ", ".join(unapplied)
-        )
-    catmaid_leaves = sorted(
-        migration_name
-        for app_label, migration_name in targets
-        if app_label == "catmaid"
-    )
-    if not catmaid_leaves:
-        raise DatabasePreflightError("No CATMAID migration leaf was found")
-    return {"catmaid_leaf_migrations": catmaid_leaves, "unapplied": []}
-
-
 def _check_replica_role(connection: Any, atomic_factory: Any | None) -> None:
     if atomic_factory is None:
         from django.db import transaction
@@ -187,11 +164,10 @@ def _check_replica_role(connection: Any, atomic_factory: Any | None) -> None:
 def preflight_database(
     connection: Any | None = None,
     *,
-    executor_factory: Any | None = None,
     atomic_factory: Any | None = None,
     require_replica_role: bool = True,
 ) -> dict[str, Any]:
-    """Verify migrations, schema objects, functions, role, and target identity.
+    """Verify schema objects, functions, role, and target identity.
 
     The checks do not create application rows.  Sequence allocation is kept as
     an explicit later operation because ``nextval`` is intentionally not
@@ -199,7 +175,6 @@ def preflight_database(
     """
 
     connection = _default_connection(connection)
-    migrations = _migration_status(connection, executor_factory)
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -262,7 +237,6 @@ def preflight_database(
     return {
         "target": target,
         "catmaid_version": catmaid_version,
-        "migrations": migrations,
         "objects": sorted(REQUIRED_TABLES + REQUIRED_SEQUENCES),
         "functions": sorted(REQUIRED_FUNCTIONS),
         "system_user_id": int(system_user.id),

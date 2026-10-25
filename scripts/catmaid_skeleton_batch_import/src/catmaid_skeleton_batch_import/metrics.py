@@ -10,7 +10,7 @@ from __future__ import annotations
 import copy
 import math
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from . import __version__
 from .errors import ImmutableStateError, InvalidInputError
@@ -81,14 +81,23 @@ def _phase_identity(
 
 def _completed_phase_record(
     metrics: Mapping[str, Any],
-    identity: Mapping[str, Any],
+    name: str,
     *,
     duration_seconds: float,
-    status: OperationStatus,
-    node_count: int | None,
-    row_counts: Mapping[str, object] | None,
-    error: str | None,
+    status: OperationStatus = OperationStatus.COMPLETE,
+    batch_index: int | None = None,
+    batch_node_count: int | None = None,
+    batch_skeleton_count: int | None = None,
+    node_count: int | None = None,
+    row_counts: Mapping[str, object] | None = None,
+    error: str | None = None,
 ) -> dict[str, Any]:
+    identity = _phase_identity(
+        name,
+        batch_index=batch_index,
+        batch_node_count=batch_node_count,
+        batch_skeleton_count=batch_skeleton_count,
+    )
     try:
         status = OperationStatus(status)
     except (ValueError, TypeError) as exc:
@@ -247,7 +256,6 @@ class MetricsStore:
         atomic_write_json(self.path, metrics)
         return copy.deepcopy(metrics)
 
-
     def record_phase(
         self,
         name: str,
@@ -263,26 +271,33 @@ class MetricsStore:
     ) -> dict[str, Any]:
         """Append a completed phase with one atomic metrics-file replacement."""
 
+        return self.record_phases([{
+            "name": name,
+            "duration_seconds": duration_seconds,
+            "status": status,
+            "batch_index": batch_index,
+            "batch_node_count": batch_node_count,
+            "batch_skeleton_count": batch_skeleton_count,
+            "node_count": node_count,
+            "row_counts": row_counts,
+            "error": error,
+        }])[0]
+
+    def record_phases(
+        self, phases: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Append buffered timings together with one atomic file replacement."""
+        if not phases:
+            return []
         metrics = self.load()
-        identity = _phase_identity(
-            name,
-            batch_index=batch_index,
-            batch_node_count=batch_node_count,
-            batch_skeleton_count=batch_skeleton_count,
-        )
-        record = _completed_phase_record(
-            metrics,
-            identity,
-            duration_seconds=duration_seconds,
-            status=status,
-            node_count=node_count,
-            row_counts=row_counts,
-            error=error,
-        )
-        metrics["phases"].append(record)
+        records = []
+        for phase in phases:
+            record = _completed_phase_record(metrics, **phase)
+            metrics["phases"].append(record)
+            records.append(record)
         if metrics["status"] == MetricsStatus.PENDING:
             metrics["status"] = MetricsStatus.IN_PROGRESS
-        if status == OperationStatus.FAILED:
+        if any(record["status"] == OperationStatus.FAILED for record in records):
             metrics["status"] = MetricsStatus.FAILED
         atomic_write_json(self.path, metrics)
-        return copy.deepcopy(record)
+        return copy.deepcopy(records)

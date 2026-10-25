@@ -21,6 +21,21 @@ pytestmark = [
 ]
 
 
+def test_database_preflight_does_not_inspect_migration_history(isolated_database, monkeypatch):
+    from django.db.migrations.executor import MigrationExecutor
+    from catmaid_skeleton_batch_import.database import preflight_database
+
+    def unexpected_executor(*_args, **_kwargs):
+        pytest.fail("The importer must not inspect the Django migration graph")
+
+    monkeypatch.setattr(MigrationExecutor, "__init__", unexpected_executor)
+    result = preflight_database(isolated_database)
+    assert "migrations" not in result
+    assert result["system_user_id"] > 0
+    assert result["objects"]
+    assert result["functions"]
+
+
 @pytest.mark.parametrize("orientation,maximum", [
     (0, (120, 260, 420)), (1, (120, 320, 360)), (2, (220, 260, 320)),
 ])

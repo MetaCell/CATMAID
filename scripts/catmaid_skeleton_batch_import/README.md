@@ -523,9 +523,8 @@ are performed.
 
 Apply CATMAID migration `0126_fix_single_node_selective_summary` through the
 normal deployment migration process before running this importer. It fixes
-selective summary rebuilding for single-node skeletons. The runtime database preflight rejects
-unapplied migrations. Finish active imports before upgrading the database:
-their saved migration/database fingerprint must match at run time.
+selective summary rebuilding for single-node skeletons. Deployment is responsible
+for applying migrations; the importer does not inspect migration history.
 
 `CATMAID_PROJECTS_DIRECTORY` defaults to `/home/django/projects`, and
 `CATMAID_INGESTION_MEDIA_ROOT` defaults to
@@ -623,9 +622,11 @@ Metrics are observational: completed counts reflect confirmed committed batches.
 Cache rebuilding has a running phase in `state.json` and optional live cell
 counters in `cache-progress.json` (see measured cache progress below).
 The orchestrator measures operation durations with its monotonic clock and
-appends completed records through `record_phase()`. This is the sole timing
-writer. Live phase progress comes from
-`state.json` and `cache-progress.json`, independently of metrics.
+writes them through `MetricsStore`. Loader timings collected during each batch
+transaction are buffered and appended together with one atomic metrics-file
+replacement after the transaction commits or rolls back. Other completed phases
+are recorded individually. Live phase progress comes from `state.json` and
+`cache-progress.json`, independently of metrics.
 All planned nodes can therefore be loaded while cache rebuilding or final
 verification is still running.
 

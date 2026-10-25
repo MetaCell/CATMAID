@@ -154,3 +154,79 @@ def test_metrics_schema_contains_no_wal_measurement(tmp_path: Path) -> None:
     )
 
     assert "wal" not in store.path.read_text().lower()
+
+
+@pytest.mark.parametrize("middle_status", ["complete", "failed"])
+def test_buffered_phases_use_one_write_and_keep_sequence_and_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, middle_status: str,
+) -> None:
+    from catmaid_skeleton_batch_import import metrics as metrics_module
+
+    store = MetricsStore(tmp_path)
+    store.initialize()
+    store.record_phase("earlier", duration_seconds=0.1)
+    write = metrics_module.atomic_write_json
+    writes = []
+
+    def observe_write(path, value):
+        writes.append(path)
+        write(path, value)
+
+    monkeypatch.setattr(metrics_module, "atomic_write_json", observe_write)
+    records = store.record_phases([
+        {"name": "copy", "duration_seconds": 1.25, "batch_index": 1,
+         "batch_node_count": 8, "batch_skeleton_count": 2,
+         "row_counts": {"treenode_rows": 8}},
+        {"name": "edges", "duration_seconds": 0.5, "status": middle_status,
+         "error": "edge failure" if middle_status == "failed" else None},
+        {"name": "validation", "duration_seconds": 0.25},
+    ])
+
+    assert writes == [store.path]
+    saved = store.load()
+    assert saved["phases"][1:] == records
+    assert [record["sequence"] for record in saved["phases"]] == [1, 2, 3, 4]
+    assert [record["name"] for record in records] == ["copy", "edges", "validation"]
+    assert records[0]["node_count"] == 8
+    assert records[0]["row_counts"] == {"treenode_rows": 8}
+    assert saved["status"] == ("failed" if middle_status == "failed" else "in_progress")
+    if middle_status == "failed":
+        assert records[1]["error"] == "edge failure"
+
+
+@pytest.mark.parametrize("invalid", [
+    {"duration_seconds": float("nan")},
+    {"status": "unknown"},
+])
+def test_invalid_buffered_phase_does_not_persist_partial_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid,
+) -> None:
+    from catmaid_skeleton_batch_import import metrics as metrics_module
+
+    store = MetricsStore(tmp_path)
+    store.initialize()
+    before = store.path.read_bytes()
+
+    def unexpected_write(*_args):
+        pytest.fail("Invalid buffered metrics must not be written")
+
+    monkeypatch.setattr(metrics_module, "atomic_write_json", unexpected_write)
+    with pytest.raises(InvalidInputError):
+        store.record_phases([
+            {"name": "valid", "duration_seconds": 0.1},
+            {"name": "invalid", "duration_seconds": 0.2, **invalid},
+        ])
+    assert store.path.read_bytes() == before
+
+
+def test_empty_phase_buffer_does_not_read_or_write_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MetricsStore(tmp_path)
+
+    def unexpected_load():
+        pytest.fail("An empty buffer must not read metrics")
+
+    monkeypatch.setattr(store, "load", unexpected_load)
+    assert store.record_phases([]) == []
+    assert not store.path.exists()
