@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from catmaid_skeleton_batch_import import database, loader, materialization, offline_cache, orchestrator, project
+from catmaid_skeleton_batch_import import database, loader, materialization, cache_rebuild, orchestrator, project
 from catmaid_skeleton_batch_import.config import load_request, load_operational_settings
 from catmaid_skeleton_batch_import.artifacts import read_id_artifact
 from catmaid_skeleton_batch_import.errors import ImmutableStateError, InvalidInputError, OperationalFailureError
@@ -209,7 +209,7 @@ def test_append_plan_needs_a_local_snapshot_without_attempting_database_access(t
     assert not (tmp_path / "state" / "state.json").exists()
 
 
-def test_preflight_only_reads_metadata_and_append_planning_is_entirely_offline(tmp_path, monkeypatch):
+def test_preflight_only_reads_metadata_and_append_planning_is_database_free(tmp_path, monkeypatch):
     connection = Connection()
     configure_run(monkeypatch, connection)
     path = request_file(tmp_path)
@@ -371,7 +371,7 @@ def test_complete_append_is_scoped_and_preserves_target_configuration(tmp_path, 
     assert len(exact_checks) == 1
     result = json.loads((state_dir / "verification.json").read_text())
     assert result["cache"] == {
-        "rebuilt": True, "strategy": "offline_full_grid_rebuild", "verified": True,
+        "rebuilt": True, "strategy": "full_grid_rebuild", "verified": True,
         "grid_count": 0, "cell_count": 0,
     }
     assert result["database"]["skeleton_count"] == 1
@@ -407,14 +407,14 @@ def test_cache_or_verification_failure_is_terminal(tmp_path, monkeypatch, phase)
         if phase == "cache":
             raise OperationalFailureError("injected failure")
         return {"schema_version": 1, "project_id": 123, "grids": [],
-                "strategy": "offline_full_grid_rebuild"}
+                "strategy": "full_grid_rebuild"}
     def verify(self, _receipt):
         events.append("verification")
         raise OperationalFailureError("injected failure")
     monkeypatch.setattr(orchestrator, "execute_batch_transaction", commit)
     monkeypatch.setattr(loader, "verify_exact_treenodes", lambda *_args: None)
-    monkeypatch.setattr(offline_cache.OfflineGridCache, "rebuild", rebuild)
-    monkeypatch.setattr(offline_cache.OfflineGridCache, "verify", verify)
+    monkeypatch.setattr(cache_rebuild.GridCacheRebuild, "rebuild", rebuild)
+    monkeypatch.setattr(cache_rebuild.GridCacheRebuild, "verify", verify)
     with pytest.raises(OperationalFailureError, match="injected failure"):
         orchestrator.run_ingestion(state_dir)
     state = StateStore(state_dir).load()
@@ -442,17 +442,17 @@ def test_cache_is_rebuilt_once_after_all_batches(tmp_path, monkeypatch):
         return dict(COUNTS)
     monkeypatch.setattr(orchestrator, "execute_batch_transaction", commit)
     monkeypatch.setattr(loader, "verify_exact_treenodes", lambda *_args: None)
-    original = offline_cache.OfflineGridCache.rebuild
+    original = cache_rebuild.GridCacheRebuild.rebuild
     def rebuild(self, **kwargs):
         events.append("cache")
         return original(self, **kwargs) | {"rebuild_serial": events.count("cache")}
-    monkeypatch.setattr(offline_cache.OfflineGridCache, "rebuild", rebuild)
-    original_verify = offline_cache.OfflineGridCache.verify
+    monkeypatch.setattr(cache_rebuild.GridCacheRebuild, "rebuild", rebuild)
+    original_verify = cache_rebuild.GridCacheRebuild.verify
     def verify(self, receipt):
         assert StateStore(state_dir).load()["phases"]["verification"]["status"] == "running"
         events.append("verify_cache")
         return original_verify(self, receipt)
-    monkeypatch.setattr(offline_cache.OfflineGridCache, "verify", verify)
+    monkeypatch.setattr(cache_rebuild.GridCacheRebuild, "verify", verify)
     assert orchestrator.run_ingestion(state_dir)["status"] == "complete"
     assert events == ["commit_1", "commit_2", "cache", "verify_cache"]
     with pytest.raises(InvalidInputError, match="terminal"):
@@ -466,13 +466,13 @@ def test_cache_observation_starts_before_coverage_planning(tmp_path, monkeypatch
     plan_append(request_file(tmp_path), state_dir)
     monkeypatch.setattr(orchestrator, "execute_batch_transaction", lambda *_args, **_kwargs: dict(COUNTS))
     monkeypatch.setattr(loader, "verify_exact_treenodes", lambda *_args: None)
-    original = offline_cache.OfflineGridCache.plan
+    original = cache_rebuild.GridCacheRebuild.plan
     observations = []
     def plan(cache):
         observations.append(json.loads((state_dir / "cache-progress.json").read_text()))
         assert StateStore(state_dir).load()["phases"]["cache"]["status"] == "running"
         return original(cache)
-    monkeypatch.setattr(offline_cache.OfflineGridCache, "plan", plan)
+    monkeypatch.setattr(cache_rebuild.GridCacheRebuild, "plan", plan)
     assert orchestrator.run_ingestion(state_dir)["status"] == "complete"
     assert observations == [{"schema_version": 1, "completed": 0, "total": 0}]
 

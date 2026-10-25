@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from catmaid_skeleton_batch_import.offline_cache import GRID_FIELDS
+from catmaid_skeleton_batch_import.cache_rebuild import GRID_FIELDS
 
 
 ROOT = Path(__file__).resolve().parents[3]

@@ -15,7 +15,7 @@ from .errors import ImmutableStateError
 from .util import sha256_file
 
 
-class SourceSnapshotWriter:
+class BatchSnapshotWriter:
     def __init__(self, root: Path, maximum_nodes: int):
         self.root = root
         self.maximum_nodes = maximum_nodes
@@ -26,7 +26,7 @@ class SourceSnapshotWriter:
     def add(self, member, nodes):
         if self.output is None or self.nodes + member.node_count > self.maximum_nodes:
             self.close_batch()
-            path = self.root / f"source-snapshot-{len(self.descriptors) + 1:06d}.jsonl.gz"
+            path = self.root / f"batch-snapshot-{len(self.descriptors) + 1:06d}.jsonl.gz"
             self.root.mkdir(parents=True, exist_ok=True)
             self.raw = path.open("wb")
             self.output = gzip.GzipFile(filename="", mode="wb", fileobj=self.raw, mtime=0, compresslevel=1)
@@ -51,7 +51,7 @@ class SourceSnapshotWriter:
         self.close_batch()
 
 
-class SourceSnapshotReader:
+class BatchSnapshotReader:
     """Keep only one bounded batch in memory; verify its bytes before decoding."""
     def __init__(self, root, plan):
         self.root = root
@@ -67,14 +67,14 @@ class SourceSnapshotReader:
 
     def load(self, member):
         if self.batch_index != member.batch_index:
-            descriptor = self.plan.source_snapshots[member.batch_index - 1]
+            descriptor = self.plan.batch_snapshots[member.batch_index - 1]
             path = self.root / descriptor["path"]
             try:
                 valid = path.stat().st_size == descriptor["size_bytes"] and sha256_file(path) == descriptor["sha256"]
             except OSError as exc:
-                raise ImmutableStateError("Source snapshot is missing; restore the retained state files") from exc
+                raise ImmutableStateError("Batch snapshot is missing; restore the retained state files") from exc
             if not valid:
-                raise ImmutableStateError("Source snapshot bytes differ from the immutable plan")
+                raise ImmutableStateError("Batch snapshot bytes differ from the immutable plan")
             expected = {m.member_path: m for m in self.plan.batches[member.batch_index - 1].members}
             decoded = {}
             try:
@@ -87,7 +87,7 @@ class SourceSnapshotReader:
                 if set(decoded) != set(expected):
                     raise ValueError("missing members")
             except (ValueError, TypeError, OSError, EOFError) as exc:
-                raise ImmutableStateError(f"Invalid source snapshot: {exc}") from exc
+                raise ImmutableStateError(f"Invalid batch snapshot: {exc}") from exc
             self.members = decoded
             self.batch_index = member.batch_index
         return self.members[member.member_path]

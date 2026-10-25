@@ -24,7 +24,7 @@ python -m pip install ./scripts/catmaid_skeleton_batch_import
 Then prepare and run one ingestion:
 
 ```bash
-# Capture the associated target stacks before offline planning.
+# Capture the associated target stacks before database-free planning.
 DJANGO_SETTINGS_MODULE=mysite.settings \
 catmaid-skeleton-import preflight \
   --request /staging/request.json \
@@ -100,7 +100,7 @@ reported with the other member errors.
 
 An ingestion consists of a **request JSON file plus a local ZIP containing SWC
 files**. No input CSV or manifest is required. Keep the ZIP unchanged and readable
-until `plan` succeeds. After that, `run` uses the retained source snapshots;
+until `plan` succeeds. After that, `run` uses the retained batch snapshots;
 the original ZIP can be removed or moved to archival storage. Its path, size and
 SHA-256 remain recorded in `state/archive.json` for audit.
 
@@ -271,7 +271,7 @@ and a summary with `num_nodes=1` and `cable_length=0`; its provenance and cache
 generation use the same path as larger skeletons.
 The sample root becomes `(10000, 20000, 30000)` nm with radius `2000` nm.
 
-## Offline import and cache rebuild
+## Batch import and cache rebuild
 
 1. Make the target managed layer inactive in Neuroglass and stop other writes to
    that project. No CATMAID service shutdown is required.
@@ -533,7 +533,7 @@ identify the rows to inspect. The importer does not retry, resume, reconcile or
 delete data automatically. A hard-killed run also cannot be started again from
 the same workspace.
 
-Planning publishes `state.json` once, after the plan, source snapshots and the
+Planning publishes `state.json` once, after the plan, batch snapshots and the
 associated-stack snapshot have been written and verified. Failed initialization
 publishes no executable state.
 
@@ -544,7 +544,7 @@ database and retained evidence before manually choosing cleanup or a new import.
 ## State and progress
 
 The directory supplied through `--state-dir` contains inputs, saved IDs,
-source snapshots, maps, manifests and progress for one import. Keep it on durable
+batch snapshots, maps, manifests and progress for one import. Keep it on durable
 storage for diagnosis and later review-queue mapping. `state.py` uses a writer
 lock and atomically replaces JSON so readers see complete records. The run marker
 moves once from pending to running and then complete or failed; an interrupted
@@ -671,12 +671,12 @@ and full 171-batch rehearsal passed. These are local measurements and do not
 establish a cluster speedup.
 
 
-## Source snapshots and local node maps
+## Batch snapshots and local node maps
 
-Planning retains validated source nodes through `source_snapshot.py` in deterministic
+Planning retains validated source nodes through `batch_snapshot.py` in deterministic
 gzip JSON-lines files, one bounded file per whole-SWC batch:
-`source-snapshot-000001.jsonl.gz`, `source-snapshot-000002.jsonl.gz`, and so on.
-The plan's `source_snapshots` descriptors bind each file's SHA-256, byte size and
+`batch-snapshot-000001.jsonl.gz`, `batch-snapshot-000002.jsonl.gz`, and so on.
+The plan's `batch_snapshots` descriptors bind each file's SHA-256, byte size and
 node count. Loading and final verification reuse these values instead of
 reparsing SWCs. Source-unit double precision and normal conversion remain.
 Snapshot hashes establish source identity; summary verification calculates cable

@@ -1,4 +1,4 @@
-"""Rebuild project grid payloads once, after offline bulk ingestion."""
+"""Rebuild project grid payloads once, after bulk ingestion."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ GRID_FIELDS = (
 )
 
 
-class OfflineGridCache:
+class GridCacheRebuild:
     """Keep definitions unchanged; replace payloads from all project data.
 
     The Neuroglass managed layer must remain inactive throughout the run.
@@ -168,7 +168,7 @@ class OfflineGridCache:
                 cell_count = cursor.fetchone()[0]
             records.append({"definition": grid, "generated_at": started_at, "cell_count": cell_count})
         result = {"schema_version": 1, "project_id": self.project_id,
-                  "strategy": "offline_full_grid_rebuild", "node_limit": None,
+                  "strategy": "full_grid_rebuild", "node_limit": None,
                   "grids": records}
         # The orchestrator verifies payloads once, in its final verification phase.
         return result
@@ -178,7 +178,7 @@ class OfflineGridCache:
         self._check_grids()
         if (receipt.get("schema_version") != 1 or receipt.get("project_id") != self.project_id
                 or receipt.get("node_limit") is not None
-                or receipt.get("strategy") != "offline_full_grid_rebuild"
+                or receipt.get("strategy") != "full_grid_rebuild"
                 or [record["definition"] for record in receipt["grids"]] != self.grids):
             raise VerificationError("Cache rebuild receipt does not match the target configuration")
         total = 0
@@ -202,5 +202,5 @@ class OfflineGridCache:
                     f"Grid {grid['id']} rebuild is incomplete or stale; keep the layer inactive "
                     "and inspect the failed import")
             total += count
-        return {"strategy": "offline_full_grid_rebuild", "rebuilt": True, "verified": True,
+        return {"strategy": "full_grid_rebuild", "rebuilt": True, "verified": True,
                 "grid_count": len(self.grids), "cell_count": total}

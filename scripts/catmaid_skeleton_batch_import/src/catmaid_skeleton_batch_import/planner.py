@@ -33,7 +33,7 @@ class ImportPlan:
     max_nodes_per_batch: int
     members: tuple[PlannedMember, ...]
     batches: tuple[PlannedBatch, ...]
-    source_snapshots: tuple[dict[str, Any], ...] = ()
+    batch_snapshots: tuple[dict[str, Any], ...] = ()
 
     @property
     def member_count(self) -> int:
@@ -55,7 +55,7 @@ class ImportPlan:
             "member_count": self.member_count,
             "batch_count": self.batch_count,
             "total_nodes": self.total_nodes,
-            "source_snapshots": list(self.source_snapshots),
+            "batch_snapshots": list(self.batch_snapshots),
         }
         return result
 
@@ -295,7 +295,7 @@ def read_plan(path: Path) -> ImportPlan:
         "member_count",
         "batch_count",
         "total_nodes",
-        "source_snapshots",
+        "batch_snapshots",
     }
     if set(header) != expected_header or header.get("record_type") != "header":
         raise InvalidInputError(f"{path}: invalid plan header")
@@ -325,14 +325,14 @@ def read_plan(path: Path) -> ImportPlan:
         or rebuilt.total_nodes != expected_total_nodes
     ):
         raise InvalidInputError(f"{path}: plan header counts do not match records")
-    descriptors = header["source_snapshots"]
+    descriptors = header["batch_snapshots"]
     if not isinstance(descriptors, list) or len(descriptors) != rebuilt.batch_count:
-        raise InvalidInputError(f"{path}: invalid source snapshot count")
+        raise InvalidInputError(f"{path}: invalid batch snapshot count")
     for batch, item in zip(rebuilt.batches, descriptors):
         if (not isinstance(item, dict) or set(item) != {"path", "sha256", "size_bytes", "node_count"}
-                or item["path"] != f"source-snapshot-{batch.index:06d}.jsonl.gz"
+                or item["path"] != f"batch-snapshot-{batch.index:06d}.jsonl.gz"
                 or not isinstance(item["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])
                 or type(item["size_bytes"]) is not int or item["size_bytes"] <= 0
                 or type(item["node_count"]) is not int or item["node_count"] != batch.node_count):
-            raise InvalidInputError(f"{path}: invalid source snapshot descriptor")
-    return replace(rebuilt, source_snapshots=tuple(descriptors))
+            raise InvalidInputError(f"{path}: invalid batch snapshot descriptor")
+    return replace(rebuilt, batch_snapshots=tuple(descriptors))

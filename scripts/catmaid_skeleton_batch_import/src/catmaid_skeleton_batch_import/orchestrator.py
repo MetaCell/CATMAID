@@ -40,7 +40,7 @@ from .errors import (
 from .loader import PreparedBatch, ProjectContext, execute_batch_transaction, prepare_copy_rows
 from .metrics import MetricsStore
 from .planner import ImportPlan, plan_archive, read_plan, write_plan
-from .source_snapshot import SourceSnapshotReader, SourceSnapshotWriter
+from .batch_snapshot import BatchSnapshotReader, BatchSnapshotWriter
 from .state import ArchiveMetadata, StateStore
 from .statuses import DatabaseStatus, MetricsStatus, OperationStatus
 from .stack_bounds import geometry_bounds, read_project_stack_geometry
@@ -148,22 +148,22 @@ def plan_ingestion(request_path: Path, state_dir: Path) -> dict[str, object]:
         bounds = geometry_bounds(geometry)
         _progress(f"Scanning and validating local archive {request.archive_path}")
         started = time.monotonic()
-        with tempfile.TemporaryDirectory(prefix=".source-snapshot-", dir=store.state_dir) as staging:
-            writer = SourceSnapshotWriter(Path(staging), settings.max_nodes_per_batch)
+        with tempfile.TemporaryDirectory(prefix=".batch-snapshot-", dir=store.state_dir) as staging:
+            writer = BatchSnapshotWriter(Path(staging), settings.max_nodes_per_batch)
             try:
                 scan = scan_archive(request, settings, bounds_nm=bounds, on_member=writer.add)
             finally:
                 writer.close()
-            plan = replace(plan_archive(scan, settings), source_snapshots=tuple(writer.descriptors))
-            for descriptor in plan.source_snapshots:
+            plan = replace(plan_archive(scan, settings), batch_snapshots=tuple(writer.descriptors))
+            for descriptor in plan.batch_snapshots:
                 os.replace(Path(staging) / descriptor["path"], store.state_dir / descriptor["path"])
         plan_digest = write_plan(store.state_dir / PLAN_FILENAME, plan)
         artifacts = {"plan": artifact_descriptor(
             store.state_dir, store.state_dir / PLAN_FILENAME, count=plan.member_count)}
         batch_artifacts = {
-            batch.index: {"source_snapshot": artifact_descriptor(
+            batch.index: {"batch_snapshot": artifact_descriptor(
                 store.state_dir, store.state_dir / descriptor["path"], count=batch.node_count)}
-            for batch, descriptor in zip(plan.batches, plan.source_snapshots)
+            for batch, descriptor in zip(plan.batches, plan.batch_snapshots)
         }
         artifacts["stack_geometry"] = artifact_descriptor(
             store.state_dir, store.state_dir / STACK_GEOMETRY_FILENAME, count=len(geometry["stacks"]))
@@ -474,14 +474,14 @@ def _run_batch(
     timeouts: Mapping[str, int],
     project: ProjectContext,
     connection: Any,
-    archive: SourceSnapshotReader,
+    snapshots: BatchSnapshotReader,
     metrics: MetricsStore,
 ) -> None:
     concept_ids, location_ids = _prepare_batch_artifacts(store, batch, connection)
     store.mark_batch_prepared(batch.index)
     _progress(f"Preparing batch {batch.index}: {batch.skeleton_count} skeletons, {batch.node_count} nodes")
     started = time.monotonic()
-    with prepare_copy_rows(batch, request, project, concept_ids, location_ids, archive.load) as prepared:
+    with prepare_copy_rows(batch, request, project, concept_ids, location_ids, snapshots.load) as prepared:
         metrics.record_phase(
             f"batch_{batch.index:06d}_row_generation", duration_seconds=time.monotonic() - started,
             batch_index=batch.index, batch_node_count=batch.node_count,
@@ -687,11 +687,11 @@ def _execute_ingestion(store: StateStore, resources: ExitStack) -> dict[str, obj
     _check_saved_geometry(store, store.load(), geometry)
     project = _ensure_existing_project(store, request.target_project_id, metrics)
     _check_existing_fragment_conflicts(plan, project, connection)
-    from .offline_cache import OfflineGridCache
-    grid_cache = OfflineGridCache(project.project_id, connection, **timeouts)
-    _progress("Offline import: keep the Neuroglass managed layer inactive until verification succeeds")
+    from .cache_rebuild import GridCacheRebuild
+    grid_cache = GridCacheRebuild(project.project_id, connection, **timeouts)
+    _progress("Batch import: keep the Neuroglass managed layer inactive until verification succeeds")
 
-    with SourceSnapshotReader(store.state_dir, plan) as archive:
+    with BatchSnapshotReader(store.state_dir, plan) as snapshots:
         for batch in plan.batches:
             _run_batch(
                 store,
@@ -700,7 +700,7 @@ def _execute_ingestion(store: StateStore, resources: ExitStack) -> dict[str, obj
                 timeouts,
                 project,
                 connection,
-                archive,
+                snapshots,
                 metrics,
             )
 
@@ -748,14 +748,14 @@ def _execute_ingestion(store: StateStore, resources: ExitStack) -> dict[str, obj
         if current_project != project:
             raise VerificationError("Existing project tracing context changed during import")
         project_result = {"project_id": project.project_id, "existing_project": True}
-        with SourceSnapshotReader(store.state_dir, plan) as verification_archive:
+        with BatchSnapshotReader(store.state_dir, plan) as verification_snapshots:
             database_result = _verify_database_by_batch(
                 store,
                 plan,
                 state,
                 project,
                 connection,
-                verification_archive.load,
+                verification_snapshots.load,
                 request=request,
             )
         cache_result = grid_cache.verify(

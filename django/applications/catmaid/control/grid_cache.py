@@ -19,10 +19,10 @@ def locked_grid_cell(grid_id, x, y, z, *, connection=None,
     the dirty row's MVCC version, not just its timestamp (``now()`` is the
     invalidator's transaction start time), so a newer invalidation survives.
 
-    Offline imports rebuild after loading, while normal workers can also refresh
+    Batch imports rebuild after loading, while normal workers can also refresh
     cells. Sharing this transaction and lock prevents their format writes from
     interleaving. Readers see the previous committed payload when one exists;
-    the full offline rebuild still requires the target layer to remain inactive.
+    the full grid rebuild still requires the target layer to remain inactive.
     """
     if connection is None or atomic is None:
         from django.db import connection as default_connection, transaction

@@ -193,7 +193,7 @@ def test_planned_micrometre_snapshot_prepares_rows_at_large_coordinate_offsets(
     from catmaid_skeleton_batch_import.config import load_request
     from catmaid_skeleton_batch_import.orchestrator import plan_ingestion
     from catmaid_skeleton_batch_import.planner import read_plan
-    from catmaid_skeleton_batch_import.source_snapshot import SourceSnapshotReader
+    from catmaid_skeleton_batch_import.batch_snapshot import BatchSnapshotReader
 
     monkeypatch.setenv("CATMAID_BATCH_IMPORT_MAX_NODES_PER_BATCH", "250000")
     archive = tmp_path / "input.zip"
@@ -207,7 +207,7 @@ def test_planned_micrometre_snapshot_prepares_rows_at_large_coordinate_offsets(
     plan = read_plan(state_dir / "plan.jsonl.gz")
     project = ProjectContext(5, 1, 8, 9, 10, 11, 12)
 
-    with SourceSnapshotReader(state_dir, plan) as source:
+    with BatchSnapshotReader(state_dir, plan) as source:
         with prepare_copy_rows(
             plan.batches[0], load_request(request_path), project,
             list(range(100, 105)), list(range(200, 10201)), source.load,

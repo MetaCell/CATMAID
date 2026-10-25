@@ -16,7 +16,7 @@ from catmaid_skeleton_batch_import.fragments import (
 )
 from catmaid_skeleton_batch_import.planner import build_plan, read_plan, serialize_plan, write_plan
 from catmaid_skeleton_batch_import.state import StateStore
-from test_planner import member, with_source_snapshots
+from test_planner import member, with_batch_snapshots
 
 
 @pytest.mark.parametrize(("filename", "expected"), [
@@ -66,7 +66,7 @@ def test_plan_rejects_fragment_identifier_inconsistent_with_filename():
 
 
 def test_new_plan_and_manifest_preserve_identifier_and_five_id_layout(tmp_path):
-    plan = with_source_snapshots(build_plan([member("191805/ 0021814 .swc", 2)], 2))
+    plan = with_batch_snapshots(build_plan([member("191805/ 0021814 .swc", 2)], 2))
     path = tmp_path / "plan.jsonl.gz"
     write_plan(path, plan)
     loaded = read_plan(path)

@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     preflight = commands.add_parser(
-        "preflight", help="snapshot associated stack metadata before offline append planning"
+        "preflight", help="snapshot associated stack metadata before database-free append planning"
     )
     preflight.add_argument("--request", type=Path, required=True)
     preflight.add_argument("--state-dir", type=Path, required=True)

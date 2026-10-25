@@ -421,7 +421,7 @@ def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_c
             return edges, cursor.fetchall()
     old_derived = old_derived_rows()
     append_state = request(tmp_path / "append", "new-fragment", pid)
-    # Loading and final verification need only the retained source snapshots.
+    # Loading and final verification need only the retained batch snapshots.
     (tmp_path / "append" / "input.zip").unlink()
     result = run_ingestion(append_state)
     after = snapshot()
@@ -444,7 +444,7 @@ def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_c
     report = json.loads(Path(result["verification"]).read_text())
     assert report["cache"]["verified"] is True
     assert report["cache"]["cell_count"] == 1
-    assert report["cache"]["strategy"] == "offline_full_grid_rebuild"
+    assert report["cache"]["strategy"] == "full_grid_rebuild"
     with connection.cursor() as cursor:
         cursor.execute("""
             SELECT cardinality(json_data), cardinality(json_text_data), cardinality(msgpack_data)
@@ -490,7 +490,7 @@ def test_micrometre_rounding_regression_completes_import_and_final_cache_verific
     import math
 
     from catmaid_skeleton_batch_import.artifacts import read_manifest
-    from catmaid_skeleton_batch_import.offline_cache import OfflineGridCache
+    from catmaid_skeleton_batch_import.cache_rebuild import GridCacheRebuild
     from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, preflight_ingestion, run_ingestion
     from catmaid_skeleton_batch_import.state import StateStore
 
@@ -504,7 +504,7 @@ def test_micrometre_rounding_regression_completes_import_and_final_cache_verific
     preflight_ingestion(request_path, state_dir)
     assert plan_ingestion(request_path, state_dir)["nodes"] == 10001
     verification_phases = []
-    original_verify = OfflineGridCache.verify
+    original_verify = GridCacheRebuild.verify
 
     def verify(cache, receipt):
         verification_phases.append(
@@ -512,7 +512,7 @@ def test_micrometre_rounding_regression_completes_import_and_final_cache_verific
         )
         return original_verify(cache, receipt)
 
-    monkeypatch.setattr(OfflineGridCache, "verify", verify)
+    monkeypatch.setattr(GridCacheRebuild, "verify", verify)
     result = run_ingestion(state_dir)
 
     assert result["status"] == "complete"

@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-from catmaid_skeleton_batch_import.offline_cache import GRID_FIELDS, OfflineGridCache
+from catmaid_skeleton_batch_import.cache_rebuild import GRID_FIELDS, GridCacheRebuild
 from catmaid_skeleton_batch_import.errors import OperationalFailureError, VerificationError
 
 
@@ -77,7 +77,7 @@ class Connection:
 
 
 def tracker(connection):
-    return OfflineGridCache(123, connection, lock_timeout_ms=500, statement_timeout_ms=5000)
+    return GridCacheRebuild(123, connection, lock_timeout_ms=500, statement_timeout_ms=5000)
 
 
 def test_full_rebuild_retains_all_grid_definitions_and_includes_whole_project(monkeypatch):

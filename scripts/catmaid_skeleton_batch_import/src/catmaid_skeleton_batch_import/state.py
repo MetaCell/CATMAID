@@ -352,7 +352,7 @@ class StateStore:
         return value
 
     def verify_immutable(self) -> dict[str, Any]:
-        """Verify retained metadata and artifacts; execution uses source snapshots."""
+        """Verify retained metadata and artifacts; execution uses batch snapshots."""
         state = self.load()
         self._verify_metadata_file(
             self.request_path, state["request"]["sha256"], "normalized request"
