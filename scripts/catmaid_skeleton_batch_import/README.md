@@ -99,8 +99,10 @@ reported with the other member errors.
 ## Input contract
 
 An ingestion consists of a **request JSON file plus a local ZIP containing SWC
-files**. No input CSV or manifest is required. The archive must remain unchanged
-and readable by both `plan` and `run`.
+files**. No input CSV or manifest is required. Keep the ZIP unchanged and readable
+until `plan` succeeds. After that, `run` uses the retained source snapshots;
+the original ZIP can be removed or moved to archival storage. Its path, size and
+SHA-256 remain recorded in `state/archive.json` for audit.
 
 ### Request JSON
 
@@ -680,7 +682,10 @@ reparsing SWCs. Source-unit double precision and normal conversion remain.
 Snapshot hashes establish source identity; summary verification calculates cable
 length from stored float32 coordinates. It does not compare cable lengths computed
 before and after unit conversion, whose floating-point rounding can differ.
-Both loading and final verification require the snapshot files.
+Both loading and final verification require the snapshot files. Execution verifies
+their hashes and the retained metadata without rereading the original ZIP.
+Retain the complete state directory through loading and final verification; keep
+its node maps and manifests afterward for audit and review-queue mapping.
 
 The feature is unpublished and supports only the current plan/state format.
 

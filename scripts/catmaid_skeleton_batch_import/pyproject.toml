@@ -27,5 +27,5 @@ addopts = "-ra"
 pythonpath = ["src"]
 testpaths = ["tests"]
 markers = [
-  "e2e: opt-in tests that create hidden projects in a configured CATMAID database",
+  "e2e: opt-in append tests in a disposable CATMAID database",
 ]

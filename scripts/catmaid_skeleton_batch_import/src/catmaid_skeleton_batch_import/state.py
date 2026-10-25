@@ -352,7 +352,7 @@ class StateStore:
         return value
 
     def verify_immutable(self) -> dict[str, Any]:
-        """Re-hash immutable inputs and every registered artifact."""
+        """Verify retained metadata and artifacts; execution uses source snapshots."""
         state = self.load()
         self._verify_metadata_file(
             self.request_path, state["request"]["sha256"], "normalized request"
@@ -361,11 +361,6 @@ class StateStore:
             self.archive_path,
             state["archive"]["metadata_sha256"],
             "archive metadata",
-        )
-
-        archive = ArchiveMetadata.from_dict(load_json(self.archive_path))
-        self._verify_source_file(
-            archive.path, archive.size_bytes, archive.sha256, "archive"
         )
 
         for name, artifact in state.get("artifacts", {}).items():
@@ -387,7 +382,6 @@ class StateStore:
         max_id: int | None = None,
         compression: str | None = None,
         batch_index: int | None = None,
-        expected_sha256: str | None = None,
     ) -> ArtifactMetadata:
         """Atomically reference a completed artifact from state.
 
@@ -412,19 +406,6 @@ class StateStore:
             compression=compression,
         )
         metadata_value = metadata.to_dict()
-        if expected_sha256 is not None:
-            expected_sha256 = _validate_sha256(
-                expected_sha256, "expected artifact digest"
-            )
-            if metadata.sha256 != expected_sha256:
-                raise ImmutableStateError(
-                    f"Artifact digest does not match its immutable plan: {name}",
-                    details={
-                        "path": str(absolute),
-                        "expected": expected_sha256,
-                        "actual": metadata.sha256,
-                    },
-                )
 
         def mutate(state: dict[str, Any]) -> None:
             target = state["artifacts"]
@@ -817,12 +798,3 @@ class StateStore:
         state["status"] = ImportStatus.CACHE_COMPLETE
         if state["phases"]["verification"]["status"] == OperationStatus.COMPLETE:
             state["status"] = ImportStatus.COMPLETE
-
-
-@contextlib.contextmanager
-def state_directory_lock(
-    state_dir: Path, *, blocking: bool = False
-) -> Iterator[None]:
-    """Public functional wrapper for orchestration code that only needs a lock."""
-    with StateDirectoryLock(state_dir, blocking=blocking):
-        yield

@@ -460,10 +460,6 @@ def test_cache_is_rebuilt_once_after_all_batches(tmp_path, monkeypatch):
     assert events == ["commit_1", "commit_2", "cache", "verify_cache"]
 
 
-def test_project_context_round_trips():
-    assert ProjectContext.from_dict(CONTEXT).to_dict() == {k: v for k, v in CONTEXT.items() if k != "existing_project"}
-
-
 def test_cache_observation_starts_before_coverage_planning(tmp_path, monkeypatch):
     configure_run(monkeypatch, Connection())
     state_dir = tmp_path / "state"

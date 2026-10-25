@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import os
 from collections.abc import Iterator, Sequence
 from typing import Any
 
@@ -57,21 +56,8 @@ class DatabasePreflightError(RuntimeError):
     """The configured database is not compatible with this importer."""
 
 
-def bootstrap_django(settings_module: str | None = None) -> Any:
-    """Initialize Django once and return its default database connection.
-
-    ``settings_module`` is optional so a CATMAID container can provide the
-    conventional ``DJANGO_SETTINGS_MODULE`` environment variable.  A caller
-    cannot silently replace a different, already configured module.
-    """
-
-    if settings_module:
-        configured = os.environ.get("DJANGO_SETTINGS_MODULE")
-        if configured and configured != settings_module:
-            raise DatabasePreflightError(
-                "DJANGO_SETTINGS_MODULE is already set to a different value"
-            )
-        os.environ.setdefault("DJANGO_SETTINGS_MODULE", settings_module)
+def bootstrap_django() -> Any:
+    """Initialize Django using DJANGO_SETTINGS_MODULE and return its connection."""
 
     import django
     from django.apps import apps

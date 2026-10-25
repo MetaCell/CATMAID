@@ -46,7 +46,7 @@ def test_scan_archive_hashes_parses_and_preserves_exact_member_paths(tmp_path: P
 
     assert scanned.archive_sha256 == hashlib.sha256(archive.read_bytes()).hexdigest()
     assert [member.member_path for member in scanned.members] == ["a.swc", "z/cell.swc"]
-    assert scanned.total_nodes == 4
+    assert sum(member.node_count for member in scanned.members) == 4
     assert scanned.members[0].cable_length_nm == 5000
     assert scanned.members[0].display_name == "a"
 
@@ -259,7 +259,7 @@ def test_scan_and_plan_do_not_limit_files_to_the_batch_node_budget(tmp_path):
     write_zip(archive, [(f"{i}.swc", VALID_SWC) for i in range(101)])
     scanned = scan_archive(request(archive), settings(max_nodes_per_batch=10), bounds_nm=(((0, 0, 0), (10000, 20000, 30000)),))
     plan = plan_archive(scanned, settings(max_nodes_per_batch=10))
-    assert scanned.swc_count == 101
+    assert len(scanned.members) == 101
     assert plan.member_count == 101
     assert len(plan.batches) > 1
     assert all(batch.node_count <= 10 for batch in plan.batches)

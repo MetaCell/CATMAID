@@ -32,12 +32,6 @@ class ProjectContext:
             field: int(value[field]) for field in cls.__dataclass_fields__
         })
 
-    def to_dict(self) -> dict[str, int]:
-        return {
-            field: getattr(self, field)
-            for field in self.__dataclass_fields__
-        }
-
 
 @dataclass(frozen=True)
 class ExpectedSkeleton:

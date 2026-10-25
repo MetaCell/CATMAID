@@ -421,6 +421,8 @@ def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_c
             return edges, cursor.fetchall()
     old_derived = old_derived_rows()
     append_state = request(tmp_path / "append", "new-fragment", pid)
+    # Loading and final verification need only the retained source snapshots.
+    (tmp_path / "append" / "input.zip").unlink()
     result = run_ingestion(append_state)
     after = snapshot()
     assert result["status"] == "complete"

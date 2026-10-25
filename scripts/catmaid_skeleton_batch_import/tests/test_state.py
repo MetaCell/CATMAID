@@ -80,22 +80,25 @@ def test_posix_state_lock_is_exclusive_and_reentrant(tmp_path: Path) -> None:
         pass
 
 
-def test_archive_is_verified_before_loading(tmp_path: Path) -> None:
-    archive = tmp_path / "source.zip"
-    archive.write_bytes(b"archive")
-    store = StateStore(tmp_path / "state")
-    request = {'schema_version': 1, 'source': {'archive_path': str(archive.resolve()), 'coordinate_unit': 'nm'}, 'target': {'project_id': 101}}
-    store.initialize_plan(
-        request,
-        ArchiveMetadata(archive, archive.stat().st_size, sha256_file(archive)),
-        {},
-        [],
-        plan_digest="a" * 64,
-    )
+@pytest.mark.parametrize("source_change", ["removed", "replaced"])
+def test_archive_audit_metadata_is_retained_without_requiring_the_zip(
+    tmp_path: Path, source_change: str,
+) -> None:
+    store, arguments = make_store(tmp_path)
+    archive = arguments["archive"].path
+    metadata = store.archive_path.read_bytes()
+    if source_change == "removed":
+        archive.unlink()
+    else:
+        archive.write_bytes(b"replacement ZIP is not an execution input")
+
     store.verify_immutable()
 
-    archive.write_bytes(b"changed")
-    with pytest.raises(ImmutableStateError, match="archive digest changed"):
+    assert store.archive_path.read_bytes() == metadata
+    assert json.loads(metadata)["sha256"] == arguments["archive"].sha256
+
+    store.archive_path.write_bytes(metadata + b"tampered")
+    with pytest.raises(ImmutableStateError, match="Archive metadata digest mismatch"):
         store.verify_immutable()
 
 

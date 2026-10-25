@@ -24,16 +24,7 @@ class ArchiveScan:
     archive_path: Path
     archive_bytes: int
     archive_sha256: str
-    archive_mtime_ns: int
     members: tuple[PlannedMember, ...]
-
-    @property
-    def swc_count(self) -> int:
-        return len(self.members)
-
-    @property
-    def total_nodes(self) -> int:
-        return sum(member.node_count for member in self.members)
 
 
 def _regular_file_stat(path: Path, label: str) -> os.stat_result:
@@ -233,6 +224,5 @@ def scan_archive(
         archive_path=archive_path,
         archive_bytes=before.st_size,
         archive_sha256=archive_digest,
-        archive_mtime_ns=before.st_mtime_ns,
         members=tuple(members),
     )

@@ -95,23 +95,6 @@ class PlannedMember:
             result["batch_index"] = self.batch_index
         return result
 
-    @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "PlannedMember":
-        return cls(
-            member_path=str(value["member_path"]),
-            node_count=int(value["node_count"]),
-            uncompressed_bytes=int(value["uncompressed_bytes"]),
-            crc32=int(value["crc32"]),
-            display_name=str(value["display_name"]),
-            cable_length_nm=float(value["cable_length_nm"]),
-            fragment_id=str(value["fragment_id"]),
-            batch_index=(
-                int(value["batch_index"])
-                if value.get("batch_index") is not None
-                else None
-            ),
-        )
-
 
 @dataclass(frozen=True)
 class PlannedBatch:
