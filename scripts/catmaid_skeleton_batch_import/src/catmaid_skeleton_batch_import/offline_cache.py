@@ -6,7 +6,7 @@ from itertools import product
 import math
 from typing import Any
 
-from .errors import RetryableError, VerificationError
+from .errors import OperationalFailureError, VerificationError
 
 
 GRID_FIELDS = (
@@ -68,7 +68,7 @@ class OfflineGridCache:
 
     def _check_grids(self):
         if self._read_grids() != self.grids:
-            raise RetryableError("Cache configuration changed; keep the layer inactive and resume")
+            raise OperationalFailureError("Cache configuration changed; keep the layer inactive and inspect the failed import")
 
     def _bounds(self):
         # Include old and new skeletons, free connectors and negative coordinates.
@@ -118,7 +118,7 @@ class OfflineGridCache:
                 grid["has_json_text_data"], grid["has_msgpack_data"],
                 provider=self._provider, cursor=cursor, delete_empty=True,
             ):
-                raise RetryableError(f"Grid {grid['id']} cell {cell} could not be rebuilt")
+                raise OperationalFailureError(f"Grid {grid['id']} cell {cell} could not be rebuilt")
 
     def plan(self):
         """Persist coverage before clearing payloads, including intentional empty cells."""
@@ -145,7 +145,7 @@ class OfflineGridCache:
                 "node_limit": None, "grids": records}
 
     def rebuild(self, log=lambda _message: None, *, plan=None, progress=None):
-        """A failed rebuild is restarted on resume; committed batches are skipped."""
+        """Rebuild once after loading; any failure terminates this import attempt."""
         if self.connection.in_atomic_block:
             raise RuntimeError("Cache rebuilding requires its own transactions")
         self._check_grids()
@@ -153,7 +153,7 @@ class OfflineGridCache:
         if (plan.get("schema_version") != 1 or plan.get("project_id") != self.project_id
                 or plan.get("node_limit") is not None
                 or [record["definition"] for record in plan["grids"]] != self.grids):
-            raise VerificationError("Cache rebuild plan changed; resume with --rebuild-cache")
+            raise VerificationError("Cache rebuild plan changed; inspect the failed import")
         # Count all cells evaluated, including intentionally empty results.
         total = sum(math.prod(high - low + 1 for low, high in record["ranges"])
                     for record in plan["grids"] if record["ranges"] is not None)
@@ -213,7 +213,7 @@ class OfflineGridCache:
             if count != record["cell_count"] or invalid or dirty:
                 raise VerificationError(
                     f"Grid {grid['id']} rebuild is incomplete or stale; keep the layer inactive "
-                    "and resume with --rebuild-cache")
+                    "and inspect the failed import")
             total += count
         return {"strategy": "offline_full_grid_rebuild", "rebuilt": True, "verified": True,
                 "grid_count": len(self.grids), "cell_count": total}

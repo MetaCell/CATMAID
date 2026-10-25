@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 
@@ -102,7 +102,6 @@ def create_hidden_project(
     resolution_nm: Sequence[int | float],
     cache_cell_size_nm: int = 1_500_000,
     comment: str | None = None,
-    before_commit: Callable[[], None] | None = None,
     components: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a new hidden project and stack in one durable transaction.
@@ -185,7 +184,6 @@ def create_hidden_project(
             raise ProjectSetupError(
                 f"CATMAID tracing identifiers are missing: {missing}"
             )
-        (before_commit or (lambda: None))()
 
     return {
         "project_id": int(project.id),

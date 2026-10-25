@@ -216,7 +216,7 @@ def load_settings(*, use_django: bool = True) -> ImportSettings:
 
 
 def load_operational_settings() -> dict[str, int]:
-    """Resolve only settings that are intentionally mutable between retries."""
+    """Resolve the operational timeouts when the single run starts."""
 
     result: dict[str, int] = {}
     for field_name in ("statement_timeout_ms", "lock_timeout_ms"):

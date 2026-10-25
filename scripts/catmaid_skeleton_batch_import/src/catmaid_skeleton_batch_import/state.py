@@ -1,10 +1,7 @@
-"""Durable, dependency-free ingestion state.
+"""Atomic single-use import state and retained audit artifacts.
 
-The database and the state directory cannot share a transaction.  This module
-therefore makes every filesystem checkpoint atomic and makes the ambiguous
-``COMMIT`` window explicit.  It intentionally contains no Django imports so
-``plan`` and orchestration tools can inspect state without bootstrapping the
-CATMAID application.
+The state reports confirmed progress. Failed or interrupted runs are never
+resumed; committed batches remain available for diagnosis.
 """
 
 from __future__ import annotations
@@ -25,8 +22,7 @@ from .domain import ImportSettings, IngestionRequest, PlannedBatch
 from .errors import (
     ImmutableStateError,
     InvalidInputError,
-    OperatorAttentionError,
-    RetryableError,
+    OperationalFailureError,
 )
 from .util import (
     atomic_write_json,
@@ -45,23 +41,9 @@ STATE_FILENAME = "state.json"
 LOCK_FILENAME = ".state.lock"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_PROJECT_STATUSES = {
-    "planned",
-    "prepared",
-    "commit_attempted",
-    "committed",
-    "retryable",
-    "operator_attention",
-}
+_PROJECT_STATUSES = {"planned", "prepared", "committed"}
 _BATCH_STATUSES = _PROJECT_STATUSES
-_PHASE_STATUSES = {
-    "pending",
-    "running",
-    "complete",
-    "retryable",
-    "failed",
-    "operator_attention",
-}
+_PHASE_STATUSES = {"pending", "running", "complete", "failed"}
 _PHASE_ORDER = ("database_maintenance", "cache", "verification")
 
 
@@ -214,7 +196,7 @@ class StateDirectoryLock:
         except OSError as exc:
             os.close(descriptor)
             if exc.errno in (errno.EACCES, errno.EAGAIN):
-                raise RetryableError(
+                raise OperationalFailureError(
                     f"State directory is already locked: {self.state_dir}",
                     details={"state_dir": str(self.state_dir)},
                 ) from exc
@@ -280,13 +262,11 @@ class StateStore:
         batches: Sequence[PlannedBatch | Mapping[str, Any]],
         *,
         plan_digest: str | None = None,
-        planner_version: int = 3,
+        planner_version: int = 4,
+        artifacts: Mapping[str, Mapping[str, Any]] | None = None,
+        batch_artifacts: Mapping[int, Mapping[str, Mapping[str, Any]]] | None = None,
     ) -> dict[str, Any]:
-        """Create schema-v3 state, or prove an existing plan is identical.
-
-        Initialization is deliberately idempotent.  It never resets progress;
-        any immutable difference requires a new state directory.
-        """
+        """Publish one complete plan and its artifact references atomically."""
         request_value = self._normalize_request(request)
         archive_value = self._normalize_archive(archive)
         archive_identity = ArchiveMetadata.from_dict(archive_value)
@@ -340,23 +320,7 @@ class StateStore:
 
         with self._mutation_lock():
             if self.state_path.exists():
-                state = self.load()
-                actual = {
-                    key: state[key]
-                    for key in ("request", "archive", "settings", "plan")
-                }
-                if actual != immutable:
-                    raise ImmutableStateError(
-                        "Existing state directory belongs to a different ingestion plan",
-                        details={"state_dir": str(self.state_dir)},
-                    )
-                self._verify_metadata_file(
-                    self.request_path, request_digest, "normalized request"
-                )
-                self._verify_metadata_file(
-                    self.archive_path, archive_metadata_digest, "archive metadata"
-                )
-                return state
+                raise InvalidInputError("This workspace already has a plan; use a new state directory")
 
             self._install_initial_metadata(
                 self.request_path, request_value, request_digest, "normalized request"
@@ -381,24 +345,26 @@ class StateStore:
                     {
                         **copy.deepcopy(batch),
                         "status": "planned",
-                        "artifacts": {},
+                        "artifacts": copy.deepcopy((batch_artifacts or {}).get(batch["index"], {})),
                     }
                     for batch in batch_plan
                 ],
                 "phases": {
                     phase: {"status": "pending"} for phase in _PHASE_ORDER
                 },
-                "artifacts": {},
-                "operator_attention": None,
+                "artifacts": copy.deepcopy(dict(artifacts or {})),
+                "run": {"status": "pending"},
             }
+            for name, artifact in state["artifacts"].items():
+                self._verify_artifact_value(name, artifact)
+            for batch in state["batches"]:
+                for name, artifact in batch["artifacts"].items():
+                    self._verify_artifact_value(name, artifact)
             self._persist(state)
             return copy.deepcopy(state)
 
     def _persist(self, state):
         atomic_write_json(self.state_path, state)
-
-    # A concise alias is useful to callers without creating a second behavior.
-    initialize = initialize_plan
 
     def load(self) -> dict[str, Any]:
         if not self.state_path.is_file():
@@ -410,7 +376,7 @@ class StateStore:
         except (OSError, json.JSONDecodeError) as exc:
             raise ImmutableStateError(f"Cannot read state file: {exc}") from exc
         if not isinstance(value, dict) or value.get("schema_version") != SCHEMA_VERSION:
-            raise ImmutableStateError("Unsupported or malformed state schema; old development workspaces cannot be resumed; start a new state directory")
+            raise ImmutableStateError("Unsupported or malformed state schema")
         return value
 
     def verify_immutable(self) -> dict[str, Any]:
@@ -535,20 +501,15 @@ class StateStore:
         project_id: int | None = None,
         stack_id: int | None = None,
         reason: str | None = None,
-        confirmed_rollback: bool = False,
     ) -> dict[str, Any]:
         if status not in _PROJECT_STATUSES:
             raise InvalidInputError(f"Unknown project state: {status}")
-        if status == "operator_attention":
-            return self.mark_operator_attention(
-                reason or "Project commit outcome is uncertain", entity="project"
-            )
 
         def mutate(state: dict[str, Any]) -> None:
             project = state["project"]
             current = project["status"]
             self._validate_database_transition(
-                "project", current, status, confirmed_rollback=confirmed_rollback
+                "project", current, status
             )
             self._set_immutable_id(project, "project_id", project_id)
             self._set_immutable_id(project, "stack_id", stack_id)
@@ -566,9 +527,6 @@ class StateStore:
             "prepared", project_id=project_id, stack_id=stack_id
         )
 
-    def mark_project_commit_attempted(self) -> dict[str, Any]:
-        return self.transition_project("commit_attempted")
-
     def mark_project_committed(self) -> dict[str, Any]:
         return self.transition_project("committed")
 
@@ -580,7 +538,7 @@ class StateStore:
 
         def mutate(state: dict[str, Any]) -> None:
             project = state["project"]
-            if project["status"] not in {"planned", "committed"}:
+            if project["status"] != "planned":
                 raise ImmutableStateError("Cannot replace a project creation in progress")
             self._set_immutable_id(project, "project_id", project_id)
             project["mode"] = "existing"
@@ -589,29 +547,15 @@ class StateStore:
 
         return self._mutate(mutate)
 
-    def mark_project_retryable(
-        self, reason: str, *, confirmed_rollback: bool = False
-    ) -> dict[str, Any]:
-        return self.transition_project(
-            "retryable", reason=reason, confirmed_rollback=confirmed_rollback
-        )
-
     def transition_batch(
         self,
         batch_index: int,
         status: str,
         *,
         reason: str | None = None,
-        confirmed_rollback: bool = False,
     ) -> dict[str, Any]:
         if status not in _BATCH_STATUSES:
             raise InvalidInputError(f"Unknown batch state: {status}")
-        if status == "operator_attention":
-            return self.mark_operator_attention(
-                reason or f"Batch {batch_index} commit outcome is uncertain",
-                entity="batch",
-                batch_index=batch_index,
-            )
 
         def mutate(state: dict[str, Any]) -> None:
             batch = self._find_batch(state, batch_index)
@@ -620,7 +564,6 @@ class StateStore:
                 f"batch {batch_index}",
                 current,
                 status,
-                confirmed_rollback=confirmed_rollback,
             )
             if status == "prepared":
                 if state["project"]["status"] != "committed":
@@ -647,25 +590,8 @@ class StateStore:
     def mark_batch_prepared(self, batch_index: int) -> dict[str, Any]:
         return self.transition_batch(batch_index, "prepared")
 
-    def mark_batch_commit_attempted(self, batch_index: int) -> dict[str, Any]:
-        return self.transition_batch(batch_index, "commit_attempted")
-
     def mark_batch_committed(self, batch_index: int) -> dict[str, Any]:
         return self.transition_batch(batch_index, "committed")
-
-    def mark_batch_retryable(
-        self,
-        batch_index: int,
-        reason: str,
-        *,
-        confirmed_rollback: bool = False,
-    ) -> dict[str, Any]:
-        return self.transition_batch(
-            batch_index,
-            "retryable",
-            reason=reason,
-            confirmed_rollback=confirmed_rollback,
-        )
 
     def transition_phase(
         self, phase: str, status: str, *, reason: str | None = None
@@ -674,27 +600,11 @@ class StateStore:
             raise InvalidInputError(f"Unknown lifecycle phase: {phase}")
         if status not in _PHASE_STATUSES:
             raise InvalidInputError(f"Unknown phase state: {status}")
-        if status == "operator_attention":
-            return self.mark_operator_attention(
-                reason or f"Phase {phase} requires operator attention",
-                entity="phase",
-                phase=phase,
-            )
 
         def mutate(state: dict[str, Any]) -> None:
             phase_state = state["phases"][phase]
             current = phase_state["status"]
-            allowed = {
-                "pending": {"pending", "running"},
-                "running": {"running", "complete", "retryable", "failed"},
-                "retryable": {"retryable", "running"},
-                "failed": {"failed", "running"},
-                "complete": (
-                    {"complete", "running"}
-                    if phase == "verification"
-                    else {"complete"}
-                ),
-            }
+            allowed = {"pending": {"running"}, "running": {"complete", "failed"}}
             if status not in allowed.get(current, set()):
                 raise ImmutableStateError(
                     f"Invalid {phase} transition: {current} -> {status}"
@@ -716,148 +626,57 @@ class StateStore:
     def mark_phase_complete(self, phase: str) -> dict[str, Any]:
         return self.transition_phase(phase, "complete")
 
-    def mark_phase_retryable(self, phase: str, reason: str) -> dict[str, Any]:
-        return self.transition_phase(phase, "retryable", reason=reason)
+    def begin_run(self) -> dict[str, Any]:
+        """Consume this workspace once, before any CATMAID mutation."""
 
-    def prepare_cache_rebuild(self, *, reset_plan: bool = False) -> dict[str, Any]:
-        """Invalidate only cache/verification checkpoints for an explicit rebuild."""
-
-        def mutate(state: dict[str, Any]) -> None:
-            if state["project"]["status"] != "committed" or any(
-                batch["status"] != "committed" for batch in state["batches"]
-            ):
-                raise ImmutableStateError(
-                    "Cache rebuild requires every database batch to be committed"
-                )
-            if state["phases"]["database_maintenance"]["status"] != "complete":
-                raise ImmutableStateError(
-                    "Cache rebuild requires completed database maintenance"
-                )
-            state["phases"]["cache"] = {"status": "pending"}
-            state["phases"]["verification"] = {"status": "pending"}
-            state["artifacts"].pop("verification", None)
-            state["artifacts"].pop("cache_rebuild", None)
-            if reset_plan:
-                state["artifacts"].pop("cache_plan", None)
-            self._derive_status(state)
-
+        def mutate(state):
+            if state["run"]["status"] != "pending":
+                raise InvalidInputError("This workspace has already been run; retries and resume are unsupported")
+            state["run"] = {"status": "running"}
+            state["status"] = "in_progress"
         return self._mutate(mutate)
 
-    def mark_operator_attention(
-        self,
-        reason: str,
-        *,
-        entity: str | None = None,
-        batch_index: int | None = None,
-        phase: str | None = None,
-        details: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        if not reason:
-            raise InvalidInputError("Operator-attention reason cannot be empty")
+    def finish_run(self) -> dict[str, Any]:
 
-        def mutate(state: dict[str, Any]) -> None:
-            existing = state.get("operator_attention")
-            attention = {
-                "reason": str(reason),
-                "entity": entity,
-                "batch_index": batch_index,
-                "phase": phase,
-                "details": _canonical_value(dict(details or {})),
-            }
-            if existing is not None and existing != attention:
-                raise OperatorAttentionError(
-                    "Ingestion already requires operator attention",
-                    details=existing,
-                )
-            state["operator_attention"] = attention
-            state["status"] = "operator_attention"
-            if entity == "project" and state["project"]["status"] != "committed":
-                state["project"]["status"] = "operator_attention"
-            elif entity == "batch" and batch_index is not None:
-                batch = self._find_batch(state, batch_index)
-                if batch["status"] != "committed":
-                    batch["status"] = "operator_attention"
-            elif entity == "phase" and phase is not None:
-                if phase not in state["phases"]:
-                    raise InvalidInputError(f"Unknown lifecycle phase: {phase}")
-                state["phases"][phase]["status"] = "operator_attention"
+        def mutate(state):
+            if state["run"]["status"] != "running":
+                raise InvalidInputError("Import completion requires an active run")
+            if state["phases"]["verification"]["status"] != "complete":
+                raise ImmutableStateError("Import completion requires final verification")
+            state["run"] = {"status": "complete"}
+            self._derive_status(state)
+        return self._mutate(mutate)
 
-        return self._mutate(mutate, allow_operator_attention=True)
-
-    def block_on_uncertain_commit(self) -> dict[str, Any]:
-        """Convert an uncheckpointed commit attempt into a terminal safe state."""
-        attention: dict[str, Any] | None = None
-
-        def mutate(state: dict[str, Any]) -> None:
-            nonlocal attention
-            if state["project"]["status"] == "commit_attempted":
-                attention = {
-                    "reason": "Project/stack COMMIT outcome was not checkpointed",
-                    "entity": "project",
-                }
-            else:
-                for batch in state["batches"]:
-                    if batch["status"] == "commit_attempted":
-                        attention = {
-                            "reason": f"Batch {batch['index']} COMMIT outcome was not checkpointed",
-                            "entity": "batch",
-                            "batch_index": batch["index"],
-                        }
-                        break
-            if attention is None:
-                return
-            state["status"] = "operator_attention"
-            state["operator_attention"] = {
-                **attention,
-                "batch_index": attention.get("batch_index"),
-                "phase": None,
-                "details": {},
-            }
-            if attention["entity"] == "project":
-                state["project"]["status"] = "operator_attention"
-            else:
-                self._find_batch(state, attention["batch_index"])[
-                    "status"
-                ] = "operator_attention"
-
-        state = self._mutate(mutate, allow_operator_attention=True)
-        if attention is not None:
-            raise OperatorAttentionError(attention["reason"], details=attention)
-        if state.get("status") == "operator_attention":
-            existing = state.get("operator_attention") or {}
-            raise OperatorAttentionError(
-                str(existing.get("reason", "Ingestion requires operator attention")),
-                details=existing,
-            )
-        return state
-
-    def _mutate(
-        self,
-        mutator: Callable[[dict[str, Any]], None],
-        *,
-        allow_operator_attention: bool = False,
-    ) -> dict[str, Any]:
+    def fail_run(self, reason: str) -> dict[str, Any]:
+        """Retain confirmed progress and expose the first failed attempt."""
         with self._mutation_lock():
             state = self.load()
-            if state.get("status") == "operator_attention" and not allow_operator_attention:
-                raise OperatorAttentionError(
-                    "Ingestion requires operator attention; normal mutations are blocked",
-                    details=state.get("operator_attention") or {},
-                )
+            if state["run"]["status"] != "running":
+                return state
+            state["run"] = {"status": "failed", "reason": reason}
+            state["status"] = "failed"
+            for item in [state["project"], *state["batches"]]:
+                if item["status"] == "prepared":
+                    item["status"] = "failed"
+                    item["reason"] = reason
+            for item in state["phases"].values():
+                if item["status"] == "running":
+                    item["status"] = "failed"
+                    item["reason"] = reason
+            self._persist(state)
+            return copy.deepcopy(state)
+
+    def _mutate(self, mutator: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+        with self._mutation_lock():
+            self._assert_mutations_allowed()
+            state = self.load()
             mutator(state)
             self._persist(state)
             return copy.deepcopy(state)
 
     def _assert_mutations_allowed(self) -> None:
-        """Fail before preparatory work when an operator lockout is durable."""
-        if not self.state_path.is_file():
-            return
-        state = self.load()
-        if state.get("status") == "operator_attention":
-            raise OperatorAttentionError(
-                "Ingestion requires operator attention; normal mutations are blocked",
-                details=state.get("operator_attention") or {},
-            )
+        if self.state_path.is_file() and self.load()["run"]["status"] in {"failed", "complete"}:
+            raise InvalidInputError("This import attempt is terminal; the workspace cannot be reused")
 
     def _normalize_request(
         self, request: IngestionRequest | Mapping[str, Any]
@@ -1015,33 +834,9 @@ class StateStore:
             raise ImmutableStateError(f"Cannot change reserved {key}")
         target[key] = value
 
-    def _validate_database_transition(
-        self,
-        label: str,
-        current: str,
-        requested: str,
-        *,
-        confirmed_rollback: bool,
-    ) -> None:
-        if current == requested:
-            return
-        allowed = {
-            "planned": {"prepared"},
-            "prepared": {"commit_attempted", "retryable"},
-            "retryable": {"prepared"},
-            "commit_attempted": {"committed"},
-            "committed": set(),
-        }
-        if current == "commit_attempted" and requested == "retryable":
-            if confirmed_rollback:
-                return
-            raise OperatorAttentionError(
-                f"Cannot retry {label}: COMMIT outcome is uncertain"
-            )
-        if requested not in allowed.get(current, set()):
-            raise ImmutableStateError(
-                f"Invalid {label} transition: {current} -> {requested}"
-            )
+    def _validate_database_transition(self, label: str, current: str, requested: str) -> None:
+        if requested not in {"planned": {"prepared"}, "prepared": {"committed"}}.get(current, set()):
+            raise ImmutableStateError(f"Invalid {label} transition: {current} -> {requested}")
 
     def _validate_phase_prerequisite(
         self, state: Mapping[str, Any], phase: str
@@ -1063,8 +858,8 @@ class StateStore:
                 )
 
     def _derive_status(self, state: dict[str, Any]) -> None:
-        if state.get("operator_attention") is not None:
-            state["status"] = "operator_attention"
+        if state["run"]["status"] == "failed":
+            state["status"] = "failed"
             return
         project_status = state["project"]["status"]
         if project_status != "committed":

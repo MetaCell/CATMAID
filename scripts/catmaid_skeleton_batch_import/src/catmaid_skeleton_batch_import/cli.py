@@ -12,7 +12,7 @@ from typing import Any
 from typing import Sequence
 
 from . import __version__
-from .errors import ImporterError, InvalidInputError, RetryableError
+from .errors import ImporterError, InvalidInputError, OperationalFailureError
 from .util import atomic_write_json, canonical_json_bytes
 
 
@@ -41,13 +41,8 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--request", type=Path, required=True)
     plan.add_argument("--state-dir", type=Path, required=True)
 
-    run = commands.add_parser("run", help="execute or resume the prepared ingestion")
+    run = commands.add_parser("run", help="execute the planned ingestion once")
     run.add_argument("--state-dir", type=Path, required=True)
-    run.add_argument(
-        "--rebuild-cache",
-        action="store_true",
-        help="rebuild the target project's grid payloads and rerun verification (layer must be inactive)",
-    )
     return parser
 
 
@@ -146,10 +141,7 @@ def execute(argv: Sequence[str] | None = None) -> int:
         elif args.command == "plan":
             result = plan_ingestion(args.request, args.state_dir)
         else:
-            result = run_ingestion(
-                args.state_dir,
-                rebuild_cache=args.rebuild_cache,
-            )
+            result = run_ingestion(args.state_dir)
         _emit(result)
         return 0
     except ImporterError as exc:
@@ -159,7 +151,7 @@ def execute(argv: Sequence[str] | None = None) -> int:
         _emit(result)
         return exc.exit_code
     except KeyboardInterrupt:
-        exc = RetryableError("Interrupted")
+        exc = OperationalFailureError("Interrupted")
         print(str(exc), file=sys.stderr)
         result = _error_result(exc, command=command, state_dir=state_dir)
         _persist_error(state_dir, result, exc)

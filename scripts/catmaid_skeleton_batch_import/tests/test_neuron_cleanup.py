@@ -63,8 +63,7 @@ def test_deletion_releases_only_unused_annotations_and_keeps_real_collisions(sha
 
     assert annotations == ({13: "source-fragment:alpha", 43: "unrelated"}
                            if shared else {43: "unrelated"})
-    store = SimpleNamespace(load=lambda: {"batches": [{"index": 1, "status": "planned"}]})
-    args = (store, build_plan([member("alpha.swc", 2)], 10),
+    args = (build_plan([member("alpha.swc", 2)], 10),
             ProjectContext.from_dict(CONTEXT), Connection(list(annotations.items())))
     if shared:
         with pytest.raises(InvalidInputError, match="already exist"):

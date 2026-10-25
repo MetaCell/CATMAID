@@ -6,18 +6,13 @@ from catmaid_skeleton_batch_import.metrics import MetricsStore
 from catmaid_skeleton_batch_import.orchestrator import (
     _buffer_loader_timing,
     _flush_loader_timings,
-    _reconcile_completed_progress,
+    _record_completed_progress,
 )
 
 
-def test_reconciles_committed_progress_before_skipped_batches(tmp_path: Path) -> None:
+def test_records_confirmed_committed_progress(tmp_path: Path) -> None:
     metrics = MetricsStore(tmp_path)
     metrics.initialize(planned_batches=3, planned_nodes=30, planned_skeletons=6)
-    metrics.update_progress(
-        completed_batches=3,
-        completed_nodes=30,
-        completed_skeletons=6,
-    )
     state = {
         "batches": [
             {
@@ -41,7 +36,7 @@ def test_reconciles_committed_progress_before_skipped_batches(tmp_path: Path) ->
         ]
     }
 
-    reconciled = _reconcile_completed_progress(metrics, state)
+    reconciled = _record_completed_progress(metrics, state)
 
     assert reconciled["counts"]["batches"]["completed"] == 2
     assert reconciled["counts"]["nodes"]["completed"] == 20

@@ -356,15 +356,15 @@ def analyze_tables(
 @contextlib.contextmanager
 def existing_project_import_lock(project_id: int, connection: Any) -> Iterator[None]:
     """Serialize cooperating importers for one target across batch commits."""
-    from .errors import RetryableError
+    from .errors import OperationalFailureError
 
     lock_namespace = 0x4341544D  # CATM, a stable two-int advisory-lock namespace.
     with connection.cursor() as cursor:
         if not _fetch_scalar(
             cursor, "SELECT pg_try_advisory_lock(%s, %s)", [lock_namespace, project_id]
         ):
-            raise RetryableError(
-                f"Another skeleton import is using project {project_id}; retry later"
+            raise OperationalFailureError(
+                f"Another skeleton import is using project {project_id}; aborting this attempt"
             )
     session = getattr(connection, "connection", connection)
     try:

@@ -104,9 +104,9 @@ def test_rejects_old_development_plan_before_reading_old_member_layout(tmp_path,
 
 
 @pytest.mark.parametrize("schema_version", [1, 2])
-def test_rejects_old_development_state_with_clear_recovery_message(tmp_path, schema_version):
+def test_rejects_unsupported_state_schema(tmp_path, schema_version):
     (tmp_path / "state.json").write_text(json.dumps({"schema_version": schema_version}))
-    with pytest.raises(ImmutableStateError, match="start a new state directory"):
+    with pytest.raises(ImmutableStateError, match="Unsupported or malformed"):
         StateStore(tmp_path).load()
 
 

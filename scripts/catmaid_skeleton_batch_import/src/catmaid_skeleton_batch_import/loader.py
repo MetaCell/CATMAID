@@ -429,14 +429,9 @@ def execute_batch_transaction(
     prepared: PreparedBatch,
     project: ProjectContext,
     settings: ImportSettings,
-    before_commit: Callable[[], None],
     record_timing: Callable[[str, float, dict[str, int]], None] | None = None,
 ) -> dict[str, int]:
-    """COPY, materialize, validate, and attempt one atomic batch commit.
-
-    ``before_commit`` must durably record the ambiguity marker. It is called as
-    the last operation before leaving the outer atomic block.
-    """
+    """COPY, materialize and validate one batch in a single atomic transaction."""
     from django.db import connection, transaction
 
     from .materialization import materialize_and_verify_batch
@@ -514,7 +509,6 @@ def execute_batch_transaction(
                 time.monotonic() - exact_validation_start,
                 counts,
             )
-            before_commit()
 
     result = dict(counts)
     result.update({key: int(value) for key, value in materialized.items()})

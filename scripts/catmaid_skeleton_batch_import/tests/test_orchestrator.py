@@ -63,7 +63,7 @@ def _save_node_maps(store, plan, request, project, load_nodes):
             list(range(batch.index * 1000, batch.index * 1000 + batch.node_count)),
             load_nodes,
         ) as prepared:
-            orchestrator._ensure_batch_node_map(store, prepared)
+            orchestrator._save_batch_node_map(store, prepared)
 
 
 def _counts(skeletons, nodes):
@@ -159,7 +159,7 @@ def test_saved_mapping_is_checked_against_reservations_and_artifact_metadata(
     nodes = (SwcNode(1, 1, 0, 0, 0, -1, -1), SwcNode(2, 3, 2, 0, 0, -1, 1))
     with prepare_copy_rows(plan.batches[0], request, project, list(range(100, 105)),
                            [1000, 1001], lambda _member: nodes) as prepared:
-        orchestrator._ensure_batch_node_map(store, prepared)
+        orchestrator._save_batch_node_map(store, prepared)
         descriptor = state["batches"][0]["artifacts"]["node_map"]
         path = tmp_path / descriptor["path"]
         if damage == "missing":

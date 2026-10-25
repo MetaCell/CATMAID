@@ -12,7 +12,7 @@ import pytest
 from catmaid_skeleton_batch_import import database, loader, materialization, offline_cache, orchestrator, project, project_checks
 from catmaid_skeleton_batch_import.config import load_request, load_settings
 from catmaid_skeleton_batch_import.artifacts import read_id_artifact
-from catmaid_skeleton_batch_import.errors import ImmutableStateError, InvalidInputError, RetryableError
+from catmaid_skeleton_batch_import.errors import ImmutableStateError, InvalidInputError, OperationalFailureError
 from catmaid_skeleton_batch_import.loader import ProjectContext
 from catmaid_skeleton_batch_import.state import StateStore
 
@@ -150,7 +150,7 @@ def test_existing_project_lock_is_released_on_failure_and_busy_is_retryable():
         with database.existing_project_import_lock(123, connection):
             raise RuntimeError("failed batch")
     assert "pg_advisory_unlock" in connection.statements[-1][0]
-    with pytest.raises(RetryableError, match="Another skeleton import"):
+    with pytest.raises(OperationalFailureError, match="Another skeleton import"):
         with database.existing_project_import_lock(123, Connection(available=False)):
             forbidden()
 
@@ -178,11 +178,11 @@ def test_both_target_modes_use_bulk_materialization_in_one_atomic_batch(monkeypa
     )
     context = CONTEXT | {"existing_project": existing}
     loader.execute_batch_transaction(prepared, ProjectContext.from_dict(context),
-                                     load_settings(), lambda: events.append("commit"))
+                                     load_settings())
     assert len(copied) == 3
     assert [sql for sql, _params in connection.statements if "session_replication_role" in sql] == [
         "SET LOCAL session_replication_role = replica", "SET LOCAL session_replication_role = origin"]
-    assert events == ["materialize", "exact", "commit"]
+    assert events == ["materialize", "exact"]
 
 
 def configure_run(monkeypatch, connection):
@@ -237,7 +237,8 @@ def test_preflight_only_reads_metadata_and_append_planning_is_entirely_offline(t
     monkeypatch.setattr(database, "bootstrap_django", forbidden)
     monkeypatch.setenv("DJANGO_SETTINGS_MODULE", "must.not.be.loaded")
     assert orchestrator.plan_ingestion(path, state_dir)["ok"]
-    assert orchestrator.plan_ingestion(path, state_dir)["ok"]
+    with pytest.raises(InvalidInputError, match="already contains"):
+        orchestrator.plan_ingestion(path, state_dir)
     StateStore(state_dir).verify_artifact("stack_geometry")
 
 
@@ -263,10 +264,11 @@ def test_preflight_can_refresh_metadata_only_before_planning(tmp_path, monkeypat
     orchestrator.preflight_ingestion(path, state_dir)
     assert json.loads((state_dir / "stack-geometry.json").read_text()) == connection.geometry
     orchestrator.plan_ingestion(path, state_dir)
-    assert orchestrator.preflight_ingestion(path, state_dir)["ok"]
+    with pytest.raises(InvalidInputError, match="before planning"):
+        orchestrator.preflight_ingestion(path, state_dir)
     saved = (state_dir / "stack-geometry.json").read_bytes()
     connection.geometry["stacks"][0]["dimension"][0] = 300
-    with pytest.raises(ImmutableStateError, match="geometry or database identity changed"):
+    with pytest.raises(InvalidInputError, match="before planning"):
         orchestrator.preflight_ingestion(path, state_dir)
     assert (state_dir / "stack-geometry.json").read_bytes() == saved
 
@@ -283,29 +285,23 @@ def test_append_planning_rejects_outside_coordinates_without_persisting_a_plan(t
     assert connection.statements == []
 
 
-@pytest.mark.parametrize("stage", ["preflight", "run"])
 @pytest.mark.parametrize("change", ["geometry", "database"])
-def test_changed_append_geometry_or_database_is_rejected_before_reserving_ids(tmp_path, monkeypatch, stage, change):
+def test_changed_append_geometry_or_database_is_rejected_before_reserving_ids(tmp_path, monkeypatch, change):
     connection = Connection()
     configure_run(monkeypatch, connection)
     state_dir = tmp_path / "state"
-    path = request_file(tmp_path)
-    plan_append(path, state_dir)
+    plan_append(request_file(tmp_path), state_dir)
     if change == "geometry":
         connection.geometry["stacks"][0]["translation_nm"][0] = 10
     else:
         connection.geometry["database_target"]["sha256"] = "different-cluster"
     monkeypatch.setattr(database, "allocate_sequence_ids", forbidden)
     monkeypatch.setattr(orchestrator, "execute_batch_transaction", forbidden)
-    # Offline planning intentionally keeps using the snapshot, even if the live
-    # target has since changed. Preflight/run enforce freshness against CATMAID.
-    assert orchestrator.plan_ingestion(path, state_dir)["ok"]
     with pytest.raises(ImmutableStateError, match="geometry or database identity changed"):
-        if stage == "preflight":
-            orchestrator.preflight_ingestion(path, state_dir)
-        else:
-            orchestrator.run_ingestion(state_dir)
-    assert StateStore(state_dir).load()["batches"][0]["status"] == "planned"
+        orchestrator.run_ingestion(state_dir)
+    state = StateStore(state_dir).load()
+    assert state["batches"][0]["status"] == "planned"
+    assert state["status"] == "failed"
 
 
 def test_missing_stack_snapshot_fails_before_loading_or_reserving_ids(tmp_path, monkeypatch):
@@ -347,8 +343,7 @@ def test_geometry_change_during_import_prevents_completion(tmp_path, monkeypatch
     configure_run(monkeypatch, connection)
     state_dir = tmp_path / "state"
     plan_append(request_file(tmp_path), state_dir)
-    def commit(_prepared, _context, _settings, before_commit, _timings):
-        before_commit()
+    def commit(_prepared, _context, _settings, _timings):
         connection.geometry["stacks"][0]["dimension"][0] += 1
         return dict(COUNTS)
     monkeypatch.setattr(orchestrator, "execute_batch_transaction", commit)
@@ -359,17 +354,16 @@ def test_geometry_change_during_import_prevents_completion(tmp_path, monkeypatch
     assert state["status"] != "complete"
 
 
-def test_complete_append_and_resume_are_scoped_and_preserve_target_configuration(tmp_path, monkeypatch):
+def test_complete_append_is_scoped_and_preserves_target_configuration(tmp_path, monkeypatch):
     connection = Connection([(99, "source-fragment:unrelated-existing-skeleton")])
     configure_run(monkeypatch, connection)
     state_dir = tmp_path / "state"
     plan_append(request_file(tmp_path), state_dir)
     batches = []
     exact_checks = []
-    def commit(prepared, context, _settings, before_commit, _timings):
+    def commit(prepared, context, _settings, _timings):
         assert context.existing_project
         batches.append(prepared.batch.index)
-        before_commit()
         return dict(COUNTS)
     monkeypatch.setattr(orchestrator, "execute_batch_transaction", commit)
     monkeypatch.setattr(loader, "verify_exact_treenodes", lambda *_args: exact_checks.append(True))
@@ -377,14 +371,14 @@ def test_complete_append_and_resume_are_scoped_and_preserve_target_configuration
     descriptor = StateStore(state_dir).load()["batches"][0]["artifacts"]["concept_ids"]
     own_ids = read_id_artifact(state_dir, descriptor, expected_count=5)
     connection.annotations.append((own_ids[3], "source-fragment:alpha"))
-    second = orchestrator.run_ingestion(state_dir)
-    assert first == second
+    with pytest.raises(InvalidInputError, match="terminal"):
+        orchestrator.run_ingestion(state_dir)
     assert first["project_id"] == 123
     assert first["stack_id"] is None
     assert first["status"] == "complete"
     assert first["existing_project"] is True
-    assert batches == [1]  # Resume never reimports committed rows.
-    assert len(exact_checks) == 2  # Coordinates/radii are checked on every run.
+    assert batches == [1]
+    assert len(exact_checks) == 1
     result = json.loads((state_dir / "verification.json").read_text())
     assert result["cache"] == {
         "rebuilt": True, "strategy": "offline_full_grid_rebuild", "verified": True,
@@ -409,51 +403,38 @@ def test_provenance_collision_is_rejected_before_any_batch_is_loaded(tmp_path, m
     assert StateStore(state_dir).load()["batches"][0]["status"] == "planned"
 
 
-def test_interrupted_cache_refresh_resumes_committed_batch_and_requires_final_verification(tmp_path, monkeypatch):
-    connection = Connection()
-    configure_run(monkeypatch, connection)
+@pytest.mark.parametrize("phase", ["cache", "verification"])
+def test_cache_or_verification_failure_is_terminal(tmp_path, monkeypatch, phase):
+    configure_run(monkeypatch, Connection())
     state_dir = tmp_path / "state"
     plan_append(request_file(tmp_path), state_dir)
     events = []
-    def commit(_prepared, _context, _settings, before_commit, _timings):
+    def commit(*_args):
         events.append("commit")
-        before_commit()
         return dict(COUNTS)
-    monkeypatch.setattr(orchestrator, "execute_batch_transaction", commit)
-    monkeypatch.setattr(loader, "verify_exact_treenodes", lambda *_args: events.append("database_verification"))
-    failure = ["refresh"]
     def rebuild(self, **_kwargs):
-        assert StateStore(state_dir).load()["batches"][0]["status"] == "committed"
-        events.append("refresh")
-        if failure == ["refresh"]:
-            raise RetryableError("injected cache interruption")
+        events.append("cache")
+        if phase == "cache":
+            raise OperationalFailureError("injected failure")
         return {"schema_version": 1, "project_id": 123, "grids": [],
                 "strategy": "offline_full_grid_rebuild"}
     def verify(self, _receipt):
-        events.append("cache_verification")
-        if failure == ["verification"] and events[-2] == "database_verification":
-            raise RetryableError("injected final cache invalidation")
-        return {"verified": True, "cell_count": 1}
+        events.append("verification")
+        raise OperationalFailureError("injected failure")
+    monkeypatch.setattr(orchestrator, "execute_batch_transaction", commit)
+    monkeypatch.setattr(loader, "verify_exact_treenodes", lambda *_args: None)
     monkeypatch.setattr(offline_cache.OfflineGridCache, "rebuild", rebuild)
     monkeypatch.setattr(offline_cache.OfflineGridCache, "verify", verify)
-    with pytest.raises(RetryableError, match="cache interruption"):
+    with pytest.raises(OperationalFailureError, match="injected failure"):
         orchestrator.run_ingestion(state_dir)
     state = StateStore(state_dir).load()
+    assert state["status"] == "failed"
     assert state["batches"][0]["status"] == "committed"
-    assert state["status"] != "complete"
-    assert state["phases"]["cache"]["status"] == "retryable"
-
-    failure[:] = ["verification"]
-    with pytest.raises(RetryableError, match="final cache invalidation"):
+    assert state["phases"][phase]["status"] == "failed"
+    before = list(events)
+    with pytest.raises(InvalidInputError, match="terminal"):
         orchestrator.run_ingestion(state_dir)
-    state = StateStore(state_dir).load()
-    assert state["status"] != "complete"
-    assert state["phases"]["verification"]["status"] == "retryable"
-    failure.clear()
-    assert orchestrator.run_ingestion(state_dir)["status"] == "complete"
-    assert events.count("commit") == 1
-    assert events.count("refresh") == 2  # Completed cache stage is verified, not rebuilt again.
-    assert events[-2:] == ["database_verification", "cache_verification"]
+    assert events == before
 
 
 def test_cache_is_rebuilt_once_after_all_batches(tmp_path, monkeypatch):
@@ -466,9 +447,8 @@ def test_cache_is_rebuilt_once_after_all_batches(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     plan_append(path, state_dir)
     events = []
-    def commit(prepared, _context, _settings, before_commit, _timings):
+    def commit(prepared, _context, _settings, _timings):
         events.append(f"commit_{prepared.batch.index}")
-        before_commit()
         return dict(COUNTS)
     monkeypatch.setattr(orchestrator, "execute_batch_transaction", commit)
     monkeypatch.setattr(loader, "verify_exact_treenodes", lambda *_args: None)
@@ -479,58 +459,44 @@ def test_cache_is_rebuilt_once_after_all_batches(tmp_path, monkeypatch):
     monkeypatch.setattr(offline_cache.OfflineGridCache, "rebuild", rebuild)
     assert orchestrator.run_ingestion(state_dir)["status"] == "complete"
     assert events == ["commit_1", "commit_2", "cache"]
-    assert orchestrator.run_ingestion(state_dir)["status"] == "complete"
+    with pytest.raises(InvalidInputError, match="terminal"):
+        orchestrator.run_ingestion(state_dir)
     assert events == ["commit_1", "commit_2", "cache"]
-    assert orchestrator.run_ingestion(state_dir, rebuild_cache=True)["status"] == "complete"
-    assert events == ["commit_1", "commit_2", "cache", "cache"]
 
 
 def test_project_context_round_trips():
     assert ProjectContext.from_dict(CONTEXT).to_dict() == CONTEXT
 
 
-@pytest.mark.parametrize("interrupted", [False, True], ids=["explicit-rebuild", "resume"])
-def test_cache_observation_is_reset_before_coverage_planning(tmp_path, monkeypatch, interrupted):
-    connection = Connection()
-    configure_run(monkeypatch, connection)
+def test_cache_observation_starts_before_coverage_planning(tmp_path, monkeypatch):
+    configure_run(monkeypatch, Connection())
     state_dir = tmp_path / "state"
     plan_append(request_file(tmp_path), state_dir)
-    commits = []
-
-    def commit(prepared, _context, _settings, before_commit, _timings):
-        commits.append(prepared.batch.index)
-        before_commit()
-        return dict(COUNTS)
-
-    monkeypatch.setattr(orchestrator, "execute_batch_transaction", commit)
+    monkeypatch.setattr(orchestrator, "execute_batch_transaction", lambda *_args: dict(COUNTS))
     monkeypatch.setattr(loader, "verify_exact_treenodes", lambda *_args: None)
-    assert orchestrator.run_ingestion(state_dir)["status"] == "complete"
-
-    observation_path = state_dir / "cache-progress.json"
-    previous = {"schema_version": 1, "completed": 90, "total": 90}
-    observation_path.write_text(json.dumps(previous))
-    # A completed import that only verifies must not reset diagnostic counters.
-    assert orchestrator.run_ingestion(state_dir)["status"] == "complete"
-    assert json.loads(observation_path.read_text()) == previous
-
-    store = StateStore(state_dir)
-    if interrupted:
-        store.prepare_cache_rebuild(reset_plan=True)
-        store.mark_phase_running("cache")
-        store.mark_phase_retryable("cache", "interrupted coverage planning")
-
-    original_plan = offline_cache.OfflineGridCache.plan
+    original = offline_cache.OfflineGridCache.plan
     observations = []
+    def plan(cache):
+        observations.append(json.loads((state_dir / "cache-progress.json").read_text()))
+        assert StateStore(state_dir).load()["phases"]["cache"]["status"] == "running"
+        return original(cache)
+    monkeypatch.setattr(offline_cache.OfflineGridCache, "plan", plan)
+    assert orchestrator.run_ingestion(state_dir)["status"] == "complete"
+    assert observations == [{"schema_version": 1, "completed": 0, "total": 0}]
 
-    def check_before_planning(cache):
-        assert store.load()["phases"]["cache"]["status"] == "running"
-        current = json.loads(observation_path.read_text())
-        observations.append(current)
-        assert current == {"schema_version": 1, "completed": 0, "total": 0}
-        return original_plan(cache)
-
-    monkeypatch.setattr(offline_cache.OfflineGridCache, "plan", check_before_planning)
-    assert orchestrator.run_ingestion(state_dir, rebuild_cache=not interrupted)["status"] == "complete"
-    assert len(observations) == 1
-    assert commits == [1]
-    assert store.load()["phases"]["verification"]["status"] == "complete"
+def test_planning_failure_does_not_publish_partial_state(tmp_path, monkeypatch):
+    configure_run(monkeypatch, Connection())
+    path = request_file(tmp_path)
+    state_dir = tmp_path / "state"
+    orchestrator.preflight_ingestion(path, state_dir)
+    verify = StateStore._verify_artifact_value
+    def fail_geometry(self, label, value):
+        if label == "stack_geometry":
+            raise OSError("injected planning failure")
+        return verify(self, label, value)
+    monkeypatch.setattr(StateStore, "_verify_artifact_value", fail_geometry)
+    with pytest.raises(OSError, match="planning failure"):
+        orchestrator.plan_ingestion(path, state_dir)
+    assert not (state_dir / "state.json").exists()
+    with pytest.raises(InvalidInputError, match="not been planned"):
+        orchestrator.run_ingestion(state_dir)

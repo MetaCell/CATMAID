@@ -246,23 +246,6 @@ def parse_swc(
             current = nodes_by_id[current].parent_source_id
         resolved.update(path)
 
-    children: dict[int, list[int]] = {}
-    for node in nodes:
-        if node.parent_source_id != -1:
-            children.setdefault(node.parent_source_id, []).append(node.source_id)
-    visited: set[int] = set()
-    stack = [roots[0]]
-    while stack:
-        node_id = stack.pop()
-        if node_id in visited:
-            continue
-        visited.add(node_id)
-        stack.extend(children.get(node_id, ()))
-    if len(visited) != len(nodes):
-        raise InvalidInputError(
-            f"{label}: disconnected graph; reached {len(visited)} of {len(nodes)} nodes"
-        )
-
     lengths: list[float] = []
     for node in nodes:
         if node.parent_source_id == -1:

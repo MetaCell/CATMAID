@@ -96,7 +96,7 @@ exit 0
     )
 
 
-def test_run_does_not_retry_retryable_importer_exit(tmp_path: Path) -> None:
+def test_run_surfaces_operational_failure_after_one_child(tmp_path: Path) -> None:
     calls = tmp_path / "calls"
     counter = tmp_path / "counter"
     importer = tmp_path / "importer"
@@ -187,7 +187,7 @@ Path(os.environ["PYTHON_PATH_FILE"]).write_text(
     ]
 
 
-def test_successful_retry_clears_previous_failure_before_starting_child(tmp_path: Path) -> None:
+def test_failed_workspace_is_not_restarted(tmp_path: Path) -> None:
     importer = tmp_path / "importer"
     _write_executable(importer, f"""#!{sys.executable}
 import os
@@ -213,12 +213,13 @@ sys.exit(int(os.environ['TEST_IMPORTER_EXIT']))
 
     succeeded = subprocess.run(command, env=environment | {"TEST_IMPORTER_EXIT": "0"},
                                text=True, capture_output=True, check=False)
-    assert succeeded.returncode == 0, succeeded.stderr
-    assert not marker.exists()
+    assert succeeded.returncode == 64
+    assert "terminal failure" in succeeded.stderr
+    assert json.loads(marker.read_text())["importer_exit_code"] == 3
     assert json.loads(checkpoint.read_text()) == {"checkpoint": "keep"}
 
 
-def test_run_does_not_retry_operator_attention_exit(tmp_path: Path) -> None:
+def test_run_surfaces_other_nonzero_exit_after_one_child(tmp_path: Path) -> None:
     calls = tmp_path / "calls"
     importer = tmp_path / "importer"
     _write_executable(
@@ -255,3 +256,28 @@ exit 5
         "importer_exit_code": 5,
         "attempts": 1,
     }
+
+def test_readiness_failure_is_checked_once_and_reported(tmp_path):
+    importer = tmp_path / "importer"
+    _write_executable(importer, "#!/bin/bash" + chr(10) + "exit 99" + chr(10))
+    environment = _base_environment(tmp_path, importer)
+    checks = tmp_path / "checks"
+    pg_ready = Path(environment["CATMAID_PG_ISREADY_BIN"])
+    code = chr(10).join([
+        "#!" + sys.executable,
+        "from pathlib import Path",
+        "path = Path(" + repr(str(checks)) + ")",
+        "path.write_text(path.read_text() + 'x' if path.exists() else 'x')",
+        "raise SystemExit(1)",
+        "",
+    ])
+    _write_executable(pg_ready, code)
+    result = subprocess.run([sys.executable, str(WRAPPER), "run"], env=environment,
+                            text=True, capture_output=True, check=False)
+    assert result.returncode == 3
+    assert checks.read_text() == "x"
+    state = Path(environment["SKELETON_INGESTION_WORKSPACE"]) / "state"
+    marker = json.loads((state / "run-wrapper-result.json").read_text())
+    assert marker["terminal"] is True
+    assert marker["attempts"] == 0
+    assert marker["importer_exit_code"] == 3

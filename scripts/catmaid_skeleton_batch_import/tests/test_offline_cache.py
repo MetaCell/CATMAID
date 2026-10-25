@@ -7,7 +7,7 @@ import sys
 import pytest
 
 from catmaid_skeleton_batch_import.offline_cache import GRID_FIELDS, OfflineGridCache
-from catmaid_skeleton_batch_import.errors import RetryableError, VerificationError
+from catmaid_skeleton_batch_import.errors import OperationalFailureError, VerificationError
 
 
 NOW = datetime(2026, 10, 16, tzinfo=timezone.utc)
@@ -126,8 +126,8 @@ def test_saved_plan_preserves_empty_coverage_after_an_interrupted_rebuild(monkey
     connection.empty_extent = (-1, 0, 2, 2, 3, 3)
     cache = tracker(connection)
     plan = cache.plan()
-    monkeypatch.setattr(cache, "_refresh", lambda *_args: (_ for _ in ()).throw(RetryableError("interrupted")))
-    with pytest.raises(RetryableError, match="interrupted"):
+    monkeypatch.setattr(cache, "_refresh", lambda *_args: (_ for _ in ()).throw(OperationalFailureError("interrupted")))
+    with pytest.raises(OperationalFailureError, match="interrupted"):
         cache.rebuild(plan=plan)
     assert not connection.cells[11]
     connection.empty_extent = (None,) * 6
@@ -161,10 +161,10 @@ def test_failed_rebuild_can_restart_without_accepting_partial_payloads(monkeypat
     def fail(config, cell):
         calls.append(cell)
         if len(calls) == 2:
-            raise RetryableError("injected generation failure")
+            raise OperationalFailureError("injected generation failure")
         connection.cells[config["id"]].add(cell)
     monkeypatch.setattr(cache, "_refresh", fail)
-    with pytest.raises(RetryableError, match="generation failure"):
+    with pytest.raises(OperationalFailureError, match="generation failure"):
         cache.rebuild()
     monkeypatch.setattr(cache, "_refresh", lambda g, cell: connection.cells[g["id"]].add(cell))
     receipt = cache.rebuild()
@@ -187,7 +187,7 @@ def test_verification_rejects_incomplete_payloads_or_changed_settings(monkeypatc
         receipt["node_limit"] = 3500
     else:
         connection.grids[0]["ordering"] = "cable-desc"
-    with pytest.raises((VerificationError, RetryableError)):
+    with pytest.raises((VerificationError, OperationalFailureError)):
         cache.verify(receipt)
 
 
@@ -197,7 +197,7 @@ def test_limited_cache_plan_is_rejected_before_existing_payloads_are_deleted():
     plan = cache.plan()
     assert plan["node_limit"] is None
     plan["node_limit"] = 3500
-    with pytest.raises(VerificationError, match="rebuild-cache"):
+    with pytest.raises(VerificationError, match="Cache rebuild plan changed"):
         cache.rebuild(plan=plan)
     assert not any("DELETE" in sql for sql, _params in connection.statements)
 
@@ -261,9 +261,9 @@ def test_cache_progress_does_not_count_failed_cell_and_resets_on_retry(monkeypat
     def refresh(*_):
         calls.append(1)
         if len(calls)==2:
-            raise RetryableError("cell failure")
+            raise OperationalFailureError("cell failure")
     monkeypatch.setattr(cache,"_refresh",refresh)
-    with pytest.raises(RetryableError, match="cell failure"):
+    with pytest.raises(OperationalFailureError, match="cell failure"):
         cache.rebuild(plan=plan, progress=lambda d,t:observed.append((d,t)))
     assert [d for d,t in observed] == [0,1]
     observed.clear(); monkeypatch.setattr(cache,"_refresh",lambda *_:None)

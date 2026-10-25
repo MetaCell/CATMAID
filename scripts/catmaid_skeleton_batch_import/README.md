@@ -2,7 +2,7 @@
 
 This package provides non-interactive CATMAID SWC batch ingestion. It owns
 validation, deterministic batch planning, database ingestion, CATMAID
-materialization, cache creation, verification, and durable resume state. It does
+materialization, cache creation, verification, and retained audit state. It does
 not download inputs, publish a project, or delete a failed project. Imports can
 append to an existing tracing project (including one that already has skeletons)
 or create a new hidden project.
@@ -39,20 +39,10 @@ DJANGO_SETTINGS_MODULE=mysite.settings \
 catmaid-skeleton-import run --state-dir /staging/state
 ```
 
-After a successful import, `run` skips committed batches and cache rebuilding,
-and repeats verification against the saved rebuild receipt. To rebuild the target
-project's grid payloads and verify them again (for either target mode), keep the
-managed layer inactive and run:
-
-```bash
-catmaid-skeleton-import run \
-  --state-dir /staging/state \
-  --rebuild-cache
-```
-
-The rebuild first invalidates the cache and verification checkpoints. If it is
-interrupted, an ordinary later `run` resumes at cache creation without changing
-skeleton rows.
+Each workspace supports one `run` invocation. The importer surfaces the first
+failure immediately. It does not retry, resume committed batches, or offer a
+`--rebuild-cache` recovery mode. Keep the workspace for diagnosis; use a new
+workspace only after inspecting any data left by the failed attempt.
 
 `plan` needs no database or Django initialization for either target mode. For
 append requests, first run `preflight` with the same request and state directory.
@@ -103,7 +93,7 @@ These files describe the latest failed command; a later successful result is
 authoritative over any retained older error-details file.
 
 An invalid archive produces no executable plan, even if some SWCs are valid.
-Fix the reported files and rerun `plan`. Archive-wide failures such as an
+Fix the reported files and plan a new ingestion in a fresh state directory. Archive-wide failures such as an
 unreadable ZIP, duplicate ZIP paths, encryption, or archive-size limits still
 stop immediately; per-file size/type checks and fragment-ID collisions are
 reported with the other member errors.
@@ -185,8 +175,8 @@ nm accepts `[-500, -1000, -1500]` nm; X = -1001 nm is outside it.
 Missing stacks or invalid stack geometry also prevent planning.
 
 `plan` reads this snapshot locally and registers its hash alongside the plan.
-Preflight may refresh the snapshot before planning; afterward it only checks
-that the saved metadata still matches. To use changed metadata, create a new
+Preflight may refresh the snapshot before planning and must finish before the
+plan is published. To use changed metadata, create a new
 state directory and repeat preflight and planning. The stack definitions and database
 identity are rechecked before loading and final verification; a changed
 target stops the run. A missing stack snapshot also stops the run before IDs
@@ -204,7 +194,7 @@ and skeleton with fresh CATMAID IDs. Existing morphology, names, provenance,
 connectors, permissions, project visibility and stacks are retained. The importer
 does not merge incoming SWCs with existing skeletons or repair tracing setup.
 Source-fragment IDs already present in the project are rejected before loading;
-use the original state directory to resume an earlier import. Existing targets
+failed attempts must be inspected before starting another import. Existing targets
 finish with `status: "complete"`; new hidden projects finish with
 `status: "ready_for_publication"`.
 
@@ -246,7 +236,7 @@ Example files visible to the importer:
 /staging/
   request.json
   skeletons.zip
-  state/                 # created by preflight/plan; reuse for resume
+  state/                 # retained audit workspace for one import
     stack-geometry.json  # append metadata snapshot from preflight
 ```
 
@@ -321,7 +311,7 @@ The sample root becomes `(10000, 20000, 30000)` nm with radius `2000` nm.
 
 1. Make the target managed layer inactive in Neuroglass and stop other writes to
    that project. No CATMAID service shutdown is required.
-2. Run or resume the import. Every atomic batch uses bulk `COPY` with ordinary
+2. Run the import once. Every atomic batch uses bulk `COPY` with ordinary
    triggers bypassed only in the importer transaction, then explicitly creates
    and validates edges and summaries for that batch's new skeleton IDs. Existing
    skeletons and their derived data are not rematerialized or overwritten.
@@ -349,28 +339,10 @@ not promise browsing or editing availability for the target layer. Other project
 and the CATMAID service can remain available, although database load may slow
 requests. The importer does not automatically deactivate or reactivate a layer.
 
-A failed rebuild leaves committed skeleton batches intact. The saved cache plan
-preserves grid settings and coverage across interruptions; resume restarts the
-cache rebuild without importing those batches again. Keep the layer inactive on
-any failure or uncertain commit. If completed payload verification later fails,
-use `run --rebuild-cache` with the same state directory.
+A failed rebuild leaves committed skeleton batches intact and terminates the run.
+The saved cache plan and receipt are audit evidence. Keep the layer inactive after
+failure and inspect the database and retained files before deciding how to proceed.
 
-**There is one full rebuild after the last batch commits.** No cache rebuild runs
-between batches. "Full" means regenerating payloads across every configured grid's
-project coverage using both old and new data, while retaining grid definitions.
-For example, appending a few skeletons that affect 3 cells to a project with
-100,000 populated cells still rebuilds the full grid coverage once. That costs
-more than refreshing just those 3 cells. The previous live-import approach could
-refresh an overlapping cell again after each batch; that approach has been
-removed. The current tradeoff is one final full pass and a simpler offline
-consistency model, rather than a rebuild per batch.
-
-The database role must be able to use `session_replication_role=replica` for both
-new and existing targets. This also bypasses foreign-key triggers, so the importer
-explicitly validates ownership, classes, relations, parent membership and exact
-node values before committing. Bulk imports use their source manifest as the
-audit record; they do not reproduce ordinary per-node history, spatial events or
-per-SWC API import transaction metadata.
 
 ## Source fragment identifiers
 
@@ -398,9 +370,9 @@ CATMAID's normal behavior and are not the source of truth for these values.
 For an existing target, `run` rejects incoming fragment IDs that already have a
 `source-fragment:` annotation in that project, before loading any batch. It does
 not automatically skip, overwrite or merge them. This also applies to provenance
-retained after a merge or split. To resume the same import, reuse its state
-directory: the importer recognizes its own committed annotation IDs. For a new
-import, exclude already-imported fragments; folder names do not provide a dataset
+retained after a merge or split. Every run uses fresh IDs and rejects all existing
+fragment collisions. For a new import, exclude already-imported fragments;
+folder names do not provide a dataset
 namespace, so different datasets with overlapping IDs require distinct source
 identifiers before ingestion.
 
@@ -471,9 +443,9 @@ and neuron, and use `project-context.json` for the target project.
 The mapping is streamed, gzip-compressed, atomically written and registered
 with its row count and SHA-256 in `state.json` before the batch transaction.
 Only a batch with status `committed` confirms that its mapped nodes were loaded;
-`prepared` or `retryable` mappings describe reserved IDs. Resume checks saved
-mappings against those same source rows and reserved IDs. Final verification
-requires these saved mappings and checks them against the exact database rows.
+`prepared` or `failed` mappings describe reserved IDs whose commit is not confirmed.
+Final verification requires these saved mappings and checks them against the source
+rows, reserved IDs and exact database rows.
 Retain the state directory on durable storage after the import if a review
 queue will need these mappings. They add no per-node CATMAID labels or new
 database table. They record import-time identity: merges and splits retain node
@@ -540,27 +512,27 @@ SKELETON_INGESTION_WORKSPACE=/staging \
 ```
 
 The existing absolute workspace must contain `request.json`; the wrapper creates
-or resumes its `state` directory. `plan` needs no database for either mode and
+its `state` directory for one attempt. `plan` needs no database for either mode and
 uses environment/default import settings without loading Django settings.
 Append `preflight` and every `run` require
 `DB_HOST`, `DB_NAME`, `DB_USER` and `DB_PASS`, with optional `DB_PORT` (default
 5432), and use `mysite.ingestion_settings` without starting the web server or
-applying migrations. `CATMAID_INGESTION_DB_WAIT_SECONDS` controls the bounded
-readiness wait (default 120 seconds, maximum 3600); the wrapper does not retry
-failed ingestion automatically.
+applying migrations. Readiness uses one `pg_isready` check; a failed check
+immediately terminates the attempt. No readiness polling or ingestion retries
+are performed.
 
 Apply CATMAID migration `0126_fix_single_node_selective_summary` through the
 normal deployment migration process before running this importer. It fixes
 selective summary rebuilding for single-node skeletons. The runtime database preflight rejects
 unapplied migrations. Finish active imports before upgrading the database:
-their saved migration/database fingerprint is immutable across retries.
+their saved migration/database fingerprint must match at run time.
 
 `CATMAID_PROJECTS_DIRECTORY` defaults to `/home/django/projects`, and
 `CATMAID_INGESTION_MEDIA_ROOT` defaults to
-`/tmp/catmaid-skeleton-ingestion-media`. Each `run` clears the previous wrapper
-failure marker before checking readiness or starting the child. A failed child
-records a fresh result in `state/run-wrapper-result.json`; a successful retry
-leaves that failure marker absent and reports success through `result.json`.
+`/tmp/catmaid-skeleton-ingestion-media`. A failed readiness check or child records a terminal
+result in `state/run-wrapper-result.json`. The wrapper refuses to start
+another child in a workspace with that marker. Success is reported through
+`result.json`.
 Input downloads, workflow submission,
 publication and failure cleanup remain the caller's responsibility.
 
@@ -594,39 +566,39 @@ configurable for explicit multi-level overrides.
 Planning resolves import settings from the environment and defaults, without
 loading Django settings, and snapshots all result-affecting settings. Supply
 planning overrides as the environment variables above. Existing plans retain their
-recorded LOD count when resumed or rebuilt. Database timeouts are resolved
-again for each `run` and recorded with its metrics.
+recorded LOD count for their single run. Database timeouts are resolved
+when `run` starts and recorded with its metrics.
 
-## Failure and resume contract
+## Single-use failure contract
 
-Each skeleton stays inside one database batch. Core rows, the `model_of`
-relationship, fragment annotations and links, edges, summaries, and validation
-commit or roll back together. Both target modes use direct batch materialization.
-A confirmed rollback is safe to retry with `run`, and
-earlier committed batches remain untouched.
+Each skeleton stays inside one atomic database batch. Core rows, model links,
+fragment provenance, edges, summaries and validation commit together. Both target
+modes use the same direct materialization path.
 
-The state is durably marked immediately before each COMMIT attempt. If the
-process cannot prove the outcome, the ingestion becomes `operator_attention`.
-Normal `run` calls then refuse every CATMAID mutation until an operator resolves
-the uncertainty. The importer does not guess, automatically reconcile, or
-automatically delete the project.
+The importer stops on the first failure and records a terminal failed attempt.
+Previously committed batches remain in CATMAID. A failure during COMMIT can leave
+the current batch's database outcome unconfirmed; retained IDs and node maps
+identify the rows to inspect. The importer does not retry, resume, reconcile or
+delete data automatically. A hard-killed run also cannot be started again from
+the same workspace.
 
-A newly created project remains hidden after successful verification.
-Publication is a separate caller/operator responsibility. Existing targets
-retain their original visibility and permissions. Keep their Neuroglass managed
-layer inactive until the import completes; the importer does not enforce access
-restrictions on other CATMAID clients.
+Planning publishes `state.json` once, after the plan, source snapshots and any
+append stack snapshot have been written and verified. Failed initialization
+publishes no executable state.
+
+A new project stays hidden after successful verification; publication remains
+an operator action. Existing permissions and visibility remain unchanged. Keep
+the managed layer inactive until final success. After failure, inspect the
+database and retained evidence before manually choosing cleanup or a new import.
 
 ## State and progress
 
-The directory supplied through `--state-dir` holds the recovery checkpoints and
-audit artifacts for one import. Reuse it when running or resuming that import,
-and keep it on persistent storage across deployment job or pod restarts.
-`state.py` locks the directory against concurrent importer writers and atomically
-replaces checkpoints so readers do not see partially written JSON. It tracks the
-input and artifact hashes, saved settings, ID reservations, project and batch
-statuses, and maintenance/cache/verification phases. The orchestrator uses this
-state to skip committed work, reuse reservations and block uncertain commits.
+The directory supplied through `--state-dir` contains inputs, saved IDs,
+source snapshots, maps, manifests and progress for one import. Keep it on durable
+storage for diagnosis and later review-queue mapping. `state.py` uses a writer
+lock and atomically replaces JSON so readers see complete records. The run marker
+moves once from pending to running and then complete or failed; an interrupted
+running attempt cannot be resumed.
 
 Database maintenance runs after every batch has committed and before cache rebuilding.
 It executes PostgreSQL `ANALYZE` on `class_instance`,
@@ -634,17 +606,16 @@ It executes PostgreSQL `ANALYZE` on `class_instance`,
 `catmaid_skeleton_summary`. This refreshes query-planner statistics after the
 bulk load so subsequent queries can choose appropriate execution plans. It
 does not alter skeletons, rebuild indexes or run `VACUUM`. The phase is
-checkpointed, so a completed maintenance phase is skipped on retry.
+recorded in the audit state and runs once per import.
 
 | File in the state directory | Purpose |
 | --- | --- |
-| `state.json` | Authoritative recovery checkpoints and phase/batch statuses. |
-| `metrics.json` | Planned/completed batch, skeleton and node counts; operation durations, per-operation row counts and run settings history. |
+| `state.json` | Run outcome and confirmed phase/batch statuses. |
+| `metrics.json` | Planned/completed batch, skeleton and node counts; operation durations, per-operation row counts and the run's effective settings. |
 | `result.json` | Outcome of the most recent CLI command; failures contain a bounded summary and optional diagnostic-file reference. |
 | `error-details.json` | Full diagnostics of the latest failed CLI command, including all invalid SWC members; never sent through the terminal callback. |
 
-Metrics are observational: completed counts are reconciled with committed state
-on resume and after each batch. Loading progress advances after a batch commits.
+Metrics are observational: completed counts reflect confirmed committed batches. Loading progress advances after a batch commits.
 Cache rebuilding has a running phase in `state.json` and optional live cell
 counters in `cache-progress.json` (see measured cache progress below).
 The orchestrator measures operation durations with its monotonic clock and
@@ -656,7 +627,7 @@ verification is still running.
 
 There is no client-facing HTTP progress endpoint. A backend can read these files
 from shared storage and expose a status summary to a polling client. Combine the
-checkpoints and counts with deployment job/process status to detect a stopped
+state and counts with deployment job/process status to detect a stopped
 importer; the files are not a heartbeat. Reactivate the managed layer only after
 the import's successful final status, not merely when node counts reach 100%.
 
@@ -667,9 +638,8 @@ the import's successful final status, not merely when node counts reach 100%.
 | `0` | Command completed successfully |
 | `1` | Unexpected internal failure |
 | `2` | Invalid request, archive, setting, or deployment precondition |
-| `3` | Definite failure that is safe to retry with `run` |
+| `3` | Operational failure or interruption; terminal for this attempt |
 | `4` | Immutable request/archive/plan/database target mismatch |
-| `5` | Uncertain outcome requiring operator attention |
 | `6` | Final read-only verification failed |
 
 The command writes one versioned JSON result to stdout and progress diagnostics
@@ -695,7 +665,7 @@ python manage.py test \
 ```
 
 The opt-in PostgreSQL tests create hidden projects, inject failures, verify exact
-edge geometry and summary parity, and resume committed batches. Use only a
+edge geometry and summary parity, and ensure failed workspaces cannot restart. Use only a
 disposable, migrated CATMAID/PostGIS database; the tests leave their hidden
 projects for inspection. Name that database and pin its PostgreSQL cluster
 identity explicitly before enabling either database test module:
@@ -729,8 +699,8 @@ are deleted or rebuilt.
 
 Core rows, edges, CATMAID's selective summary refresh, and validation remain
 inside one atomic transaction. Current-format state files keep their immutable
-settings and recorded IDs. Committed batches are skipped on resume, while
-uncertain commit outcomes continue to block further writes.
+settings and recorded IDs for inspection. Every batch executes once; a failure
+terminates the attempt while preserving earlier confirmed commits.
 
 Metrics record `edge_staging`, `edge_creation`, and `summary_refresh` within the
 existing `materialization` aggregate, plus the executing importer version for
@@ -764,13 +734,10 @@ compact terminal result, not node mapping rows. Future microtask creation is
 deferred. The exit reporter reads the retained evidence and publishes bounded
 errors/results through Kafka; maps never travel through that callback.
 
-MNP provides **no automatic recovery after processing-pod loss** and never
-reimports a partial project. Retained files support inspection, not automatic
-replacement-pod resume. Standalone filesystem-state resume and uncertain-commit
-safeguards remain available when the complete local workspace is retained.
-Losing that workspace is not permission to start another import into the same
-project. Successful reporting may remove the source ZIP, so a standalone rerun
-must first restore the exact checksum-matching source archive.
+MNP and the standalone importer perform one attempt. Retained files support
+inspection and review-queue mapping; they are not automatic recovery inputs.
+Processing-pod loss or an importer failure leaves the layer inactive and requires
+operator inspection before another import is started.
 
 
 ## Measured cache progress
@@ -781,12 +748,10 @@ cell ranges across all configured grids. Completed increments only after a cell
 refresh succeeds, including empty cells that intentionally leave no stored row.
 Before a cache attempt starts, the orchestrator resets the observation to 0/0,
 including before potentially slow coverage planning. Once coverage is known,
-rebuilding publishes 0/total and then successful cell counts. A completed
-import that only verifies retains its counters. No configured coverage reports 0/0.
+rebuilding publishes 0/total and then successful cell counts. No configured coverage reports 0/0.
 
 This bounded observational file is replaced atomically at most once per second,
 plus the initial and final updates. A progress-file IO failure is nonfatal.
-The file is not registered as an immutable artifact or used to skip work on
-resume. Cache receipts, state transitions and final verification still decide
+The file is observational and is not registered as an immutable artifact. Cache receipts, state transitions and final verification still decide
 completion. MNP translates these observations and confirmed batch states into
 native Argo progress; the importer has no Argo or NeuroGlass dependency.

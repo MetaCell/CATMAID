@@ -56,29 +56,9 @@ def test_argument_error_has_stable_versioned_json(capsys) -> None:
     assert result["error"]["category"] == "invalid_input"
 
 
-def test_rebuild_cache_flag_is_forwarded(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
-    observed: dict[str, object] = {}
-
-    def succeed(state_dir: Path, **kwargs: object) -> dict[str, object]:
-        observed["state_dir"] = state_dir
-        observed.update(kwargs)
-        return {"ok": True}
-
-    monkeypatch.setattr(orchestrator, "run_ingestion", succeed)
-    state_dir = tmp_path / "state"
-
-    exit_code = cli.execute(
-        ["run", "--state-dir", str(state_dir), "--rebuild-cache"]
-    )
-
-    assert exit_code == 0
-    assert observed == {
-        "state_dir": state_dir,
-        "rebuild_cache": True,
-    }
-    assert json.loads(capsys.readouterr().out) == {"ok": True}
+def test_cache_recovery_flag_is_rejected(capsys):
+    assert cli.execute(["run", "--state-dir", "/unused", "--rebuild-cache"]) == 2
+    assert json.loads(capsys.readouterr().out)["error"]["category"] == "invalid_input"
 
 
 def test_preflight_is_forwarded(tmp_path, monkeypatch, capsys):

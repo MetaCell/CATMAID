@@ -24,9 +24,8 @@ _METRICS_STATUSES = {
     "in_progress",
     "complete",
     "failed",
-    "operator_attention",
 }
-_PHASE_STATUSES = {"complete", "failed", "retryable", "operator_attention"}
+_PHASE_STATUSES = {"complete", "failed"}
 
 
 def _count(value: object, label: str) -> int:
@@ -247,33 +246,6 @@ class MetricsStore:
         atomic_write_json(self.path, metrics)
         return copy.deepcopy(metrics)
 
-    def reconcile_progress(
-        self,
-        *,
-        completed_batches: int,
-        completed_nodes: int,
-        completed_skeletons: int,
-    ) -> dict[str, Any]:
-        """Replace observational progress with authoritative committed state."""
-
-        metrics = self.load()
-        updates = {
-            "batches": completed_batches,
-            "nodes": completed_nodes,
-            "skeletons": completed_skeletons,
-        }
-        for name, raw in updates.items():
-            value = _count(raw, f"completed {name}")
-            planned = metrics["counts"][name]["planned"]
-            if value > planned:
-                raise ImmutableStateError(
-                    f"Completed {name} count cannot exceed the planned count"
-                )
-            metrics["counts"][name]["completed"] = value
-        if metrics["status"] == "pending":
-            metrics["status"] = "in_progress"
-        atomic_write_json(self.path, metrics)
-        return copy.deepcopy(metrics)
 
     def record_phase(
         self,
@@ -309,7 +281,7 @@ class MetricsStore:
         metrics["phases"].append(record)
         if metrics["status"] == "pending":
             metrics["status"] = "in_progress"
-        if status in ("failed", "operator_attention"):
+        if status == "failed":
             metrics["status"] = status
         atomic_write_json(self.path, metrics)
         return copy.deepcopy(record)

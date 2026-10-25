@@ -39,7 +39,8 @@ def test_plan_retains_exact_validated_nodes_in_two_bounded_batches(tmp_path, mon
                 for member in plan.members:
                     assert source.load(member) == expected
     original = (state / "state.json").read_bytes()
-    plan_ingestion(request, state)
+    with pytest.raises(InvalidInputError, match="already contains"):
+        plan_ingestion(request, state)
     assert (state / "state.json").read_bytes() == original
 
 

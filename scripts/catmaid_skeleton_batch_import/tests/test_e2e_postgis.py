@@ -8,6 +8,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+from catmaid_skeleton_batch_import.errors import InvalidInputError
 
 
 pytestmark = [
@@ -26,7 +27,6 @@ pytestmark = [
 def test_append_preflight_reads_translated_oriented_stack_bounds_from_postgres(
     tmp_path, isolated_database, orientation, maximum,
 ):
-    from catmaid_skeleton_batch_import.errors import InvalidInputError
     from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, preflight_ingestion, run_ingestion
 
     seed = tmp_path / "seed"
@@ -78,7 +78,6 @@ def test_negative_append_coordinates_are_planned_loaded_verified_and_cached(
     tmp_path, isolated_database, coordinate_unit, orientation, maximum,
 ):
     import msgpack
-    from catmaid_skeleton_batch_import.errors import InvalidInputError
     from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, preflight_ingestion, run_ingestion
 
     seed = tmp_path / "seed"
@@ -158,18 +157,20 @@ def test_negative_append_coordinates_are_planned_loaded_verified_and_cached(
                       if bucket is not None
                       for node in msgpack.unpackb(bytes(bucket), strict_map_key=False)[0]}
         assert root_id in cached_ids
-    assert run_ingestion(state_dir) == result
+    with pytest.raises(InvalidInputError, match="terminal"):
+        run_ingestion(state_dir)
 
 
 @pytest.mark.parametrize("coordinate_unit", ["nm", "um"])
 @pytest.mark.parametrize("existing_project", [False, True])
-def test_single_node_import_rolls_back_resumes_and_is_cached(
-    tmp_path, monkeypatch, isolated_database, coordinate_unit, existing_project,
+@pytest.mark.parametrize("fail_singleton", [False, True])
+def test_single_node_import_is_atomic_and_cached(
+    tmp_path, monkeypatch, isolated_database, coordinate_unit, existing_project, fail_singleton,
 ):
     import msgpack
     from catmaid_skeleton_batch_import import materialization
     from catmaid_skeleton_batch_import.artifacts import read_manifest
-    from catmaid_skeleton_batch_import.errors import RetryableError
+    from catmaid_skeleton_batch_import.errors import OperationalFailureError
     from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, preflight_ingestion, run_ingestion
     from catmaid_skeleton_batch_import.state import StateStore
 
@@ -203,31 +204,31 @@ def test_single_node_import_rolls_back_resumes_and_is_cached(
     point = ("73 1 1.25 2.5 3.75 0.5 -1 # point soma\n" if coordinate_unit == "um"
              else "73 1 1250 2500 3750 500 -1 # point soma\n")
     state_dir = workspace("import", {"alpha.swc": ordinary, "point.swc": point}, seed_id)
-    original = materialization.materialize_and_verify_batch
-
-    def fail_after_singleton_materialization(**kwargs):
-        result = original(**kwargs)
-        if kwargs["skeletons"][0]["node_count"] == 1:
-            raise RetryableError("injected failure after singleton summary creation")
-        return result
-
-    monkeypatch.setattr(materialization, "materialize_and_verify_batch",
-                        fail_after_singleton_materialization)
-    with pytest.raises(RetryableError, match="singleton summary"):
-        run_ingestion(state_dir)
+    if fail_singleton:
+        original = materialization.materialize_and_verify_batch
+        def fail_after_singleton_materialization(**kwargs):
+            result = original(**kwargs)
+            if kwargs["skeletons"][0]["node_count"] == 1:
+                raise OperationalFailureError("injected failure after singleton summary creation")
+            return result
+        monkeypatch.setattr(materialization, "materialize_and_verify_batch", fail_after_singleton_materialization)
+        with pytest.raises(OperationalFailureError, match="singleton summary"):
+            run_ingestion(state_dir)
+        state = StateStore(state_dir).load()
+        assert state["status"] == "failed"
+        assert [batch["status"] for batch in state["batches"]] == ["committed", "failed"]
+        with isolated_database.cursor() as cursor:
+            cursor.execute("SELECT count(*) FROM class_instance WHERE project_id=%s AND name=%s",
+                           [state["project"]["project_id"], "source-fragment:point"])
+            assert cursor.fetchone()[0] == 0
+        with pytest.raises(InvalidInputError, match="terminal"):
+            run_ingestion(state_dir)
+        return
+    result = run_ingestion(state_dir)
     state = StateStore(state_dir).load()
-    assert [batch["status"] for batch in state["batches"]] == ["committed", "retryable"]
+    project_id = state["project"]["project_id"]
     maps_before = [batch["artifacts"]["node_map"] for batch in state["batches"]]
     assert [item["count"] for item in maps_before] == [2, 1]
-    assert all((state_dir / item["path"]).is_file() for item in maps_before)
-    project_id = state["project"]["project_id"]
-    with isolated_database.cursor() as cursor:
-        cursor.execute("SELECT count(*) FROM class_instance WHERE project_id=%s AND name=%s",
-                       [project_id, "source-fragment:point"])
-        assert cursor.fetchone()[0] == 0
-    monkeypatch.setattr(materialization, "materialize_and_verify_batch", original)
-    result = run_ingestion(state_dir)
-    assert [batch["artifacts"]["node_map"] for batch in StateStore(state_dir).load()["batches"]] == maps_before
     assert result["status"] == ("complete" if existing_project else "ready_for_publication")
     assert result["skeletons"] == 2
     assert result["nodes"] == 3
@@ -258,14 +259,15 @@ def test_single_node_import_rolls_back_resumes_and_is_cached(
                       if bucket is not None
                       for row in msgpack.unpackb(bytes(bucket), strict_map_key=False)[0]}
         assert node_id in cached_ids
-    assert run_ingestion(state_dir) == result
+    with pytest.raises(InvalidInputError, match="terminal"):
+        run_ingestion(state_dir)
 
 
-def test_known_rollback_preserves_prior_batch_and_resumes(
+def test_known_rollback_preserves_prior_batch_and_is_terminal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_database,
 ) -> None:
     from catmaid_skeleton_batch_import import materialization
-    from catmaid_skeleton_batch_import.errors import RetryableError
+    from catmaid_skeleton_batch_import.errors import OperationalFailureError
     from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, run_ingestion
     from catmaid_skeleton_batch_import.state import StateStore
 
@@ -307,19 +309,19 @@ def test_known_rollback_preserves_prior_batch_and_resumes(
         nonlocal calls
         calls += 1
         if calls == 2:
-            raise RetryableError("injected materialization failure")
+            raise OperationalFailureError("injected materialization failure")
         return original(**kwargs)
 
     monkeypatch.setattr(
         materialization, "materialize_and_verify_batch", fail_second_batch
     )
-    with pytest.raises(RetryableError, match="injected materialization failure"):
+    with pytest.raises(OperationalFailureError, match="injected materialization failure"):
         run_ingestion(state_dir)
 
     state = StateStore(state_dir).load()
     assert [batch["status"] for batch in state["batches"]] == [
         "committed",
-        "retryable",
+        "failed",
     ]
     maps_before = [batch["artifacts"]["node_map"] for batch in state["batches"]]
     saved_rows = []
@@ -331,22 +333,14 @@ def test_known_rollback_preserves_prior_batch_and_resumes(
                        [[int(row["treenode_id"]) for row in saved_rows[1]]])
         assert cursor.fetchall() == []  # A saved mapping alone does not mean COMMIT.
 
-    monkeypatch.setattr(materialization, "materialize_and_verify_batch", original)
-    result = run_ingestion(state_dir)
-    assert result["status"] == "ready_for_publication"
-    assert result["nodes"] == 6
-    assert result["skeletons"] == 2
-    assert [batch["status"] for batch in StateStore(state_dir).load()["batches"]] == [
-        "committed",
-        "committed",
-    ]
-    assert [batch["artifacts"]["node_map"] for batch in StateStore(state_dir).load()["batches"]] == maps_before
+    with pytest.raises(InvalidInputError, match="terminal"):
+        run_ingestion(state_dir)
+    assert calls == 2
+    assert StateStore(state_dir).load()["status"] == "failed"
     with isolated_database.cursor() as cursor:
-        for rows in saved_rows:
-            cursor.execute("SELECT id, parent_id FROM treenode WHERE id=ANY(%s::bigint[]) ORDER BY id",
-                           [[int(row["treenode_id"]) for row in rows]])
-            ids = [int(row["treenode_id"]) for row in rows]
-            assert cursor.fetchall() == [(ids[0], None), (ids[1], ids[0]), (ids[2], ids[1])]
+        ids = [int(row["treenode_id"]) for row in saved_rows[0]]
+        cursor.execute("SELECT id, parent_id FROM treenode WHERE id=ANY(%s::bigint[]) ORDER BY id", [ids])
+        assert cursor.fetchall() == [(ids[0], None), (ids[1], ids[0]), (ids[2], ids[1])]
 
 
 def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_caches(
@@ -460,15 +454,16 @@ def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_c
             FROM node_grid_cache_cell WHERE grid_id=%s AND x_index=0 AND y_index=0 AND z_index=0
         """, [grid_id])
         assert cursor.fetchone() == (2, 2, 2)
-    assert run_ingestion(append_state) == result
+    with pytest.raises(InvalidInputError, match="terminal"):
+        run_ingestion(append_state)
     assert cache_cells() == cells_after  # Verification does not regenerate payloads.
     assert snapshot() == after
-    assert run_ingestion(append_state, rebuild_cache=True) == result
+    with pytest.raises(InvalidInputError, match="terminal"):
+        run_ingestion(append_state)
     assert snapshot() == after
 
     # A fresh workspace must not duplicate an earlier import's source IDs.
     collision = request(tmp_path / "collision", "new-fragment", pid)
-    from catmaid_skeleton_batch_import.errors import InvalidInputError
     with pytest.raises(InvalidInputError, match="already exist"):
         run_ingestion(collision)
     assert snapshot() == after

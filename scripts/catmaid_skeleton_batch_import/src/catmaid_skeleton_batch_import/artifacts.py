@@ -33,7 +33,7 @@ def write_node_map(path: Path, source: TextIO) -> None:
         with atomic_output_path(path) as temporary:
             with temporary.open("wb") as output:
                 # No filename or wall-clock timestamp in the gzip header, so
-                # retries with the same reservations produce identical bytes.
+                # the retained mapping has deterministic bytes.
                 with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
                     while chunk := source.read(64 * 1024):
                         compressed.write(chunk.encode("utf-8"))

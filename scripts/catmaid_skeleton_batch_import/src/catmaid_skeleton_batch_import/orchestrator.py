@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import sys
 import time
 from contextlib import ExitStack
@@ -15,6 +14,7 @@ from typing import Any, Callable, Mapping, Sequence
 from . import __version__
 from .archive import ArchiveScan, scan_archive
 from .artifacts import (
+    artifact_descriptor,
     combine_manifests,
     manifest_rows,
     read_id_artifact,
@@ -35,8 +35,7 @@ from .errors import (
     ImporterError,
     ImmutableStateError,
     InvalidInputError,
-    OperatorAttentionError,
-    RetryableError,
+    OperationalFailureError,
     VerificationError,
 )
 from .loader import PreparedBatch, ProjectContext, execute_batch_transaction, prepare_copy_rows
@@ -45,7 +44,7 @@ from .planner import ImportPlan, plan_archive, read_plan, write_plan
 from .source_snapshot import SourceSnapshotReader, SourceSnapshotWriter
 from .state import ArchiveMetadata, StateStore
 from .stack_bounds import geometry_bounds, read_project_stack_geometry
-from .util import atomic_write_json, canonical_json_bytes, load_json, sha256_file
+from .util import atomic_write_json, load_json, sha256_file
 
 
 PLAN_FILENAME = "plan.jsonl.gz"
@@ -100,33 +99,18 @@ def _plan_result(store: StateStore, state: Mapping[str, Any]) -> dict[str, objec
     )
 
 
-def _same_normalized_request(request: IngestionRequest, store: StateStore) -> bool:
-    return canonical_json_bytes(request.to_dict()) == canonical_json_bytes(
-        load_json(store.request_path)
-    )
-
-
 def preflight_ingestion(request_path: Path, state_dir: Path) -> dict[str, object]:
-    """Capture append stack metadata without reading SWCs or modifying CATMAID."""
+    """Capture append metadata before planning, without modifying CATMAID."""
     store = StateStore(state_dir)
     with store.lock():
+        if store.state_path.exists():
+            raise InvalidInputError("Preflight must run before planning in a new state directory")
         request = load_request(request_path)
-        state = store.verify_immutable() if store.state_path.exists() else None
-        if state is not None and not _same_normalized_request(request, store):
-            raise ImmutableStateError(
-                "Existing state directory contains a different normalized request"
-            )
         geometry = _append_geometry(request)
         if geometry is not None:
-            if state is not None and "stack_geometry" in state.get("artifacts", {}):
-                _check_saved_geometry(store, state, geometry)
-            else:
-                # Planning later hashes this snapshot. Once registered, preflight
-                # must never refresh it underneath an existing executable plan.
-                atomic_write_json(store.state_dir / STACK_GEOMETRY_FILENAME, geometry)
+            atomic_write_json(store.state_dir / STACK_GEOMETRY_FILENAME, geometry)
         return _write_result(store.state_dir, _success_result(
-            "preflight", store.state_dir,
-            required=geometry is not None,
+            "preflight", store.state_dir, required=geometry is not None,
             project_id=request.target_project_id,
             stack_count=len(geometry["stacks"]) if geometry is not None else 0,
         ))
@@ -160,87 +144,48 @@ def _planning_geometry(request: IngestionRequest, store: StateStore) -> dict[str
 def plan_ingestion(request_path: Path, state_dir: Path) -> dict[str, object]:
     store = StateStore(state_dir)
     with store.lock():
+        if store.state_path.exists() or (store.state_dir / PLAN_FILENAME).exists():
+            raise InvalidInputError("This workspace already contains a planning attempt; use a new state directory")
         request = load_request(request_path)
-        # Deployment limits are explicit environment values/defaults here.
-        # Even an inherited DJANGO_SETTINGS_MODULE must not initialize Django.
         settings = load_settings(use_django=False)
         geometry = _planning_geometry(request, store)
         bounds = geometry_bounds(geometry) if geometry is not None else None
-
-        if store.state_path.exists():
-            state = store.verify_immutable()
-            if not _same_normalized_request(request, store):
-                raise ImmutableStateError(
-                    "Existing state directory contains a different normalized request"
-                )
-            if state["settings"] != settings.plan_dict():
-                raise ImmutableStateError(
-                    "Existing state directory was planned with different deployment settings"
-                )
-            if "plan" in state.get("artifacts", {}):
-                store.verify_artifact("plan")
-                _check_saved_geometry(store, state, geometry)
-                result = _plan_result(store, state)
-                return _write_result(store.state_dir, result)
-
         _progress(f"Scanning and validating local archive {request.archive_path}")
-        planning_started = time.monotonic()
+        started = time.monotonic()
         with tempfile.TemporaryDirectory(prefix=".source-snapshot-", dir=store.state_dir) as staging:
             writer = SourceSnapshotWriter(Path(staging), settings.max_nodes_per_batch)
             try:
                 scan = scan_archive(request, settings, bounds_nm=bounds, on_member=writer.add)
             finally:
                 writer.close()
-            plan = plan_archive(scan, settings)
-            plan = replace(plan, source_snapshots=tuple(writer.descriptors))
+            plan = replace(plan_archive(scan, settings), source_snapshots=tuple(writer.descriptors))
             for descriptor in plan.source_snapshots:
                 os.replace(Path(staging) / descriptor["path"], store.state_dir / descriptor["path"])
-        plan_path = store.state_dir / PLAN_FILENAME
-        plan_digest = write_plan(plan_path, plan)
-        planning_duration = time.monotonic() - planning_started
-
-        state = store.initialize_plan(
-            request,
-            _archive_metadata(scan),
-            settings.plan_dict(),
-            plan.batches,
-            plan_digest=plan_digest,
-            planner_version=plan.schema_version,
-        )
-        store.register_artifact(
-            "plan",
-            PLAN_FILENAME,
-            count=plan.member_count,
-            compression="gzip",
-            expected_sha256=plan_digest,
-        )
-        for batch, descriptor in zip(plan.batches, plan.source_snapshots):
-            store.register_artifact("source_snapshot", descriptor["path"], count=batch.node_count,
-                                    batch_index=batch.index, expected_sha256=descriptor["sha256"])
+        plan_digest = write_plan(store.state_dir / PLAN_FILENAME, plan)
+        artifacts = {"plan": artifact_descriptor(
+            store.state_dir, store.state_dir / PLAN_FILENAME, count=plan.member_count)}
+        batch_artifacts = {
+            batch.index: {"source_snapshot": artifact_descriptor(
+                store.state_dir, store.state_dir / descriptor["path"], count=batch.node_count)}
+            for batch, descriptor in zip(plan.batches, plan.source_snapshots)
+        }
         if geometry is not None:
-            _write_registered_json(store, "stack_geometry", STACK_GEOMETRY_FILENAME, geometry)
+            artifacts["stack_geometry"] = artifact_descriptor(
+                store.state_dir, store.state_dir / STACK_GEOMETRY_FILENAME, count=len(geometry["stacks"]))
         metrics = MetricsStore(store.state_dir)
-        metrics.initialize(
-            planned_batches=plan.batch_count,
-            planned_nodes=plan.total_nodes,
-            planned_skeletons=plan.member_count,
+        metrics.initialize(planned_batches=plan.batch_count, planned_nodes=plan.total_nodes,
+                           planned_skeletons=plan.member_count)
+        metrics.record_phase("archive_scan_and_planning", duration_seconds=time.monotonic() - started,
+                             node_count=plan.total_nodes, row_counts={
+                                 "archive_bytes": scan.archive_bytes, "swc_members": plan.member_count,
+                                 "planned_batches": plan.batch_count})
+        # Publishing state is the final planning step: it references all required files.
+        state = store.initialize_plan(
+            request, _archive_metadata(scan), settings.plan_dict(), plan.batches,
+            plan_digest=plan_digest, planner_version=plan.schema_version,
+            artifacts=artifacts, batch_artifacts=batch_artifacts,
         )
-        if not metrics.load()["phases"]:
-            metrics.record_phase(
-                "archive_scan_and_planning",
-                duration_seconds=planning_duration,
-                node_count=plan.total_nodes,
-                row_counts={
-                    "archive_bytes": scan.archive_bytes,
-                    "swc_members": plan.member_count,
-                    "planned_batches": plan.batch_count,
-                },
-            )
-        state = store.load()
-        _progress(
-            f"Planned {plan.member_count} skeletons and {plan.total_nodes} nodes "
-            f"in {plan.batch_count} batches"
-        )
+        _progress(f"Planned {plan.member_count} skeletons and {plan.total_nodes} nodes in {plan.batch_count} batches")
         return _write_result(store.state_dir, _plan_result(store, state))
 
 
@@ -318,7 +263,7 @@ def _classified_runtime_error(
     *,
     context: str,
     preflight: bool = False,
-) -> InvalidInputError | RetryableError | None:
+) -> InvalidInputError | OperationalFailureError | None:
     """Map expected Django/database failures onto the public CLI contract."""
 
     if isinstance(exc, ModuleNotFoundError):
@@ -337,7 +282,7 @@ def _classified_runtime_error(
             f"Django is not configured for {context}: {exc}"
         )
     if isinstance(exc, (OperationalError, InterfaceError)):
-        return RetryableError(f"Database operation failed during {context}: {exc}")
+        return OperationalFailureError(f"Database operation failed during {context}: {exc}")
     if isinstance(exc, DatabaseError):
         cause = getattr(exc, "__cause__", None)
         sqlstate = getattr(cause, "pgcode", None) or getattr(
@@ -386,24 +331,7 @@ def _database_context(
         geometry = _load_registered_json(store, state, "stack_geometry")
         if geometry["database_target"] != current["target"]:
             raise ImmutableStateError("Configured CATMAID database differs from append planning")
-    persisted = state.get("artifacts", {}).get("database")
-    if persisted is None:
-        _write_registered_json(
-            store,
-            "database",
-            DATABASE_FILENAME,
-            current,
-        )
-    else:
-        expected = _load_registered_json(store, state, "database")
-        if expected != current:
-            raise ImmutableStateError(
-                "Configured CATMAID database target or compatibility fingerprint changed",
-                details={
-                    "expected_target": expected.get("target"),
-                    "actual_target": current.get("target"),
-                },
-            )
+    _write_registered_json(store, "database", DATABASE_FILENAME, current)
     return connection, current
 
 
@@ -421,7 +349,11 @@ def _append_geometry(request: IngestionRequest, connection: Any = None) -> dict[
         raise InvalidInputError(f"Could not read target stack geometry: {exc}") from exc
 
 
-def _check_saved_geometry(store: StateStore, state: Mapping[str, Any], geometry: Mapping[str, Any] | None) -> None:
+def _check_saved_geometry(
+    store: StateStore,
+    state: Mapping[str, Any],
+    geometry: Mapping[str, Any] | None,
+) -> None:
     if geometry is not None and _load_registered_json(store, state, "stack_geometry") != geometry:
         raise ImmutableStateError(
             "Target stack geometry or database identity changed since planning; use a new plan"
@@ -440,9 +372,6 @@ def _project_reservation(
     connection: Any,
     request: IngestionRequest,
 ) -> dict[str, Any]:
-    if "project_reservation" in state.get("artifacts", {}):
-        return _load_registered_json(store, state, "project_reservation")
-
     from .database import allocate_project_ids
 
     try:
@@ -479,106 +408,27 @@ def _ensure_project(
 ) -> ProjectContext:
     if request.target_project_id is not None:
         return _ensure_existing_project(store, request.target_project_id, metrics)
-    project_status = state["project"]["status"]
+    from .project import ProjectSetupError, create_hidden_project
     reservation = _project_reservation(store, state, connection, request)
-
-    if project_status == "planned":
-        store.mark_project_prepared(
-            int(reservation["project_id"]), int(reservation["stack_id"])
-        )
-        project_status = "prepared"
-    elif project_status == "retryable":
-        store.transition_project(
-            "prepared",
-            project_id=int(reservation["project_id"]),
-            stack_id=int(reservation["stack_id"]),
-        )
-        project_status = "prepared"
-
-    if project_status == "committed":
-        context = _load_registered_json(store, store.load(), "project_context")
-        return ProjectContext.from_dict(context)
-    if project_status != "prepared":
-        raise ImmutableStateError(f"Unsupported project state: {project_status}")
-
-    from .project import create_hidden_project
-
-    attempted = False
-    started = time.monotonic()
-
-    def before_commit() -> None:
-        nonlocal attempted
-        store.mark_project_commit_attempted()
-        attempted = True
-
+    store.mark_project_prepared(int(reservation["project_id"]), int(reservation["stack_id"]))
     _progress(f"Creating hidden CATMAID project {reservation['project_id']}")
+    started = time.monotonic()
     try:
         created = create_hidden_project(
-            project_id=int(reservation["project_id"]),
-            stack_id=int(reservation["stack_id"]),
-            project_stack_id=int(reservation["project_stack_id"]),
-            title=str(reservation["title"]),
-            dimension=request.dimension,
-            resolution_nm=request.resolution_nm,
+            project_id=int(reservation["project_id"]), stack_id=int(reservation["stack_id"]),
+            project_stack_id=int(reservation["project_stack_id"]), title=str(reservation["title"]),
+            dimension=request.dimension, resolution_nm=request.resolution_nm,
             cache_cell_size_nm=settings.cache_cell_size_nm,
-            comment=(
-                "Hidden skeleton batch import. "
-                f"Archive SHA-256: {state['archive']['sha256']}"
-            ),
-            before_commit=before_commit,
+            comment=f"Hidden skeleton batch import. Archive SHA-256: {state['archive']['sha256']}",
         )
-    except BaseException as exc:
-        duration = time.monotonic() - started
-        if attempted:
-            store.mark_operator_attention(
-                "Project/stack COMMIT outcome is uncertain",
-                entity="project",
-                details={"error": str(exc)},
-            )
-            metrics.record_phase(
-                "project_creation",
-                duration_seconds=duration,
-                status="operator_attention",
-                error=str(exc),
-            )
-            metrics.set_status("operator_attention")
-            raise OperatorAttentionError(
-                "Project/stack COMMIT outcome is uncertain"
-            ) from exc
-        store.mark_project_retryable(str(exc), confirmed_rollback=True)
-        metrics.record_phase(
-            "project_creation",
-            duration_seconds=duration,
-            status="retryable",
-            error=str(exc),
-        )
-        if isinstance(exc, (InvalidInputError, ImmutableStateError, RetryableError)):
-            raise
-        from .project import ProjectSetupError
-
-        if isinstance(exc, ProjectSetupError):
-            raise InvalidInputError(f"Project setup failed: {exc}") from exc
-        if isinstance(exc, KeyboardInterrupt):
-            raise RetryableError("Project creation was interrupted and rolled back") from exc
-        classified = _classified_runtime_error(exc, context="project creation")
-        if classified is not None:
-            raise classified from exc
-        raise
-
-    context_value = {"schema_version": 1, **created}
-    _write_registered_json(
-        store,
-        "project_context",
-        PROJECT_CONTEXT_FILENAME,
-        context_value,
-    )
+    except ProjectSetupError as exc:
+        raise InvalidInputError(f"Project setup failed: {exc}") from exc
+    _write_registered_json(store, "project_context", PROJECT_CONTEXT_FILENAME,
+                           {"schema_version": 1, **created})
     store.mark_project_committed()
-    metrics.record_phase(
-        "project_creation",
-        duration_seconds=time.monotonic() - started,
-        row_counts={"project": 1, "stack": 1, "project_stack": 1},
-    )
-    return ProjectContext.from_dict(context_value)
+    metrics.record_phase("project_creation", duration_seconds=time.monotonic() - started,
+                         row_counts={"project": 1, "stack": 1, "project_stack": 1})
+    return ProjectContext.from_dict(created)
 
 
 def _ensure_existing_project(
@@ -595,36 +445,23 @@ def _ensure_existing_project(
         if classified is not None:
             raise classified from exc
         raise
-    state = store.load()
     _write_registered_json(
         store, "project_context", PROJECT_CONTEXT_FILENAME,
         {"schema_version": 1, **context},
     )
     store.select_existing_project(project_id)
-    if state["project"]["status"] != "committed":
-        metrics.record_phase("existing_project_selection", duration_seconds=0.0)
+    metrics.record_phase("existing_project_selection", duration_seconds=0.0)
     return ProjectContext.from_dict(context)
 
 
 def _check_existing_fragment_conflicts(
-    store: StateStore, plan: ImportPlan, project: ProjectContext, connection: Any,
+    plan: ImportPlan,
+    project: ProjectContext,
+    connection: Any,
 ) -> None:
-    """Reject provenance collisions before loading any batch; allow our resume IDs."""
+    """Reject every existing provenance collision before loading any batch."""
     from .fragments import fragment_annotation_name
-
-    state = store.load()
     for batch in plan.batches:
-        batch_state = _batch_state(state, batch.index)
-        expected = {}
-        if batch_state["status"] == "committed":
-            ids = read_id_artifact(
-                store.state_dir, batch_state["artifacts"]["concept_ids"],
-                expected_count=batch.skeleton_count * 5,
-            )
-            expected = {
-                fragment_annotation_name(member.fragment_id): ids[i * 5 + 3]
-                for i, member in enumerate(batch.members)
-            }
         names = [fragment_annotation_name(member.fragment_id) for member in batch.members]
         with connection.cursor() as cursor:
             cursor.execute(
@@ -632,15 +469,11 @@ def _check_existing_fragment_conflicts(
                 "AND class_id = %s AND name = ANY(%s::text[])",
                 [project.project_id, project.annotation_class_id, names],
             )
-            conflicts = [
-                name for identifier, name in cursor.fetchall()
-                if expected.get(name) != int(identifier)
-            ]
+            conflicts = [name for _identifier, name in cursor.fetchall()]
         if conflicts:
             raise InvalidInputError(
                 f"Source fragment identifiers already exist in project {project.project_id}: "
-                + ", ".join(sorted(set(conflicts))[:10])
-            )
+                + ", ".join(sorted(set(conflicts))[:10]))
 
 
 def _batch_state(state: Mapping[str, Any], index: int) -> Mapping[str, Any]:
@@ -652,98 +485,22 @@ def _batch_state(state: Mapping[str, Any], index: int) -> Mapping[str, Any]:
 
 def _prepare_batch_artifacts(
     store: StateStore,
-    state: Mapping[str, Any],
     batch: PlannedBatch,
     connection: Any,
 ) -> tuple[list[int], list[int]]:
-    batch_dir = f"batches/{batch.index:06d}"
-    batch_state = _batch_state(state, batch.index)
-    artifacts = batch_state.get("artifacts", {})
-
-    if "concept_ids" in artifacts:
-        concept_ids = read_id_artifact(
-            store.state_dir,
-            artifacts["concept_ids"],
-            expected_count=batch.skeleton_count * 5,
-        )
-    else:
-        from .database import allocate_sequence_ids
-
-        try:
-            concept_ids = list(
-                allocate_sequence_ids(
-                    "concept_id_seq", batch.skeleton_count * 5, connection
-                )
-            )
-        except Exception as exc:
-            classified = _classified_runtime_error(
-                exc, context=f"batch {batch.index} concept ID reservation"
-            )
-            if classified is not None:
-                raise classified from exc
-            raise
-        concept_relative = f"{batch_dir}/concept_ids.txt.gz"
-        write_id_artifact(store.state_dir / concept_relative, concept_ids)
-        store.register_artifact(
-            "concept_ids",
-            concept_relative,
-            count=len(concept_ids),
-            min_id=min(concept_ids),
-            max_id=max(concept_ids),
-            compression="gzip",
-            batch_index=batch.index,
-        )
-
-    state = store.load()
-    batch_state = _batch_state(state, batch.index)
-    artifacts = batch_state.get("artifacts", {})
-    if "location_ids" in artifacts:
-        location_ids = read_id_artifact(
-            store.state_dir,
-            artifacts["location_ids"],
-            expected_count=batch.node_count,
-        )
-    else:
-        from .database import allocate_sequence_ids
-
-        try:
-            location_ids = list(
-                allocate_sequence_ids(
-                    "location_id_seq", batch.node_count, connection
-                )
-            )
-        except Exception as exc:
-            classified = _classified_runtime_error(
-                exc, context=f"batch {batch.index} location ID reservation"
-            )
-            if classified is not None:
-                raise classified from exc
-            raise
-        location_relative = f"{batch_dir}/location_ids.txt.gz"
-        write_id_artifact(store.state_dir / location_relative, location_ids)
-        store.register_artifact(
-            "location_ids",
-            location_relative,
-            count=len(location_ids),
-            min_id=min(location_ids),
-            max_id=max(location_ids),
-            compression="gzip",
-            batch_index=batch.index,
-        )
-
-    state = store.load()
-    batch_state = _batch_state(state, batch.index)
-    if "manifest" not in batch_state.get("artifacts", {}):
-        manifest_relative = f"{batch_dir}/manifest.csv.gz"
-        rows = manifest_rows(batch, concept_ids)
-        write_manifest(store.state_dir / manifest_relative, rows)
-        store.register_artifact(
-            "manifest",
-            manifest_relative,
-            count=len(rows),
-            compression="gzip",
-            batch_index=batch.index,
-        )
+    """Allocate once and retain the exact identities as audit evidence."""
+    from .database import allocate_sequence_ids
+    concept_ids = list(allocate_sequence_ids("concept_id_seq", batch.skeleton_count * 5, connection))
+    location_ids = list(allocate_sequence_ids("location_id_seq", batch.node_count, connection))
+    for name, values in (("concept_ids", concept_ids), ("location_ids", location_ids)):
+        path = f"batches/{batch.index:06d}/{name}.txt.gz"
+        write_id_artifact(store.state_dir / path, values)
+        store.register_artifact(name, path, count=len(values), min_id=min(values),
+                                max_id=max(values), compression="gzip", batch_index=batch.index)
+    path = f"batches/{batch.index:06d}/manifest.csv.gz"
+    rows = manifest_rows(batch, concept_ids)
+    write_manifest(store.state_dir / path, rows)
+    store.register_artifact("manifest", path, count=len(rows), compression="gzip", batch_index=batch.index)
     return concept_ids, location_ids
 
 
@@ -777,8 +534,7 @@ def _flush_loader_timings(
         )
 
 
-
-def _reconcile_completed_progress(
+def _record_completed_progress(
     metrics: MetricsStore,
     state: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -787,7 +543,7 @@ def _reconcile_completed_progress(
     committed = [
         batch for batch in state["batches"] if batch["status"] == "committed"
     ]
-    return metrics.reconcile_progress(
+    return metrics.update_progress(
         completed_batches=len(committed),
         completed_nodes=sum(int(batch["node_count"]) for batch in committed),
         completed_skeletons=sum(
@@ -806,20 +562,11 @@ def _verify_batch_node_map(store: StateStore, prepared: PreparedBatch) -> None:
     verify_node_map(path, prepared.node_map_file)
 
 
-def _ensure_batch_node_map(store: StateStore, prepared: PreparedBatch) -> None:
-    """Save reserved identities before COMMIT and check them on every retry."""
+def _save_batch_node_map(store: StateStore, prepared: PreparedBatch) -> None:
     batch = prepared.batch
-    state = store.load()
-    descriptor = _batch_state(state, batch.index)["artifacts"].get("node_map")
-    if descriptor is not None:
-        _verify_batch_node_map(store, prepared)
-        return
     relative = Path("batches") / f"{batch.index:06d}" / "node-map.csv.gz"
     write_node_map(store.state_dir / relative, prepared.node_map_file)
-    store.register_artifact(
-        "node_map", relative, count=batch.node_count, compression="gzip",
-        batch_index=batch.index,
-    )
+    store.register_artifact("node_map", relative, count=batch.node_count, compression="gzip", batch_index=batch.index)
 
 
 def _run_batch(
@@ -832,158 +579,40 @@ def _run_batch(
     archive: SourceSnapshotReader,
     metrics: MetricsStore,
 ) -> None:
-    state = store.load()
-    batch_status = str(_batch_state(state, batch.index)["status"])
-    if batch_status == "committed":
-        return
-    concept_ids, location_ids = _prepare_batch_artifacts(
-        store, state, batch, connection
-    )
-    if batch_status == "planned":
-        store.mark_batch_prepared(batch.index)
-    elif batch_status == "retryable":
-        store.transition_batch(batch.index, "prepared")
-    elif batch_status != "prepared":
-        raise ImmutableStateError(
-            f"Unsupported state for batch {batch.index}: {batch_status}"
-        )
-
-    _progress(
-        f"Preparing batch {batch.index}: {batch.skeleton_count} skeletons, "
-        f"{batch.node_count} nodes"
-    )
-    generation_started = time.monotonic()
-    try:
-        prepared_context = prepare_copy_rows(
-            batch,
-            request,
-            project,
-            concept_ids,
-            location_ids,
-            archive.load,
-        )
-    except BaseException as exc:
-        store.mark_batch_retryable(
-            batch.index, f"Row preparation failed: {exc}", confirmed_rollback=True
-        )
+    concept_ids, location_ids = _prepare_batch_artifacts(store, batch, connection)
+    store.mark_batch_prepared(batch.index)
+    _progress(f"Preparing batch {batch.index}: {batch.skeleton_count} skeletons, {batch.node_count} nodes")
+    started = time.monotonic()
+    with prepare_copy_rows(batch, request, project, concept_ids, location_ids, archive.load) as prepared:
         metrics.record_phase(
-            f"batch_{batch.index:06d}_row_generation",
-            duration_seconds=time.monotonic() - generation_started,
-            status="retryable",
-            batch_index=batch.index,
-            batch_node_count=batch.node_count,
-            batch_skeleton_count=batch.skeleton_count,
-            error=str(exc),
-        )
-        raise
-    metrics.record_phase(
-        f"batch_{batch.index:06d}_row_generation",
-        duration_seconds=time.monotonic() - generation_started,
-        batch_index=batch.index,
-        batch_node_count=batch.node_count,
-        batch_skeleton_count=batch.skeleton_count,
-        node_count=batch.node_count,
-        row_counts={
-            "class_instance_rows": batch.skeleton_count * 3,
-            "relationship_rows": batch.skeleton_count * 2,
-            "treenode_rows": batch.node_count,
-        },
-    )
-
-    attempted = False
-    transaction_started = time.monotonic()
-    loader_timings: list[tuple[str, float, dict[str, int]]] = []
-
-    def before_commit() -> None:
-        nonlocal attempted
-        store.mark_batch_commit_attempted(batch.index)
-        attempted = True
-
-    try:
-        with prepared_context as prepared:
-            _ensure_batch_node_map(store, prepared)
+            f"batch_{batch.index:06d}_row_generation", duration_seconds=time.monotonic() - started,
+            batch_index=batch.index, batch_node_count=batch.node_count,
+            batch_skeleton_count=batch.skeleton_count, node_count=batch.node_count)
+        _save_batch_node_map(store, prepared)
+        timings = []
+        started = time.monotonic()
+        try:
             counts = execute_batch_transaction(
-                prepared,
-                project,
-                settings,
-                before_commit,
-                _buffer_loader_timing(loader_timings),
-            )
-    except BaseException as exc:
-        duration = time.monotonic() - transaction_started
-        if attempted:
-            store.mark_operator_attention(
-                f"Batch {batch.index} COMMIT outcome is uncertain",
-                entity="batch",
-                batch_index=batch.index,
-                details={"error": str(exc)},
-            )
-            _flush_loader_timings(metrics, batch.index, loader_timings)
+                prepared, project, settings, _buffer_loader_timing(timings))
+        except BaseException as exc:
+            _flush_loader_timings(metrics, batch.index, timings)
             metrics.record_phase(
-                f"batch_{batch.index:06d}_transaction",
-                duration_seconds=duration,
-                status="operator_attention",
-                batch_index=batch.index,
-                batch_node_count=batch.node_count,
-                batch_skeleton_count=batch.skeleton_count,
-                error=str(exc),
-            )
-            metrics.set_status("operator_attention")
-            raise OperatorAttentionError(
-                f"Batch {batch.index} COMMIT outcome is uncertain"
-            ) from exc
-        store.mark_batch_retryable(
-            batch.index, str(exc), confirmed_rollback=True
-        )
-        _flush_loader_timings(metrics, batch.index, loader_timings)
-        metrics.record_phase(
-            f"batch_{batch.index:06d}_transaction",
-            duration_seconds=duration,
-            status="retryable",
-            batch_index=batch.index,
-            batch_node_count=batch.node_count,
-            batch_skeleton_count=batch.skeleton_count,
-            error=str(exc),
-        )
-        if isinstance(exc, VerificationError):
-            raise RetryableError(
-                f"Batch {batch.index} validation failed and rolled back: {exc}",
-                details=exc.details,
-            ) from exc
-        if isinstance(exc, (ImmutableStateError, InvalidInputError)):
+                f"batch_{batch.index:06d}_transaction", duration_seconds=time.monotonic() - started,
+                status="failed", batch_index=batch.index, batch_node_count=batch.node_count,
+                batch_skeleton_count=batch.skeleton_count, error=str(exc))
             raise
-        if isinstance(exc, RetryableError):
-            raise
-        if isinstance(exc, KeyboardInterrupt):
-            raise RetryableError(
-                f"Batch {batch.index} was interrupted and rolled back"
-            ) from exc
-        classified = _classified_runtime_error(
-            exc, context=f"batch {batch.index} transaction"
-        )
-        if classified is not None:
-            raise classified from exc
-        raise
-
     store.mark_batch_committed(batch.index)
-    _flush_loader_timings(metrics, batch.index, loader_timings)
+    _flush_loader_timings(metrics, batch.index, timings)
     metrics.record_phase(
-        f"batch_{batch.index:06d}_transaction",
-        duration_seconds=time.monotonic() - transaction_started,
-        batch_index=batch.index,
-        batch_node_count=batch.node_count,
-        batch_skeleton_count=batch.skeleton_count,
-        node_count=batch.node_count,
-        row_counts=counts,
-    )
-    current_state = store.load()
-    _reconcile_completed_progress(metrics, current_state)
-    _progress(f"Committed batch {batch.index}/{len(current_state['batches'])}")
+        f"batch_{batch.index:06d}_transaction", duration_seconds=time.monotonic() - started,
+        batch_index=batch.index, batch_node_count=batch.node_count,
+        batch_skeleton_count=batch.skeleton_count, node_count=batch.node_count, row_counts=counts)
+    current = store.load()
+    _record_completed_progress(metrics, current)
+    _progress(f"Committed batch {batch.index}/{len(current['batches'])}")
 
 
 def _combine_manifest(store: StateStore, state: Mapping[str, Any]) -> Path:
-    if "manifest" in state.get("artifacts", {}):
-        return _artifact_path(store, state, "manifest")
     paths = [
         _artifact_path(store, state, "manifest", batch_index=int(batch["index"]))
         for batch in state["batches"]
@@ -1004,59 +633,20 @@ def _run_phase(
     metrics: MetricsStore,
     phase: str,
     action: Callable[[], Mapping[str, Any]],
-    *,
-    rerun_complete: bool = False,
 ) -> dict[str, Any]:
-    state = store.load()
-    if state["phases"][phase]["status"] == "complete" and not rerun_complete:
-        return {}
     store.mark_phase_running(phase)
     started = time.monotonic()
     try:
         result = dict(action())
-    except VerificationError:
-        duration = time.monotonic() - started
-        store.transition_phase(phase, "failed", reason="Verification failed")
-        metrics.record_phase(
-            phase,
-            duration_seconds=duration,
-            status="failed",
-            error="Verification failed",
-        )
-        raise
     except BaseException as exc:
-        duration = time.monotonic() - started
-        store.mark_phase_retryable(phase, str(exc))
-        metrics.record_phase(
-            phase,
-            duration_seconds=duration,
-            status="retryable",
-            error=str(exc),
-        )
-        if isinstance(exc, (InvalidInputError, ImmutableStateError, RetryableError)):
-            raise
-        if isinstance(exc, KeyboardInterrupt):
-            raise RetryableError(
-                f"{phase} was interrupted and is safe to retry"
-            ) from exc
-        classified = _classified_runtime_error(exc, context=phase)
-        if classified is not None:
-            raise classified from exc
+        store.transition_phase(phase, "failed", reason=str(exc))
+        metrics.record_phase(phase, duration_seconds=time.monotonic() - started,
+                             status="failed", error=str(exc))
         raise
     store.mark_phase_complete(phase)
-    metrics.record_phase(
-        phase,
-        duration_seconds=time.monotonic() - started,
-        row_counts={
-            key: value
-            for key, value in result.items()
-            if isinstance(value, int) and not isinstance(value, bool)
-            and (
-                key.endswith("_count")
-                or key in {"count", "nodes", "skeletons", "cache_cells"}
-            )
-        },
-    )
+    metrics.record_phase(phase, duration_seconds=time.monotonic() - started,
+                         row_counts={key: value for key, value in result.items()
+                                     if isinstance(value, int) and not isinstance(value, bool)})
     return result
 
 
@@ -1156,205 +746,213 @@ def _verify_database_by_batch(
     )
 
 
-def run_ingestion(
-    state_dir: Path,
-    *,
-    rebuild_cache: bool = False,
-) -> dict[str, object]:
+def run_ingestion(state_dir: Path) -> dict[str, object]:
+    """Execute this workspace once and surface the first failure immediately."""
     store = StateStore(state_dir)
-    with store.lock(), ExitStack() as resources:
-        state = store.block_on_uncertain_commit()
-        state = store.verify_immutable()
-        request = load_request(store.request_path)
-        operational_settings = load_operational_settings()
-        settings = settings_from_state(state["settings"], operational_settings)
-        plan_path = _artifact_path(store, state, "plan")
-        plan = read_plan(plan_path)
-        if sha256_file(plan_path) != state["plan"]["digest"]:
-            raise ImmutableStateError("Plan artifact digest does not match state")
-        if (
-            plan.batch_count != state["plan"]["batch_count"]
-            or plan.member_count != state["plan"]["skeleton_count"]
-            or plan.total_nodes != state["plan"]["node_count"]
-        ):
-            raise ImmutableStateError("Plan artifact totals do not match state")
+    with store.lock():
+        store.begin_run()
+        try:
+            with ExitStack() as resources:
+                result = _execute_ingestion(store, resources)
+            store.finish_run()
+            return result
+        except BaseException as exc:
+            try:
+                store.fail_run(str(exc) or "Interrupted")
+                metrics = MetricsStore(store.state_dir)
+                if metrics.path.exists():
+                    metrics.set_status("failed")
+            except Exception as reporting_error:
+                _progress(f"Could not persist failure status: {reporting_error}")
+            if isinstance(exc, ImporterError):
+                raise
+            classified = _classified_runtime_error(exc, context="ingestion")
+            if classified is not None:
+                raise classified from exc
+            raise
 
-        metrics = MetricsStore(store.state_dir)
-        metrics.initialize(
-            planned_batches=plan.batch_count,
-            planned_nodes=plan.total_nodes,
-            planned_skeletons=plan.member_count,
+
+def _execute_ingestion(store: StateStore, resources: ExitStack) -> dict[str, object]:
+    state = store.verify_immutable()
+    request = load_request(store.request_path)
+    operational_settings = load_operational_settings()
+    settings = settings_from_state(state["settings"], operational_settings)
+    plan_path = _artifact_path(store, state, "plan")
+    plan = read_plan(plan_path)
+    if sha256_file(plan_path) != state["plan"]["digest"]:
+        raise ImmutableStateError("Plan artifact digest does not match state")
+    if (
+        plan.batch_count != state["plan"]["batch_count"]
+        or plan.member_count != state["plan"]["skeleton_count"]
+        or plan.total_nodes != state["plan"]["node_count"]
+    ):
+        raise ImmutableStateError("Plan artifact totals do not match state")
+
+    metrics = MetricsStore(store.state_dir)
+    metrics.initialize(
+        planned_batches=plan.batch_count,
+        planned_nodes=plan.total_nodes,
+        planned_skeletons=plan.member_count,
+    )
+    metrics.record_operational_settings(
+        statement_timeout_ms=settings.statement_timeout_ms,
+        lock_timeout_ms=settings.lock_timeout_ms,
+    )
+    metrics.set_status("in_progress")
+    connection, _preflight = _database_context(
+        store, state, require_replica_role=True,
+    )
+    if request.target_project_id is not None:
+        from .database import existing_project_import_lock
+        resources.enter_context(
+            existing_project_import_lock(request.target_project_id, connection)
         )
-        metrics.record_operational_settings(
-            statement_timeout_ms=settings.statement_timeout_ms,
-            lock_timeout_ms=settings.lock_timeout_ms,
+    geometry = _append_geometry(request, connection)
+    _check_saved_geometry(store, store.load(), geometry)
+    state = store.load()
+    project = _ensure_project(
+        store, state, request, settings, connection, metrics
+    )
+    if project.existing_project:
+        _check_existing_fragment_conflicts(plan, project, connection)
+    from .offline_cache import OfflineGridCache
+    grid_cache = OfflineGridCache(
+        project.project_id, connection,
+        lock_timeout_ms=settings.lock_timeout_ms,
+        statement_timeout_ms=settings.statement_timeout_ms,
+    )
+    if not project.existing_project:
+        grid_cache.ensure_import_grid(
+            cell_size_nm=settings.cache_cell_size_nm, lod_levels=settings.lod_levels,
+            lod_bucket_size=settings.lod_bucket_size, lod_strategy=settings.lod_strategy,
         )
-        _reconcile_completed_progress(metrics, state)
-        metrics.set_status("in_progress")
-        connection, _preflight = _database_context(
-            store, state, require_replica_role=True,
-        )
-        if request.target_project_id is not None:
-            from .database import existing_project_import_lock
-            resources.enter_context(
-                existing_project_import_lock(request.target_project_id, connection)
-            )
-        geometry = _append_geometry(request, connection)
-        _check_saved_geometry(store, store.load(), geometry)
-        state = store.load()
-        project = _ensure_project(
-            store, state, request, settings, connection, metrics
-        )
-        if project.existing_project:
-            _check_existing_fragment_conflicts(store, plan, project, connection)
-        from .offline_cache import OfflineGridCache
-        grid_cache = OfflineGridCache(
-            project.project_id, connection,
-            lock_timeout_ms=settings.lock_timeout_ms,
-            statement_timeout_ms=settings.statement_timeout_ms,
-        )
-        if not project.existing_project:
-            grid_cache.ensure_import_grid(
-                cell_size_nm=settings.cache_cell_size_nm, lod_levels=settings.lod_levels,
-                lod_bucket_size=settings.lod_bucket_size, lod_strategy=settings.lod_strategy,
-            )
-        _progress("Offline import: keep the Neuroglass managed layer inactive until verification succeeds")
+    _progress("Offline import: keep the Neuroglass managed layer inactive until verification succeeds")
 
-        with SourceSnapshotReader(store.state_dir, plan) as archive:
-            for batch in plan.batches:
-                _run_batch(
-                    store,
-                    batch,
-                    request,
-                    settings,
-                    project,
-                    connection,
-                    archive,
-                    metrics,
-                )
-
-        state = store.load()
-        _combine_manifest(store, state)
-
-        from .database import analyze_tables
-        from .project_checks import verify_project_stack
-
-        _run_phase(
-            store,
-            metrics,
-            "database_maintenance",
-            lambda: analyze_tables(connection),
-        )
-        # Interrupted cache phases restart from their saved coverage plan.
-        cache_state = store.load()
-        cache_progress = CacheProgressWriter(store.state_dir)
-        if (rebuild_cache or cache_state["phases"]["cache"]["status"] != "complete"
-                or "cache_rebuild" not in cache_state["artifacts"]):
-            _progress("Invalidating cache and verification checkpoints")
-            store.prepare_cache_rebuild(reset_plan=rebuild_cache)
-            # Clear the old attempt before marking cache running or planning coverage.
-            cache_progress(0, 0)
-        def build_cache() -> Mapping[str, Any]:
-            state = store.load()
-            if "cache_plan" not in state["artifacts"]:
-                _write_registered_json(store, "cache_plan", "cache-plan.json", grid_cache.plan())
-            cache_plan = load_json(_artifact_path(store, store.load(), "cache_plan"))
-            receipt = grid_cache.rebuild(
-                log=_progress, plan=cache_plan, progress=cache_progress,
-            )
-            _write_registered_json(
-                store, "cache_rebuild", "cache-rebuild.json", receipt,
-            )
-            return {"grid_count": len(receipt["grids"]),
-                    "cell_count": sum(grid["cell_count"] for grid in receipt["grids"])}
-
-        _run_phase(
-            store,
-            metrics,
-            "cache",
-            build_cache,
-        )
-
-        state = store.load()
-
-        def verify() -> Mapping[str, Any]:
-            if project.existing_project:
-                _check_saved_geometry(store, store.load(), _append_geometry(request, connection))
-                from .project import ProjectSetupError, existing_project_context
-                try:
-                    current_project = ProjectContext.from_dict(
-                        existing_project_context(project.project_id)
-                    )
-                except ProjectSetupError as exc:
-                    raise VerificationError(str(exc)) from exc
-                if current_project != project:
-                    raise VerificationError("Existing project tracing context changed during import")
-                project_result = {"project_id": project.project_id, "existing_project": True}
-            else:
-                project_result = verify_project_stack(
-                    project_id=project.project_id,
-                    stack_id=project.stack_id,
-                    project_stack_id=project.project_stack_id,
-                    system_user_id=project.user_id,
-                    title=_project_title(state, request),
-                    dimension=request.dimension,
-                    resolution_nm=request.resolution_nm,
-                    cache_cell_size_nm=settings.cache_cell_size_nm,
-                    connection=connection,
-                )
-            with SourceSnapshotReader(store.state_dir, plan) as verification_archive:
-                database_result = _verify_database_by_batch(
-                    store,
-                    plan,
-                    state,
-                    project,
-                    connection,
-                    verification_archive.load,
-                    request=request,
-                )
-            cache_result = grid_cache.verify(
-                load_json(_artifact_path(store, store.load(), "cache_rebuild"))
-            )
-            result = {
-                "project": project_result,
-                "database": database_result,
-                "cache": cache_result,
-            }
-            verification_value = {"schema_version": 1, **result}
-            _write_registered_json(
+    with SourceSnapshotReader(store.state_dir, plan) as archive:
+        for batch in plan.batches:
+            _run_batch(
                 store,
-                "verification",
-                VERIFICATION_FILENAME,
-                verification_value,
+                batch,
+                request,
+                settings,
+                project,
+                connection,
+                archive,
+                metrics,
             )
-            counts = {
-                "skeletons": plan.member_count,
-                "nodes": plan.total_nodes,
-            }
-            counts["cache_cells"] = result["cache"]["cell_count"]
-            return counts
 
-        _run_phase(
+    state = store.load()
+    _combine_manifest(store, state)
+
+    from .database import analyze_tables
+    from .project_checks import verify_project_stack
+
+    _run_phase(
+        store,
+        metrics,
+        "database_maintenance",
+        lambda: analyze_tables(connection),
+    )
+    cache_progress = CacheProgressWriter(store.state_dir)
+    cache_progress(0, 0)
+    def build_cache() -> Mapping[str, Any]:
+        _write_registered_json(store, "cache_plan", "cache-plan.json", grid_cache.plan())
+        cache_plan = load_json(_artifact_path(store, store.load(), "cache_plan"))
+        receipt = grid_cache.rebuild(
+            log=_progress, plan=cache_plan, progress=cache_progress,
+        )
+        _write_registered_json(
+            store, "cache_rebuild", "cache-rebuild.json", receipt,
+        )
+        return {"grid_count": len(receipt["grids"]),
+                "cell_count": sum(grid["cell_count"] for grid in receipt["grids"])}
+
+    _run_phase(
+        store,
+        metrics,
+        "cache",
+        build_cache,
+    )
+
+    state = store.load()
+
+    def verify() -> Mapping[str, Any]:
+        if project.existing_project:
+            _check_saved_geometry(store, store.load(), _append_geometry(request, connection))
+            from .project import ProjectSetupError, existing_project_context
+            try:
+                current_project = ProjectContext.from_dict(
+                    existing_project_context(project.project_id)
+                )
+            except ProjectSetupError as exc:
+                raise VerificationError(str(exc)) from exc
+            if current_project != project:
+                raise VerificationError("Existing project tracing context changed during import")
+            project_result = {"project_id": project.project_id, "existing_project": True}
+        else:
+            project_result = verify_project_stack(
+                project_id=project.project_id,
+                stack_id=project.stack_id,
+                project_stack_id=project.project_stack_id,
+                system_user_id=project.user_id,
+                title=_project_title(state, request),
+                dimension=request.dimension,
+                resolution_nm=request.resolution_nm,
+                cache_cell_size_nm=settings.cache_cell_size_nm,
+                connection=connection,
+            )
+        with SourceSnapshotReader(store.state_dir, plan) as verification_archive:
+            database_result = _verify_database_by_batch(
+                store,
+                plan,
+                state,
+                project,
+                connection,
+                verification_archive.load,
+                request=request,
+            )
+        cache_result = grid_cache.verify(
+            load_json(_artifact_path(store, store.load(), "cache_rebuild"))
+        )
+        result = {
+            "project": project_result,
+            "database": database_result,
+            "cache": cache_result,
+        }
+        verification_value = {"schema_version": 1, **result}
+        _write_registered_json(
             store,
-            metrics,
             "verification",
-            verify,
-            rerun_complete=True,
+            VERIFICATION_FILENAME,
+            verification_value,
         )
+        counts = {
+            "skeletons": plan.member_count,
+            "nodes": plan.total_nodes,
+        }
+        counts["cache_cells"] = result["cache"]["cell_count"]
+        return counts
 
-        state = store.load()
-        metrics.set_status("complete")
-        result = _success_result(
-            "run",
-            store.state_dir,
-            status=state["status"],
-            project_id=project.project_id,
-            stack_id=project.stack_id,
-            existing_project=project.existing_project,
-            batches=plan.batch_count,
-            skeletons=plan.member_count,
-            nodes=plan.total_nodes,
-            manifest=str(_artifact_path(store, state, "manifest")),
-            verification=str(_artifact_path(store, state, "verification")),
-        )
-        return _write_result(store.state_dir, result)
+    _run_phase(
+        store,
+        metrics,
+        "verification",
+        verify,
+    )
+
+    state = store.load()
+    metrics.set_status("complete")
+    result = _success_result(
+        "run",
+        store.state_dir,
+        status=state["status"],
+        project_id=project.project_id,
+        stack_id=project.stack_id,
+        existing_project=project.existing_project,
+        batches=plan.batch_count,
+        skeletons=plan.member_count,
+        nodes=plan.total_nodes,
+        manifest=str(_artifact_path(store, state, "manifest")),
+        verification=str(_artifact_path(store, state, "verification")),
+    )
+    return _write_result(store.state_dir, result)

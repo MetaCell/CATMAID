@@ -147,7 +147,6 @@ def test_create_hidden_project_is_create_only_and_returns_tracing_ids():
         title="example",
         dimension=(100, 200, 300),
         resolution_nm=(4, 5, 6),
-        before_commit=lambda: calls.append(("before_commit",)),
         components=components,
     )
 
@@ -160,7 +159,6 @@ def test_create_hidden_project_is_create_only_and_returns_tracing_ids():
     assert sum(call[0] == "permission" for call in calls) == len(
         project.SYSTEM_PROJECT_PERMISSIONS
     )
-    assert calls[-1] == ("before_commit",)
 
 
 def _valid_batch_responses():

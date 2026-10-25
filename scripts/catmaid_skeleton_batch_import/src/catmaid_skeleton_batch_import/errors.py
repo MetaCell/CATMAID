@@ -19,19 +19,14 @@ class InvalidInputError(ImporterError):
     category = "invalid_input"
 
 
-class RetryableError(ImporterError):
+class OperationalFailureError(ImporterError):
     exit_code = 3
-    category = "retryable_failure"
+    category = "operation_failed"
 
 
 class ImmutableStateError(ImporterError):
     exit_code = 4
     category = "immutable_state_mismatch"
-
-
-class OperatorAttentionError(ImporterError):
-    exit_code = 5
-    category = "operator_attention"
 
 
 class VerificationError(ImporterError):

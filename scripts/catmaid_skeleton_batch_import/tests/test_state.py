@@ -9,8 +9,7 @@ from catmaid_skeleton_batch_import.artifacts import read_id_artifact, write_id_a
 from catmaid_skeleton_batch_import.errors import (
     ImmutableStateError,
     InvalidInputError,
-    OperatorAttentionError,
-    RetryableError,
+    OperationalFailureError,
 )
 from catmaid_skeleton_batch_import.state import (
     ArchiveMetadata,
@@ -67,47 +66,25 @@ def make_store(tmp_path: Path, *, batch_count: int = 2) -> tuple[StateStore, dic
 
 def commit_project(store: StateStore) -> None:
     store.mark_project_prepared(project_id=101, stack_id=202)
-    store.mark_project_commit_attempted()
     store.mark_project_committed()
 
 
 def commit_batch(store: StateStore, index: int) -> None:
     store.mark_batch_prepared(index)
-    store.mark_batch_commit_attempted(index)
     store.mark_batch_committed(index)
 
 
-def test_state_files_are_canonical_and_plan_is_idempotent(tmp_path: Path) -> None:
+def test_state_files_are_canonical_and_planning_is_single_use(tmp_path: Path) -> None:
     store, arguments = make_store(tmp_path)
-
     assert store.load()["schema_version"] == SCHEMA_VERSION
     for path in (store.request_path, store.archive_path, store.state_path):
-        parsed = json.loads(path.read_bytes())
-        assert path.read_bytes() == canonical_json_bytes(parsed)
-
-    store.mark_project_prepared(project_id=101, stack_id=202)
+        assert path.read_bytes() == canonical_json_bytes(json.loads(path.read_bytes()))
     before = store.state_path.read_bytes()
-    resumed = store.initialize_plan(**arguments)
+    with pytest.raises(InvalidInputError, match="already has a plan"):
+        store.initialize_plan(**arguments)
     assert store.state_path.read_bytes() == before
-    assert resumed["project"] == {
-        "status": "prepared",
-        "project_id": 101,
-        "stack_id": 202,
-    }
 
 
-def test_idempotent_plan_rejects_any_immutable_difference(tmp_path: Path) -> None:
-    store, arguments = make_store(tmp_path)
-    changed_request = json.loads(json.dumps(arguments["request"]))
-    changed_request["source"]["coordinate_unit"] = "nm"
-
-    with pytest.raises(ImmutableStateError):
-        store.initialize_plan(**{**arguments, "request": changed_request})
-
-    changed_batches = list(arguments["batches"])
-    changed_batches[0] = {**changed_batches[0], "node_count": 99}
-    with pytest.raises(ImmutableStateError):
-        store.initialize_plan(**{**arguments, "batches": changed_batches})
 
 
 def test_posix_state_lock_is_exclusive_and_reentrant(tmp_path: Path) -> None:
@@ -116,7 +93,7 @@ def test_posix_state_lock_is_exclusive_and_reentrant(tmp_path: Path) -> None:
 
     with first.lock():
         with first.lock():
-            with pytest.raises(RetryableError):
+            with pytest.raises(OperationalFailureError):
                 with second.lock():
                     pass
 
@@ -124,7 +101,7 @@ def test_posix_state_lock_is_exclusive_and_reentrant(tmp_path: Path) -> None:
         pass
 
 
-def test_archive_is_verified_on_resume(tmp_path: Path) -> None:
+def test_archive_is_verified_before_loading(tmp_path: Path) -> None:
     archive = tmp_path / "source.zip"
     archive.write_bytes(b"archive")
     store = StateStore(tmp_path / "state")
@@ -218,28 +195,18 @@ def test_persisted_artifact_descriptor_is_accepted_by_artifact_reader(
 
 
 def test_project_batch_and_phase_lifecycle(tmp_path: Path) -> None:
-    store, _ = make_store(tmp_path, batch_count=2)
+    store, _ = make_store(tmp_path)
+    store.begin_run()
     commit_project(store)
-
-    store.mark_batch_prepared(1)
-    store.mark_batch_retryable(1, "known COPY rollback")
-    store.mark_batch_prepared(1)
-    store.mark_batch_commit_attempted(1)
-    state = store.mark_batch_committed(1)
-    assert state["status"] == "database_in_progress"
-
+    commit_batch(store, 1)
+    assert store.load()["status"] == "database_in_progress"
     commit_batch(store, 2)
-    assert store.load()["status"] == "database_complete"
-
-    store.mark_phase_running("database_maintenance")
-    store.mark_phase_complete("database_maintenance")
-    store.mark_phase_running("cache")
-    store.mark_phase_retryable("cache", "worker interruption")
-    store.mark_phase_running("cache")
-    store.mark_phase_complete("cache")
-    store.mark_phase_running("verification")
-    state = store.mark_phase_complete("verification")
-    assert state["status"] == "ready_for_publication"
+    for phase in ("database_maintenance", "cache", "verification"):
+        store.mark_phase_running(phase)
+        store.mark_phase_complete(phase)
+    assert store.finish_run()["status"] == "ready_for_publication"
+    with pytest.raises(InvalidInputError, match="terminal"):
+        store.begin_run()
 
 
 def test_whole_batch_order_and_phase_prerequisites_are_enforced(tmp_path: Path) -> None:
@@ -254,94 +221,32 @@ def test_whole_batch_order_and_phase_prerequisites_are_enforced(tmp_path: Path) 
         store.mark_phase_running("database_maintenance")
 
 
-def test_phase_retry_clears_stale_failure_reason(tmp_path: Path) -> None:
-    store, _ = make_store(tmp_path, batch_count=1)
-    commit_project(store)
-    commit_batch(store, 1)
-    store.mark_phase_running("database_maintenance")
-    store.mark_phase_complete("database_maintenance")
-    store.mark_phase_running("cache")
-    store.mark_phase_complete("cache")
-    store.mark_phase_running("verification")
-    store.transition_phase("verification", "failed", reason="Verification failed")
-
-    state = store.mark_phase_running("verification")
-    assert "reason" not in state["phases"]["verification"]
-    state = store.mark_phase_complete("verification")
-    assert state["phases"]["verification"] == {"status": "complete"}
 
 
-def test_explicit_cache_rebuild_preserves_database_and_invalidates_verification(
-    tmp_path: Path,
-) -> None:
-    store, _ = make_store(tmp_path, batch_count=1)
-    commit_project(store)
-    commit_batch(store, 1)
-    for phase in ("database_maintenance", "cache", "verification"):
-        store.mark_phase_running(phase)
-        store.mark_phase_complete(phase)
-    verification_path = store.state_dir / "verification.json"
-    verification_path.write_text('{"ok":true}\n')
-    store.register_artifact("verification", "verification.json", count=1)
-
-    state = store.prepare_cache_rebuild()
-
-    assert state["status"] == "maintenance_complete"
-    assert state["project"]["status"] == "committed"
-    assert state["batches"][0]["status"] == "committed"
-    assert state["phases"]["database_maintenance"]["status"] == "complete"
-    assert state["phases"]["cache"] == {"status": "pending"}
-    assert state["phases"]["verification"] == {"status": "pending"}
-    assert "verification" not in state["artifacts"]
 
 
-def test_cache_rebuild_requires_completed_database(tmp_path: Path) -> None:
-    store, _ = make_store(tmp_path, batch_count=1)
-    commit_project(store)
-
-    with pytest.raises(ImmutableStateError, match="every database batch"):
-        store.prepare_cache_rebuild()
 
 
-def test_uncertain_commit_becomes_operator_attention_and_blocks_mutation(
-    tmp_path: Path,
-) -> None:
-    store, _ = make_store(tmp_path)
-    commit_project(store)
-    store.mark_batch_prepared(1)
-    store.mark_batch_commit_attempted(1)
-
-    with pytest.raises(OperatorAttentionError, match="not checkpointed"):
-        store.block_on_uncertain_commit()
-
-    state = store.load()
-    assert state["status"] == "operator_attention"
-    assert state["batches"][0]["status"] == "operator_attention"
-    with pytest.raises(OperatorAttentionError, match="normal mutations are blocked"):
-        store.mark_batch_committed(1)
-    with pytest.raises(OperatorAttentionError):
-        store.register_artifact("manifest", "manifest.csv.gz", count=0)
 
 
-def test_known_commit_failure_can_be_marked_retryable_only_when_confirmed(
-    tmp_path: Path,
-) -> None:
-    store, _ = make_store(tmp_path, batch_count=1)
-    commit_project(store)
-    store.mark_batch_prepared(1)
-    store.mark_batch_commit_attempted(1)
-
-    with pytest.raises(OperatorAttentionError, match="COMMIT outcome is uncertain"):
-        store.mark_batch_retryable(1, "lost connection")
-
-    state = store.mark_batch_retryable(
-        1, "PostgreSQL rejected COMMIT and confirmed rollback", confirmed_rollback=True
-    )
-    assert state["batches"][0]["status"] == "retryable"
 
 
 def test_reserved_project_ids_cannot_change(tmp_path: Path) -> None:
     store, _ = make_store(tmp_path)
     store.mark_project_prepared(project_id=101, stack_id=202)
     with pytest.raises(ImmutableStateError, match="project_id"):
-        store.transition_project("prepared", project_id=999)
+        store.transition_project("committed", project_id=999)
+
+def test_failed_and_interrupted_attempts_cannot_be_resumed(tmp_path):
+    store, _ = make_store(tmp_path)
+    store.begin_run()
+    commit_project(store)
+    commit_batch(store, 1)
+    store.mark_batch_prepared(2)
+    with pytest.raises(InvalidInputError, match="already been run"):
+        store.begin_run()
+    state = store.fail_run("first error")
+    assert state["status"] == "failed"
+    assert [item["status"] for item in state["batches"]] == ["committed", "failed"]
+    with pytest.raises(InvalidInputError, match="terminal"):
+        store.begin_run()

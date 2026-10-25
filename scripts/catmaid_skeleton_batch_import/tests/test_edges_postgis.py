@@ -9,6 +9,7 @@ from pathlib import Path
 import zipfile
 
 import pytest
+from catmaid_skeleton_batch_import.errors import InvalidInputError
 
 pytestmark = [
     pytest.mark.e2e,
@@ -172,9 +173,12 @@ def test_exact_canonical_geometry_summary_and_connectors(local_database, project
         assert connector_snapshot(connection) == connector_before
         raise RollbackTrial
 
+    def timing(name, duration, _counts):
+        observed[name] = duration
+        if name == "exact_treenode_validation":
+            compare()
     with pytest.raises(RollbackTrial):
-        execute_batch_transaction(prepared, project, load_settings(), compare,
-                                  lambda n, t, _: observed.update({n: t}))
+        execute_batch_transaction(prepared, project, load_settings(), timing)
     assert {"edge_staging", "edge_creation", "summary_refresh", "materialization"} <= observed.keys()
     assert_absent(connection, prepared)
     assert connector_snapshot(connection) == before
@@ -235,7 +239,8 @@ def test_existing_edge_fails_without_deletion(local_database, project, prepared)
         assert edge_rows(local_database, prepared.location_ids) == before
         raise RollbackTrial
     with pytest.raises(RollbackTrial):
-        execute_batch_transaction(prepared, project, load_settings(), conflict)
+        execute_batch_transaction(prepared, project, load_settings(),
+                                  lambda name, *_args: conflict() if name == "exact_treenode_validation" else None)
     assert_absent(local_database, prepared)
 
 
@@ -252,10 +257,10 @@ def make_request(tmp_path):
 
 
 @pytest.mark.parametrize("phase", ["edge_staging", "edge_creation", "summary_refresh"])
-def test_phase_failure_rolls_back_second_batch_and_resumes(local_database, tmp_path, monkeypatch, phase):
+def test_phase_failure_rolls_back_second_batch_and_is_terminal(local_database, tmp_path, monkeypatch, phase):
     from catmaid_skeleton_batch_import import materialization
     from catmaid_skeleton_batch_import.config import load_settings
-    from catmaid_skeleton_batch_import.errors import RetryableError
+    from catmaid_skeleton_batch_import.errors import OperationalFailureError
     from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, run_ingestion
     from catmaid_skeleton_batch_import.state import StateStore
     from catmaid_skeleton_batch_import.artifacts import read_id_artifact
@@ -272,14 +277,14 @@ def test_phase_failure_rolls_back_second_batch_and_resumes(local_database, tmp_p
         def timing(name, duration):
             callback(name, duration)
             if calls == 2 and name == phase:
-                raise RetryableError("injected after " + phase)
+                raise OperationalFailureError("injected after " + phase)
         kwargs["record_timing"] = timing
         return original(**kwargs)
     monkeypatch.setattr(materialization, "materialize_and_verify_batch", injected)
-    with pytest.raises(RetryableError, match="injected after"):
+    with pytest.raises(OperationalFailureError, match="injected after"):
         run_ingestion(state_dir)
     state = StateStore(state_dir).load()
-    assert [b["status"] for b in state["batches"]] == ["committed", "retryable"]
+    assert [b["status"] for b in state["batches"]] == ["committed", "failed"]
     artifacts = [b["artifacts"] for b in state["batches"]]
     first_ids = list(read_id_artifact(state_dir, artifacts[0]["location_ids"], expected_count=3))
     second_ids = list(read_id_artifact(state_dir, artifacts[1]["location_ids"], expected_count=3))
@@ -297,10 +302,11 @@ def test_phase_failure_rolls_back_second_batch_and_resumes(local_database, tmp_p
         c.execute("SELECT count(*) FROM catmaid_skeleton_summary WHERE skeleton_id=ANY(%s::bigint[])", [concepts])
         assert c.fetchone()[0] == 0
     assert_no_temp(local_database)
-    monkeypatch.setattr(materialization, "materialize_and_verify_batch", original)
-    assert run_ingestion(state_dir)["nodes"] == 6
+    with pytest.raises(InvalidInputError, match="terminal"):
+        run_ingestion(state_dir)
     assert edge_rows(local_database, first_ids) == first
-    assert len(edge_rows(local_database, second_ids)) == 3
+    assert len(edge_rows(local_database, second_ids)) == 0
+    assert StateStore(state_dir).load()["status"] == "failed"
     assert_no_temp(local_database)
 
 
@@ -312,7 +318,6 @@ def test_fragment_metadata_failure_rolls_back_entire_batch(local_database, proje
     from catmaid_skeleton_batch_import.loader import execute_batch_transaction
     original = materialization.materialize_and_verify_batch
     item = prepared.expected_skeletons[0]
-    attempted = []
 
     def corrupted(**kwargs):
         cursor = kwargs["cursor"]
@@ -330,6 +335,5 @@ def test_fragment_metadata_failure_rolls_back_entire_batch(local_database, proje
 
     monkeypatch.setattr(materialization, "materialize_and_verify_batch", corrupted)
     with pytest.raises(VerificationError):
-        execute_batch_transaction(prepared, project, load_settings(), lambda: attempted.append(True))
-    assert not attempted
+        execute_batch_transaction(prepared, project, load_settings())
     assert_absent(local_database, prepared)

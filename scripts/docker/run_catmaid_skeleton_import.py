@@ -19,13 +19,12 @@ import signal
 import subprocess
 import sys
 import tempfile
-import time
 from collections.abc import Mapping, Sequence
 
 
 EX_USAGE = 64
 EX_NOINPUT = 66
-RETRYABLE_IMPORTER_EXIT = 3
+OPERATION_FAILED_EXIT = 3
 REQUEST_FILENAME = "request.json"
 STATE_DIRECTORY = "state"
 RUN_RESULT_FILENAME = "run-wrapper-result.json"
@@ -149,19 +148,6 @@ def _write_terminal_marker(
         temporary.unlink(missing_ok=True)
 
 
-def _clear_terminal_marker(state_directory: Path) -> None:
-    """A new invocation must not inherit the previous wrapper's failure."""
-    try:
-        (state_directory / RUN_RESULT_FILENAME).unlink()
-        _fsync_directory(state_directory)
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        raise EntrypointError(
-            f"Could not reset the previous CATMAID wrapper result: {exc}", EX_NOINPUT
-        ) from exc
-
-
 def _prepare(workspace: Path, importer: str, environ: Mapping[str, str], *, action: str) -> int:
     request = workspace / REQUEST_FILENAME
     if not request.is_file():
@@ -187,46 +173,17 @@ def _prepare(workspace: Path, importer: str, environ: Mapping[str, str], *, acti
     )
 
 
-def _wait_for_database(
-    *,
-    pg_isready: str,
-    host: str,
-    port: int,
-    database: str,
-    user: str,
-    wait_seconds: int,
-    environ: Mapping[str, str],
-) -> bool:
-    deadline = time.monotonic() + wait_seconds
-    print(f"Waiting for CATMAID database {host}:{port}...", file=sys.stderr)
-    command = (
-        pg_isready,
-        "--quiet",
-        "--host",
-        host,
-        "--port",
-        str(port),
-        "--dbname",
-        database,
-        "--username",
-        user,
-    )
-    while True:
-        try:
-            ready = subprocess.run(
-                command,
-                env=dict(environ),
-                check=False,
-            ).returncode == 0
-        except OSError as exc:
-            raise EntrypointError(
-                f"Could not run PostgreSQL readiness check: {exc}", EX_NOINPUT
-            ) from exc
-        if ready:
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(min(2, max(0, deadline - time.monotonic())))
+def _database_is_ready(*, pg_isready, host, port, database, user, environ) -> bool:
+    """Run one readiness check; a failed check is terminal for this attempt."""
+    print(f"Checking CATMAID database {host}:{port}...", file=sys.stderr)
+    try:
+        return subprocess.run(
+            (pg_isready, "--quiet", "--host", host, "--port", str(port),
+             "--dbname", database, "--username", user),
+            env=dict(environ), check=False,
+        ).returncode == 0
+    except OSError as exc:
+        raise EntrypointError(f"Could not run PostgreSQL readiness check: {exc}", EX_NOINPUT) from exc
 
 
 def _database_environment(environ: Mapping[str, str]) -> tuple[Path, dict[str, str]]:
@@ -235,9 +192,6 @@ def _database_environment(environ: Mapping[str, str]) -> tuple[Path, dict[str, s
     database_user = _required_environment_value(environ, "DB_USER")
     _required_environment_value(environ, "DB_PASS")
     database_port = _bounded_positive_integer(environ, "DB_PORT", 5432, 65535)
-    wait_seconds = _bounded_positive_integer(
-        environ, "CATMAID_INGESTION_DB_WAIT_SECONDS", 120, 3600
-    )
     projects_directory = Path(
         _environment_value(environ, "CATMAID_PROJECTS_DIRECTORY")
         or "/home/django/projects"
@@ -274,23 +228,23 @@ def _database_environment(environ: Mapping[str, str]) -> tuple[Path, dict[str, s
         _environment_value(environ, "CATMAID_PG_ISREADY_BIN")
         or "/usr/bin/pg_isready"
     )
-    if not _wait_for_database(
+    if not _database_is_ready(
         pg_isready=pg_isready,
         host=database_host,
         port=database_port,
         database=database_name,
         user=database_user,
-        wait_seconds=wait_seconds,
         environ=run_environment,
     ):
         raise EntrypointError(
-            f"CATMAID database was not ready after {wait_seconds} seconds", RETRYABLE_IMPORTER_EXIT,
+            "CATMAID database readiness check failed", OPERATION_FAILED_EXIT,
         )
     return projects_directory, run_environment
 
 
 def _run(workspace: Path, importer: str, environ: Mapping[str, str]) -> int:
-    _clear_terminal_marker(workspace / STATE_DIRECTORY)
+    if (workspace / STATE_DIRECTORY / RUN_RESULT_FILENAME).exists():
+        raise EntrypointError("This workspace has a terminal failure; use a new state directory")
     projects_directory, run_environment = _database_environment(environ)
 
     original_directory = Path.cwd()
@@ -331,6 +285,7 @@ def execute(
     parser.add_argument("action", choices=("preflight", "plan", "run"))
     arguments = parser.parse_args(argv)
     environment = os.environ if environ is None else environ
+    workspace = None
     try:
         workspace = _workspace(environment)
         importer = (
@@ -342,6 +297,13 @@ def execute(
         return _run(workspace, importer, environment)
     except EntrypointError as exc:
         print(str(exc), file=sys.stderr)
+        if arguments.action == "run" and workspace is not None:
+            state_directory = workspace / STATE_DIRECTORY
+            if not (state_directory / RUN_RESULT_FILENAME).exists():
+                try:
+                    _write_terminal_marker(state_directory, importer_exit_code=exc.exit_code, attempts=0)
+                except OSError as reporting_error:
+                    print(f"Could not persist the terminal wrapper result: {reporting_error}", file=sys.stderr)
         return exc.exit_code
 
 
