@@ -14,18 +14,13 @@ from typing import Any, Mapping
 
 from . import __version__
 from .errors import ImmutableStateError, InvalidInputError
+from .statuses import MetricsStatus, OperationStatus
 from .util import atomic_write_json, load_json
 
 
 SCHEMA_VERSION = 1
 METRICS_FILENAME = "metrics.json"
-_METRICS_STATUSES = {
-    "pending",
-    "in_progress",
-    "complete",
-    "failed",
-}
-_PHASE_STATUSES = {"complete", "failed"}
+_COMPLETED_PHASE_STATUSES = {OperationStatus.COMPLETE, OperationStatus.FAILED}
 
 
 def _count(value: object, label: str) -> int:
@@ -89,12 +84,16 @@ def _completed_phase_record(
     identity: Mapping[str, Any],
     *,
     duration_seconds: float,
-    status: str,
+    status: OperationStatus,
     node_count: int | None,
     row_counts: Mapping[str, object] | None,
     error: str | None,
 ) -> dict[str, Any]:
-    if status not in _PHASE_STATUSES:
+    try:
+        status = OperationStatus(status)
+    except (ValueError, TypeError) as exc:
+        raise InvalidInputError(f"Unknown completed phase status: {status}") from exc
+    if status not in _COMPLETED_PHASE_STATUSES:
         raise InvalidInputError(f"Unknown completed phase status: {status}")
     record = {
         "sequence": len(metrics["phases"]) + 1,
@@ -158,7 +157,7 @@ class MetricsStore:
 
         metrics = {
             "schema_version": SCHEMA_VERSION,
-            "status": "pending",
+            "status": MetricsStatus.PENDING,
             "counts": expected,
             "phases": [],
             "runs": [],
@@ -175,9 +174,11 @@ class MetricsStore:
             raise ImmutableStateError("Unsupported or malformed metrics schema")
         return value
 
-    def set_status(self, status: str) -> dict[str, Any]:
-        if status not in _METRICS_STATUSES:
-            raise InvalidInputError(f"Unknown metrics status: {status}")
+    def set_status(self, status: MetricsStatus) -> dict[str, Any]:
+        try:
+            status = MetricsStatus(status)
+        except (ValueError, TypeError) as exc:
+            raise InvalidInputError(f"Unknown metrics status: {status}") from exc
         metrics = self.load()
         metrics["status"] = status
         atomic_write_json(self.path, metrics)
@@ -241,8 +242,8 @@ class MetricsStore:
                 raise ImmutableStateError(f"Row count {name} cannot decrease")
             metrics["counts"]["rows"][name] = value
 
-        if metrics["status"] == "pending":
-            metrics["status"] = "in_progress"
+        if metrics["status"] == MetricsStatus.PENDING:
+            metrics["status"] = MetricsStatus.IN_PROGRESS
         atomic_write_json(self.path, metrics)
         return copy.deepcopy(metrics)
 
@@ -252,7 +253,7 @@ class MetricsStore:
         name: str,
         *,
         duration_seconds: float,
-        status: str = "complete",
+        status: OperationStatus = OperationStatus.COMPLETE,
         batch_index: int | None = None,
         batch_node_count: int | None = None,
         batch_skeleton_count: int | None = None,
@@ -279,9 +280,9 @@ class MetricsStore:
             error=error,
         )
         metrics["phases"].append(record)
-        if metrics["status"] == "pending":
-            metrics["status"] = "in_progress"
-        if status == "failed":
-            metrics["status"] = status
+        if metrics["status"] == MetricsStatus.PENDING:
+            metrics["status"] = MetricsStatus.IN_PROGRESS
+        if status == OperationStatus.FAILED:
+            metrics["status"] = MetricsStatus.FAILED
         atomic_write_json(self.path, metrics)
         return copy.deepcopy(record)

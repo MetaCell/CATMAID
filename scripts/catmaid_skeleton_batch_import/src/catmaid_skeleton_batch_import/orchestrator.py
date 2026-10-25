@@ -43,6 +43,7 @@ from .metrics import MetricsStore
 from .planner import ImportPlan, plan_archive, read_plan, write_plan
 from .source_snapshot import SourceSnapshotReader, SourceSnapshotWriter
 from .state import ArchiveMetadata, StateStore
+from .statuses import DatabaseStatus, MetricsStatus, OperationStatus
 from .stack_bounds import geometry_bounds, read_project_stack_geometry
 from .util import atomic_write_json, load_json, sha256_file
 
@@ -541,7 +542,7 @@ def _record_completed_progress(
     """Make committed filesystem state authoritative for progress metrics."""
 
     committed = [
-        batch for batch in state["batches"] if batch["status"] == "committed"
+        batch for batch in state["batches"] if batch["status"] == DatabaseStatus.COMMITTED
     ]
     return metrics.update_progress(
         completed_batches=len(committed),
@@ -598,7 +599,7 @@ def _run_batch(
             _flush_loader_timings(metrics, batch.index, timings)
             metrics.record_phase(
                 f"batch_{batch.index:06d}_transaction", duration_seconds=time.monotonic() - started,
-                status="failed", batch_index=batch.index, batch_node_count=batch.node_count,
+                status=OperationStatus.FAILED, batch_index=batch.index, batch_node_count=batch.node_count,
                 batch_skeleton_count=batch.skeleton_count, error=str(exc))
             raise
     store.mark_batch_committed(batch.index)
@@ -639,9 +640,9 @@ def _run_phase(
     try:
         result = dict(action())
     except BaseException as exc:
-        store.transition_phase(phase, "failed", reason=str(exc))
+        store.transition_phase(phase, OperationStatus.FAILED, reason=str(exc))
         metrics.record_phase(phase, duration_seconds=time.monotonic() - started,
-                             status="failed", error=str(exc))
+                             status=OperationStatus.FAILED, error=str(exc))
         raise
     store.mark_phase_complete(phase)
     metrics.record_phase(phase, duration_seconds=time.monotonic() - started,
@@ -761,7 +762,7 @@ def run_ingestion(state_dir: Path) -> dict[str, object]:
                 store.fail_run(str(exc) or "Interrupted")
                 metrics = MetricsStore(store.state_dir)
                 if metrics.path.exists():
-                    metrics.set_status("failed")
+                    metrics.set_status(MetricsStatus.FAILED)
             except Exception as reporting_error:
                 _progress(f"Could not persist failure status: {reporting_error}")
             if isinstance(exc, ImporterError):
@@ -798,7 +799,7 @@ def _execute_ingestion(store: StateStore, resources: ExitStack) -> dict[str, obj
         statement_timeout_ms=settings.statement_timeout_ms,
         lock_timeout_ms=settings.lock_timeout_ms,
     )
-    metrics.set_status("in_progress")
+    metrics.set_status(MetricsStatus.IN_PROGRESS)
     connection, _preflight = _database_context(
         store, state, require_replica_role=True,
     )
@@ -941,7 +942,7 @@ def _execute_ingestion(store: StateStore, resources: ExitStack) -> dict[str, obj
     )
 
     state = store.load()
-    metrics.set_status("complete")
+    metrics.set_status(MetricsStatus.COMPLETE)
     result = _success_result(
         "run",
         store.state_dir,

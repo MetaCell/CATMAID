@@ -600,6 +600,10 @@ lock and atomically replaces JSON so readers see complete records. The run marke
 moves once from pending to running and then complete or failed; an interrupted
 running attempt cannot be resumed.
 
+The importer defines status enums in `statuses.py` for database records,
+operations, overall ingestion progress and metrics. JSON files retain the
+same plain string values, such as `committed`, `running` and `failed`.
+
 Database maintenance runs after every batch has committed and before cache rebuilding.
 It executes PostgreSQL `ANALYZE` on `class_instance`,
 `class_instance_class_instance`, `treenode`, `treenode_edge` and

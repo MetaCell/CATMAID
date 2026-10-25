@@ -24,6 +24,7 @@ from .errors import (
     InvalidInputError,
     OperationalFailureError,
 )
+from .statuses import DatabaseStatus, ImportStatus, OperationStatus
 from .util import (
     atomic_write_json,
     canonical_json_bytes,
@@ -41,9 +42,6 @@ STATE_FILENAME = "state.json"
 LOCK_FILENAME = ".state.lock"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_PROJECT_STATUSES = {"planned", "prepared", "committed"}
-_BATCH_STATUSES = _PROJECT_STATUSES
-_PHASE_STATUSES = {"pending", "running", "complete", "failed"}
 _PHASE_ORDER = ("database_maintenance", "cache", "verification")
 
 
@@ -334,26 +332,26 @@ class StateStore:
             state = {
                 "schema_version": SCHEMA_VERSION,
                 "importer_version": __version__,
-                "status": "planned",
+                "status": ImportStatus.PLANNED,
                 **immutable,
                 "project": {
-                    "status": "planned",
+                    "status": DatabaseStatus.PLANNED,
                     "project_id": None,
                     "stack_id": None,
                 },
                 "batches": [
                     {
                         **copy.deepcopy(batch),
-                        "status": "planned",
+                        "status": DatabaseStatus.PLANNED,
                         "artifacts": copy.deepcopy((batch_artifacts or {}).get(batch["index"], {})),
                     }
                     for batch in batch_plan
                 ],
                 "phases": {
-                    phase: {"status": "pending"} for phase in _PHASE_ORDER
+                    phase: {"status": OperationStatus.PENDING} for phase in _PHASE_ORDER
                 },
                 "artifacts": copy.deepcopy(dict(artifacts or {})),
-                "run": {"status": "pending"},
+                "run": {"status": OperationStatus.PENDING},
             }
             for name, artifact in state["artifacts"].items():
                 self._verify_artifact_value(name, artifact)
@@ -496,14 +494,16 @@ class StateStore:
 
     def transition_project(
         self,
-        status: str,
+        status: DatabaseStatus,
         *,
         project_id: int | None = None,
         stack_id: int | None = None,
         reason: str | None = None,
     ) -> dict[str, Any]:
-        if status not in _PROJECT_STATUSES:
-            raise InvalidInputError(f"Unknown project state: {status}")
+        try:
+            status = DatabaseStatus(status)
+        except (ValueError, TypeError) as exc:
+            raise InvalidInputError(f"Unknown project state: {status}") from exc
 
         def mutate(state: dict[str, Any]) -> None:
             project = state["project"]
@@ -516,7 +516,7 @@ class StateStore:
             project["status"] = status
             if reason is not None:
                 project["reason"] = str(reason)
-            elif status in ("prepared", "committed"):
+            elif status in (DatabaseStatus.PREPARED, DatabaseStatus.COMMITTED):
                 project.pop("reason", None)
             self._derive_status(state)
 
@@ -524,11 +524,11 @@ class StateStore:
 
     def mark_project_prepared(self, project_id: int, stack_id: int) -> dict[str, Any]:
         return self.transition_project(
-            "prepared", project_id=project_id, stack_id=stack_id
+            DatabaseStatus.PREPARED, project_id=project_id, stack_id=stack_id
         )
 
     def mark_project_committed(self) -> dict[str, Any]:
-        return self.transition_project("committed")
+        return self.transition_project(DatabaseStatus.COMMITTED)
 
     def select_existing_project(self, project_id: int) -> dict[str, Any]:
         """Checkpoint a read-only project selection, without a COMMIT window."""
@@ -538,11 +538,11 @@ class StateStore:
 
         def mutate(state: dict[str, Any]) -> None:
             project = state["project"]
-            if project["status"] != "planned":
+            if project["status"] != DatabaseStatus.PLANNED:
                 raise ImmutableStateError("Cannot replace a project creation in progress")
             self._set_immutable_id(project, "project_id", project_id)
             project["mode"] = "existing"
-            project["status"] = "committed"
+            project["status"] = DatabaseStatus.COMMITTED
             self._derive_status(state)
 
         return self._mutate(mutate)
@@ -550,12 +550,14 @@ class StateStore:
     def transition_batch(
         self,
         batch_index: int,
-        status: str,
+        status: DatabaseStatus,
         *,
         reason: str | None = None,
     ) -> dict[str, Any]:
-        if status not in _BATCH_STATUSES:
-            raise InvalidInputError(f"Unknown batch state: {status}")
+        try:
+            status = DatabaseStatus(status)
+        except (ValueError, TypeError) as exc:
+            raise InvalidInputError(f"Unknown batch state: {status}") from exc
 
         def mutate(state: dict[str, Any]) -> None:
             batch = self._find_batch(state, batch_index)
@@ -565,15 +567,15 @@ class StateStore:
                 current,
                 status,
             )
-            if status == "prepared":
-                if state["project"]["status"] != "committed":
+            if status == DatabaseStatus.PREPARED:
+                if state["project"]["status"] != DatabaseStatus.COMMITTED:
                     raise ImmutableStateError(
                         "Cannot prepare a batch before project creation is committed"
                     )
                 for prior in state["batches"]:
                     if prior["index"] == batch_index:
                         break
-                    if prior["status"] != "committed":
+                    if prior["status"] != DatabaseStatus.COMMITTED:
                         raise ImmutableStateError(
                             f"Cannot prepare batch {batch_index} before batch "
                             f"{prior['index']} is committed"
@@ -581,69 +583,74 @@ class StateStore:
             batch["status"] = status
             if reason is not None:
                 batch["reason"] = str(reason)
-            elif status in ("prepared", "committed"):
+            elif status in (DatabaseStatus.PREPARED, DatabaseStatus.COMMITTED):
                 batch.pop("reason", None)
             self._derive_status(state)
 
         return self._mutate(mutate)
 
     def mark_batch_prepared(self, batch_index: int) -> dict[str, Any]:
-        return self.transition_batch(batch_index, "prepared")
+        return self.transition_batch(batch_index, DatabaseStatus.PREPARED)
 
     def mark_batch_committed(self, batch_index: int) -> dict[str, Any]:
-        return self.transition_batch(batch_index, "committed")
+        return self.transition_batch(batch_index, DatabaseStatus.COMMITTED)
 
     def transition_phase(
-        self, phase: str, status: str, *, reason: str | None = None
+        self, phase: str, status: OperationStatus, *, reason: str | None = None
     ) -> dict[str, Any]:
         if phase not in _PHASE_ORDER:
             raise InvalidInputError(f"Unknown lifecycle phase: {phase}")
-        if status not in _PHASE_STATUSES:
-            raise InvalidInputError(f"Unknown phase state: {status}")
+        try:
+            status = OperationStatus(status)
+        except (ValueError, TypeError) as exc:
+            raise InvalidInputError(f"Unknown phase state: {status}") from exc
 
         def mutate(state: dict[str, Any]) -> None:
             phase_state = state["phases"][phase]
             current = phase_state["status"]
-            allowed = {"pending": {"running"}, "running": {"complete", "failed"}}
+            allowed = {
+                OperationStatus.PENDING: {OperationStatus.RUNNING},
+                OperationStatus.RUNNING: {OperationStatus.COMPLETE, OperationStatus.FAILED},
+            }
             if status not in allowed.get(current, set()):
                 raise ImmutableStateError(
                     f"Invalid {phase} transition: {current} -> {status}"
                 )
-            if status == "running":
+            if status == OperationStatus.RUNNING:
                 self._validate_phase_prerequisite(state, phase)
             phase_state["status"] = status
             if reason is not None:
                 phase_state["reason"] = str(reason)
-            elif status in ("running", "complete"):
+            elif status in (OperationStatus.RUNNING, OperationStatus.COMPLETE):
                 phase_state.pop("reason", None)
             self._derive_status(state)
 
         return self._mutate(mutate)
 
     def mark_phase_running(self, phase: str) -> dict[str, Any]:
-        return self.transition_phase(phase, "running")
+        return self.transition_phase(phase, OperationStatus.RUNNING)
 
     def mark_phase_complete(self, phase: str) -> dict[str, Any]:
-        return self.transition_phase(phase, "complete")
+        return self.transition_phase(phase, OperationStatus.COMPLETE)
 
     def begin_run(self) -> dict[str, Any]:
         """Consume this workspace once, before any CATMAID mutation."""
 
         def mutate(state):
-            if state["run"]["status"] != "pending":
+            if state["run"]["status"] != OperationStatus.PENDING:
                 raise InvalidInputError("This workspace has already been run; retries and resume are unsupported")
-            state["run"] = {"status": "running"}
-            state["status"] = "in_progress"
+            state["run"] = {"status": OperationStatus.RUNNING}
+            state["status"] = ImportStatus.IN_PROGRESS
         return self._mutate(mutate)
 
     def finish_run(self) -> dict[str, Any]:
 
         def mutate(state):
-            if state["run"]["status"] != "running":
+            if state["run"]["status"] != OperationStatus.RUNNING:
                 raise InvalidInputError("Import completion requires an active run")
-            if state["phases"]["verification"]["status"] != "complete":
+            if state["phases"]["verification"]["status"] != OperationStatus.COMPLETE:
                 raise ImmutableStateError("Import completion requires final verification")
-            state["run"] = {"status": "complete"}
+            state["run"] = {"status": OperationStatus.COMPLETE}
             self._derive_status(state)
         return self._mutate(mutate)
 
@@ -651,17 +658,17 @@ class StateStore:
         """Retain confirmed progress and expose the first failed attempt."""
         with self._mutation_lock():
             state = self.load()
-            if state["run"]["status"] != "running":
+            if state["run"]["status"] != OperationStatus.RUNNING:
                 return state
-            state["run"] = {"status": "failed", "reason": reason}
-            state["status"] = "failed"
+            state["run"] = {"status": OperationStatus.FAILED, "reason": reason}
+            state["status"] = ImportStatus.FAILED
             for item in [state["project"], *state["batches"]]:
-                if item["status"] == "prepared":
-                    item["status"] = "failed"
+                if item["status"] == DatabaseStatus.PREPARED:
+                    item["status"] = DatabaseStatus.FAILED
                     item["reason"] = reason
             for item in state["phases"].values():
-                if item["status"] == "running":
-                    item["status"] = "failed"
+                if item["status"] == OperationStatus.RUNNING:
+                    item["status"] = OperationStatus.FAILED
                     item["reason"] = reason
             self._persist(state)
             return copy.deepcopy(state)
@@ -675,7 +682,10 @@ class StateStore:
             return copy.deepcopy(state)
 
     def _assert_mutations_allowed(self) -> None:
-        if self.state_path.is_file() and self.load()["run"]["status"] in {"failed", "complete"}:
+        if (
+            self.state_path.is_file()
+            and self.load()["run"]["status"] in {OperationStatus.FAILED, OperationStatus.COMPLETE}
+        ):
             raise InvalidInputError("This import attempt is terminal; the workspace cannot be reused")
 
     def _normalize_request(
@@ -834,53 +844,61 @@ class StateStore:
             raise ImmutableStateError(f"Cannot change reserved {key}")
         target[key] = value
 
-    def _validate_database_transition(self, label: str, current: str, requested: str) -> None:
-        if requested not in {"planned": {"prepared"}, "prepared": {"committed"}}.get(current, set()):
+    def _validate_database_transition(
+        self, label: str, current: DatabaseStatus | str, requested: DatabaseStatus
+    ) -> None:
+        allowed = {
+            DatabaseStatus.PLANNED: {DatabaseStatus.PREPARED},
+            DatabaseStatus.PREPARED: {DatabaseStatus.COMMITTED},
+        }
+        if requested not in allowed.get(current, set()):
             raise ImmutableStateError(f"Invalid {label} transition: {current} -> {requested}")
 
     def _validate_phase_prerequisite(
         self, state: Mapping[str, Any], phase: str
     ) -> None:
         if phase == "database_maintenance":
-            if any(batch["status"] != "committed" for batch in state["batches"]):
+            if any(batch["status"] != DatabaseStatus.COMMITTED for batch in state["batches"]):
                 raise ImmutableStateError(
                     "Database maintenance cannot start before every batch commits"
                 )
         elif phase == "cache":
-            if state["phases"]["database_maintenance"]["status"] != "complete":
+            if state["phases"]["database_maintenance"]["status"] != OperationStatus.COMPLETE:
                 raise ImmutableStateError(
                     "Cache generation cannot start before database maintenance completes"
                 )
         elif phase == "verification":
-            if state["phases"]["cache"]["status"] != "complete":
+            if state["phases"]["cache"]["status"] != OperationStatus.COMPLETE:
                 raise ImmutableStateError(
                     "Verification cannot start before cache generation completes"
                 )
 
     def _derive_status(self, state: dict[str, Any]) -> None:
-        if state["run"]["status"] == "failed":
-            state["status"] = "failed"
+        if state["run"]["status"] == OperationStatus.FAILED:
+            state["status"] = ImportStatus.FAILED
             return
         project_status = state["project"]["status"]
-        if project_status != "committed":
+        if project_status != DatabaseStatus.COMMITTED:
             state["status"] = (
-                "planned" if project_status == "planned" else "project_in_progress"
+                ImportStatus.PLANNED
+                if project_status == DatabaseStatus.PLANNED
+                else ImportStatus.PROJECT_IN_PROGRESS
             )
             return
-        if any(batch["status"] != "committed" for batch in state["batches"]):
-            state["status"] = "database_in_progress"
+        if any(batch["status"] != DatabaseStatus.COMMITTED for batch in state["batches"]):
+            state["status"] = ImportStatus.DATABASE_IN_PROGRESS
             return
-        state["status"] = "database_complete"
-        if state["phases"]["database_maintenance"]["status"] != "complete":
+        state["status"] = ImportStatus.DATABASE_COMPLETE
+        if state["phases"]["database_maintenance"]["status"] != OperationStatus.COMPLETE:
             return
-        state["status"] = "maintenance_complete"
-        if state["phases"]["cache"]["status"] != "complete":
+        state["status"] = ImportStatus.MAINTENANCE_COMPLETE
+        if state["phases"]["cache"]["status"] != OperationStatus.COMPLETE:
             return
-        state["status"] = "cache_complete"
-        if state["phases"]["verification"]["status"] == "complete":
+        state["status"] = ImportStatus.CACHE_COMPLETE
+        if state["phases"]["verification"]["status"] == OperationStatus.COMPLETE:
             state["status"] = (
-                "complete" if state["project"].get("mode") == "existing"
-                else "ready_for_publication"
+                ImportStatus.COMPLETE if state["project"].get("mode") == "existing"
+                else ImportStatus.READY_FOR_PUBLICATION
             )
 
 
