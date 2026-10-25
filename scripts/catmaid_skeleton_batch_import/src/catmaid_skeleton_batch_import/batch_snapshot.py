@@ -75,6 +75,9 @@ class BatchSnapshotReader:
                 raise ImmutableStateError("Batch snapshot is missing; restore the retained state files") from exc
             if not valid:
                 raise ImmutableStateError("Batch snapshot bytes differ from the immutable plan")
+            # Release the previous batch before allocating the next batch's nodes.
+            self.members.clear()
+            self.batch_index = None
             expected = {m.member_path: m for m in self.plan.batches[member.batch_index - 1].members}
             decoded = {}
             try:

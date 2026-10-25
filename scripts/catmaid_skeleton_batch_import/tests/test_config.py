@@ -31,6 +31,14 @@ def test_request_is_strict_and_normalized(tmp_path: Path) -> None:
     assert request.to_dict()["target"] == {"project_id": 123}
 
 
+@pytest.mark.parametrize("unit", [[], ["um"], {}, {"unit": "um"}])
+def test_coordinate_unit_rejects_non_string_json_values(tmp_path: Path, unit) -> None:
+    path = tmp_path / "request.json"
+    write_request(path, coordinate_unit=unit)
+    with pytest.raises(InvalidInputError, match="coordinate_unit must be"):
+        load_request(path)
+
+
 @pytest.mark.parametrize("source_overrides", [
     {"coordinate_scale_nm": [1, 1, 1]},
     {"external_skeleton_id_map_path": "mapping.csv"},

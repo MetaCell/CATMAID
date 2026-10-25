@@ -1,4 +1,6 @@
+import gc
 import json
+import weakref
 from io import BytesIO
 from dataclasses import replace
 from zipfile import ZipFile
@@ -44,6 +46,32 @@ def test_plan_retains_exact_validated_nodes_in_two_bounded_batches(tmp_path, mon
     with pytest.raises(InvalidInputError, match="already contains"):
         plan_ingestion(request, state)
     assert (state / "state.json").read_bytes() == original
+
+
+def test_reader_releases_previous_batch_before_decoding_next_snapshot(tmp_path, monkeypatch):
+    state, plan, text, _ = planned(tmp_path, monkeypatch)
+    expected = parse_swc(BytesIO(text), "expected").nodes
+    decode = json.loads
+
+    with BatchSnapshotReader(state, plan) as reader:
+        reader.load(plan.batches[0].members[0])
+        previous_nodes = [
+            weakref.ref(node) for nodes in reader.members.values() for node in nodes
+        ]
+        assert previous_nodes and all(node() is not None for node in previous_nodes)
+
+        def decode_next(line):
+            gc.collect()
+            assert all(node() is None for node in previous_nodes)
+            return decode(line)
+
+        with patch(
+            "catmaid_skeleton_batch_import.batch_snapshot.json.loads",
+            side_effect=decode_next,
+        ) as decoder:
+            assert reader.load(plan.batches[1].members[0]) == expected
+
+        decoder.assert_called_once()
 
 
 def test_snapshot_tampering_fails_before_values_are_used(tmp_path, monkeypatch):

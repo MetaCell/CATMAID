@@ -73,7 +73,7 @@ def load_request(path: Path) -> IngestionRequest:
     if not isinstance(archive_value, str) or not archive_value.strip():
         raise InvalidInputError("request.source.archive_path must be a non-empty string")
     unit = source["coordinate_unit"]
-    if unit not in {"nm", "um"}:
+    if not isinstance(unit, str) or unit not in {"nm", "um"}:
         raise InvalidInputError("request.source.coordinate_unit must be 'nm' or 'um'")
     return IngestionRequest(
         schema_version=1,

@@ -5,6 +5,8 @@ import zipfile
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
 from helpers import write_stack_snapshot
 
 from catmaid_skeleton_batch_import import cli, orchestrator
@@ -56,6 +58,28 @@ def test_argument_error_has_stable_versioned_json(capsys) -> None:
     assert result["ok"] is False
     assert result["command"] is None
     assert result["error"]["category"] == "invalid_input"
+
+
+@pytest.mark.parametrize("unit", [["um"], {"unit": "um"}])
+def test_invalid_coordinate_unit_reports_invalid_input(tmp_path: Path, capsys, unit):
+    request = tmp_path / "request.json"
+    state_dir = tmp_path / "state"
+    atomic_write_json(request, {
+        "schema_version": 1,
+        "source": {"archive_path": str(tmp_path / "input.zip"), "coordinate_unit": unit},
+        "target": {"project_id": 123},
+    })
+
+    exit_code = cli.execute([
+        "preflight", "--request", str(request), "--state-dir", str(state_dir),
+    ])
+
+    result = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert result["ok"] is False
+    assert result["error"]["category"] == "invalid_input"
+    assert "coordinate_unit must be" in result["error"]["message"]
+    assert json.loads((state_dir / "result.json").read_text()) == result
 
 
 def test_cache_recovery_flag_is_rejected(capsys):
