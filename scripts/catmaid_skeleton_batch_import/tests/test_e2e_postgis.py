@@ -40,7 +40,7 @@ def test_database_preflight_does_not_inspect_migration_history(isolated_database
     (0, (120, 260, 420)), (1, (120, 320, 360)), (2, (220, 260, 320)),
 ])
 def test_append_preflight_reads_translated_oriented_stack_bounds_from_postgres(
-    tmp_path, isolated_database, orientation, maximum,
+    tmp_path, isolated_database, existing_project_factory, orientation, maximum,
 ):
     from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, preflight_ingestion, run_ingestion
 
@@ -50,9 +50,8 @@ def test_append_preflight_reads_translated_oriented_stack_bounds_from_postgres(
     with zipfile.ZipFile(archive, "w") as source:
         source.writestr("seed.swc", "1 1 1 1 1 -1 -1\n")
     path = seed / "request.json"
-    path.write_text(json.dumps({"schema_version": 1, "source": {
-        "archive_path": str(archive), "coordinate_unit": "nm"},
-        "stack": {"dimension": [10, 20, 30], "resolution_nm": [2, 3, 4]}}))
+    path.write_text(json.dumps({'schema_version': 1, 'source': {'archive_path': str(archive), 'coordinate_unit': 'nm'}, 'target': {'project_id': existing_project_factory(dimension=(10, 20, 30), resolution_nm=(2, 3, 4))}}))
+    preflight_ingestion(path, seed / "state")
     plan_ingestion(path, seed / "state")
     project = run_ingestion(seed / "state")
     with isolated_database.cursor() as cursor:
@@ -90,7 +89,7 @@ def test_append_preflight_reads_translated_oriented_stack_bounds_from_postgres(
     (2, (50000, 20000, -10000)),
 ])
 def test_negative_append_coordinates_are_planned_loaded_verified_and_cached(
-    tmp_path, isolated_database, coordinate_unit, orientation, maximum,
+    tmp_path, isolated_database, existing_project_factory, coordinate_unit, orientation, maximum,
 ):
     import msgpack
     from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, preflight_ingestion, run_ingestion
@@ -101,9 +100,8 @@ def test_negative_append_coordinates_are_planned_loaded_verified_and_cached(
     with zipfile.ZipFile(archive, "w") as source:
         source.writestr("existing.swc", "1 1 1 1 1 -1 -1\n")
     path = seed / "request.json"
-    path.write_text(json.dumps({"schema_version": 1, "source": {
-        "archive_path": str(archive), "coordinate_unit": "nm"},
-        "stack": {"dimension": [20, 40, 60], "resolution_nm": [1000] * 3}}))
+    path.write_text(json.dumps({'schema_version': 1, 'source': {'archive_path': str(archive), 'coordinate_unit': 'nm'}, 'target': {'project_id': existing_project_factory(dimension=(20, 40, 60))}}))
+    preflight_ingestion(path, seed / "state")
     plan_ingestion(path, seed / "state")
     project_id = run_ingestion(seed / "state")["project_id"]
     with isolated_database.cursor() as cursor:
@@ -177,10 +175,10 @@ def test_negative_append_coordinates_are_planned_loaded_verified_and_cached(
 
 
 @pytest.mark.parametrize("coordinate_unit", ["nm", "um"])
-@pytest.mark.parametrize("existing_project", [False, True])
+@pytest.mark.parametrize("populated", [False, True])
 @pytest.mark.parametrize("fail_singleton", [False, True])
 def test_single_node_import_is_atomic_and_cached(
-    tmp_path, monkeypatch, isolated_database, coordinate_unit, existing_project, fail_singleton,
+    tmp_path, monkeypatch, isolated_database, existing_project_factory, coordinate_unit, populated, fail_singleton,
 ):
     import msgpack
     from catmaid_skeleton_batch_import import materialization
@@ -192,7 +190,7 @@ def test_single_node_import_is_atomic_and_cached(
     monkeypatch.setenv("CATMAID_BATCH_IMPORT_MAX_NODES_PER_BATCH", "2")
     ordinary = "1 1 10 20 30 -1 -1 # root\n2 3 11 20 30 1 1 # child\n"
 
-    def workspace(name, members, project_id=None):
+    def workspace(name, members, project_id):
         directory = tmp_path / name
         directory.mkdir()
         archive = directory / "input.zip"
@@ -201,21 +199,16 @@ def test_single_node_import_is_atomic_and_cached(
                 source.writestr(member, content)
         request = {"schema_version": 1, "source": {
             "archive_path": str(archive), "coordinate_unit": coordinate_unit}}
-        if project_id is None:
-            request["stack"] = {"dimension": [100, 100, 100], "resolution_nm": [1000] * 3}
-        else:
-            request["target"] = {"project_id": project_id}
+        request["target"] = {"project_id": project_id}
         path = directory / "request.json"
         path.write_text(json.dumps(request))
-        if project_id is not None:
-            preflight_ingestion(path, directory / "state")
+        preflight_ingestion(path, directory / "state")
         plan_ingestion(path, directory / "state")
         return directory / "state"
 
-    seed_id = None
-    if existing_project:
-        seed = run_ingestion(workspace("seed", {"existing.swc": ordinary}))
-        seed_id = seed["project_id"]
+    seed_id = existing_project_factory()
+    if populated:
+        run_ingestion(workspace("seed", {"existing.swc": ordinary}, seed_id))
     point = ("73 1 1.25 2.5 3.75 0.5 -1 # point soma\n" if coordinate_unit == "um"
              else "73 1 1250 2500 3750 500 -1 # point soma\n")
     state_dir = workspace("import", {"alpha.swc": ordinary, "point.swc": point}, seed_id)
@@ -244,7 +237,7 @@ def test_single_node_import_is_atomic_and_cached(
     project_id = state["project"]["project_id"]
     maps_before = [batch["artifacts"]["node_map"] for batch in state["batches"]]
     assert [item["count"] for item in maps_before] == [2, 1]
-    assert result["status"] == ("complete" if existing_project else "ready_for_publication")
+    assert result["status"] == "complete"
     assert result["skeletons"] == 2
     assert result["nodes"] == 3
     point_row = next(row for row in read_manifest(Path(result["manifest"]))
@@ -279,11 +272,11 @@ def test_single_node_import_is_atomic_and_cached(
 
 
 def test_known_rollback_preserves_prior_batch_and_is_terminal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_database,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_database, existing_project_factory,
 ) -> None:
     from catmaid_skeleton_batch_import import materialization
     from catmaid_skeleton_batch_import.errors import OperationalFailureError
-    from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, run_ingestion
+    from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, preflight_ingestion, run_ingestion
     from catmaid_skeleton_batch_import.state import StateStore
 
     archive_path = tmp_path / "skeletons.zip"
@@ -299,22 +292,13 @@ def test_known_rollback_preserves_prior_batch_and_is_terminal(
     request_path = tmp_path / "request.json"
     request_path.write_text(
         json.dumps(
-            {
-                "schema_version": 1,
-                "source": {
-                    "archive_path": str(archive_path),
-                    "coordinate_unit": "um",
-                },
-                "stack": {
-                    "dimension": [100, 100, 100],
-                    "resolution_nm": [1000, 1000, 1000],
-                },
-            }
+            {'schema_version': 1, 'source': {'archive_path': str(archive_path), 'coordinate_unit': 'um'}, 'target': {'project_id': existing_project_factory()}}
         ),
         encoding="utf-8",
     )
     state_dir = tmp_path / "state"
     monkeypatch.setenv("CATMAID_BATCH_IMPORT_MAX_NODES_PER_BATCH", "3")
+    preflight_ingestion(request_path, state_dir)
     plan_ingestion(request_path, state_dir)
 
     original = materialization.materialize_and_verify_batch
@@ -359,7 +343,7 @@ def test_known_rollback_preserves_prior_batch_and_is_terminal(
 
 
 def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_caches(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_database,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_database, existing_project_factory,
 ) -> None:
     from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, preflight_ingestion, run_ingestion
     from guardian.models import UserObjectPermission, GroupObjectPermission
@@ -376,14 +360,10 @@ def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_c
             source.writestr(name + ".swc", "1 1 1 1 1 0.5 -1\n2 3 2 1 1 -1 1\n")
         value = {"schema_version": 1, "source": {
             "archive_path": str(archive), "coordinate_unit": "um"}}
-        if target is None:
-            value["stack"] = {"dimension": [100, 100, 100], "resolution_nm": [1000] * 3}
-        else:
-            value["target"] = {"project_id": target}
+        value["target"] = {"project_id": existing_project_factory() if target is None else target}
         path = directory / "request.json"
         path.write_text(json.dumps(value))
-        if target is not None:
-            preflight_ingestion(path, directory / "state")
+        preflight_ingestion(path, directory / "state")
         plan_ingestion(path, directory / "state")
         return directory / "state"
 
@@ -445,7 +425,7 @@ def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_c
     after = snapshot()
     assert result["status"] == "complete"
     assert result["project_id"] == pid
-    assert result["stack_id"] is None
+    assert result.get("stack_id") is None
     assert after[:3] == before[:3]
     assert after[4:] == before[4:]
     assert old_derived_rows() == old_derived
@@ -503,13 +483,13 @@ def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_c
 
 
 def test_micrometre_rounding_regression_completes_import_and_final_cache_verification(
-    tmp_path, monkeypatch, isolated_database, micrometre_zigzag_swc,
+    tmp_path, monkeypatch, isolated_database, existing_project_factory, micrometre_zigzag_swc,
 ):
     import math
 
     from catmaid_skeleton_batch_import.artifacts import read_manifest
     from catmaid_skeleton_batch_import.offline_cache import OfflineGridCache
-    from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, run_ingestion
+    from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, preflight_ingestion, run_ingestion
     from catmaid_skeleton_batch_import.state import StateStore
 
     monkeypatch.setenv("CATMAID_BATCH_IMPORT_MAX_NODES_PER_BATCH", "250000")
@@ -517,12 +497,9 @@ def test_micrometre_rounding_regression_completes_import_and_final_cache_verific
     with zipfile.ZipFile(archive, "w") as output:
         output.writestr("zigzag.swc", micrometre_zigzag_swc)
     request_path = tmp_path / "request.json"
-    request_path.write_text(json.dumps({
-        "schema_version": 1,
-        "source": {"archive_path": str(archive), "coordinate_unit": "um"},
-        "stack": {"dimension": [17797, 30801, 10826], "resolution_nm": [350, 350, 1000]},
-    }))
+    request_path.write_text(json.dumps({'schema_version': 1, 'source': {'archive_path': str(archive), 'coordinate_unit': 'um'}, 'target': {'project_id': existing_project_factory(dimension=(17797, 30801, 10826), resolution_nm=(350, 350, 1000))}}))
     state_dir = tmp_path / "state"
+    preflight_ingestion(request_path, state_dir)
     assert plan_ingestion(request_path, state_dir)["nodes"] == 10001
     verification_phases = []
     original_verify = OfflineGridCache.verify
@@ -536,7 +513,7 @@ def test_micrometre_rounding_regression_completes_import_and_final_cache_verific
     monkeypatch.setattr(OfflineGridCache, "verify", verify)
     result = run_ingestion(state_dir)
 
-    assert result["status"] == "ready_for_publication"
+    assert result["status"] == "complete"
     assert verification_phases == ["running"]
     manifest = read_manifest(Path(result["manifest"]))[0]
     with isolated_database.cursor() as cursor:

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Callable, Iterator, Sequence, TextIO
 
 from .artifacts import NODE_MAP_FIELDS
-from .domain import ImportSettings, IngestionRequest, PlannedBatch, PlannedMember, SwcNode
+from .domain import IngestionRequest, PlannedBatch, PlannedMember, SwcNode
 from .errors import InvalidInputError, VerificationError
 from .fragments import fragment_annotation_name
 
@@ -19,25 +19,20 @@ from .fragments import fragment_annotation_name
 @dataclass(frozen=True)
 class ProjectContext:
     project_id: int
-    stack_id: int | None
-    project_stack_id: int | None
     user_id: int
     neuron_class_id: int
     skeleton_class_id: int
     model_of_relation_id: int
     annotation_class_id: int
     annotated_with_relation_id: int
-    existing_project: bool = False
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> "ProjectContext":
-        fields = {
-            field: None if value[field] is None else int(value[field])
-            for field in cls.__dataclass_fields__ if field != "existing_project"
-        }
-        return cls(**fields, existing_project=bool(value["existing_project"]))
+        return cls(**{
+            field: int(value[field]) for field in cls.__dataclass_fields__
+        })
 
-    def to_dict(self) -> dict[str, int | bool | None]:
+    def to_dict(self) -> dict[str, int]:
         return {
             field: getattr(self, field)
             for field in self.__dataclass_fields__
@@ -403,7 +398,9 @@ def verify_exact_treenodes(cursor: object, prepared: PreparedBatch) -> None:
 def execute_batch_transaction(
     prepared: PreparedBatch,
     project: ProjectContext,
-    settings: ImportSettings,
+    *,
+    statement_timeout_ms: int,
+    lock_timeout_ms: int,
     record_timing: Callable[[str, float, dict[str, int]], None] | None = None,
 ) -> dict[str, int]:
     """COPY, materialize and validate one batch in a single atomic transaction."""
@@ -425,10 +422,10 @@ def execute_batch_transaction(
             cursor.execute(
                 "SELECT set_config('statement_timeout', %s, true), "
                 "set_config('lock_timeout', %s, true)",
-                [str(settings.statement_timeout_ms), str(settings.lock_timeout_ms)],
+                [str(statement_timeout_ms), str(lock_timeout_ms)],
             )
-            # Both target modes use the same offline bulk path. Only this
-            # transaction bypasses triggers; other database sessions are unchanged.
+            # Only this bulk transaction bypasses ordinary triggers;
+            # other database sessions are unchanged.
             cursor.execute("SET LOCAL session_replication_role = replica")
             copy_start = time.monotonic()
             _copy_file(

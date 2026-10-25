@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from helpers import write_stack_snapshot
+
 from catmaid_skeleton_batch_import.archive import scan_archive
 from catmaid_skeleton_batch_import.domain import ImportSettings, IngestionRequest
 from catmaid_skeleton_batch_import.errors import InvalidInputError
@@ -19,28 +21,11 @@ VALID_SWC = b"1 1 0 0 0 -1 -1\n2 3 3 4 0 2 1\n"
 
 
 def request(archive: Path) -> IngestionRequest:
-    return IngestionRequest(
-        schema_version=1,
-        archive_path=archive,
-        coordinate_unit="um",
-        dimension=(10, 20, 30),
-        resolution_nm=(1000.0, 1000.0, 1000.0),
-    )
+    return IngestionRequest(schema_version=1, archive_path=archive, coordinate_unit='um', target_project_id=123)
 
 
 def settings(**overrides: int | None) -> ImportSettings:
-    values = {
-        "max_nodes_per_batch": 10,
-        "max_archive_bytes": 1_000_000,
-        "max_swc_bytes": 100_000,
-        "max_total_nodes": None,
-        "cache_cell_size_nm": 1_500_000,
-        "lod_levels": 7,
-        "lod_bucket_size": 500,
-        "lod_strategy": "quadratic",
-        "statement_timeout_ms": 0,
-        "lock_timeout_ms": 30_000,
-    }
+    values = {'max_nodes_per_batch': 10, 'max_archive_bytes': 1000000, 'max_swc_bytes': 100000, 'max_total_nodes': None}
     values.update(overrides)
     return ImportSettings(**values)  # type: ignore[arg-type]
 
@@ -57,7 +42,7 @@ def test_scan_archive_hashes_parses_and_preserves_exact_member_paths(tmp_path: P
         archive,
         [("z/cell.swc", VALID_SWC), ("notes.txt", b"ignored"), ("a.swc", VALID_SWC)],
     )
-    scanned = scan_archive(request(archive), settings())
+    scanned = scan_archive(request(archive), settings(), bounds_nm=(((0, 0, 0), (10000, 20000, 30000)),))
 
     assert scanned.archive_sha256 == hashlib.sha256(archive.read_bytes()).hexdigest()
     assert [member.member_path for member in scanned.members] == ["a.swc", "z/cell.swc"]
@@ -68,18 +53,18 @@ def test_scan_archive_hashes_parses_and_preserves_exact_member_paths(tmp_path: P
 
 def test_rejects_non_file_and_invalid_zip(tmp_path: Path) -> None:
     with pytest.raises(InvalidInputError, match="regular file"):
-        scan_archive(request(tmp_path), settings())
+        scan_archive(request(tmp_path), settings(), bounds_nm=(((0, 0, 0), (10000, 20000, 30000)),))
     invalid = tmp_path / "invalid.zip"
     invalid.write_bytes(b"not a zip")
     with pytest.raises(InvalidInputError, match="Could not read SWC archive"):
-        scan_archive(request(invalid), settings())
+        scan_archive(request(invalid), settings(), bounds_nm=(((0, 0, 0), (10000, 20000, 30000)),))
 
 
 def test_trims_fragment_identifier_but_preserves_member_path_and_display_name(tmp_path: Path) -> None:
     archive = tmp_path / "cells.zip"
     path = "folder/ \t0021814 \u2003.swc"
     write_zip(archive, [(path, VALID_SWC)])
-    scanned = scan_archive(request(archive), settings())
+    scanned = scan_archive(request(archive), settings(), bounds_nm=(((0, 0, 0), (10000, 20000, 30000)),))
     assert scanned.members[0].member_path == path
     assert scanned.members[0].display_name == " \t0021814 \u2003"
     assert scanned.members[0].fragment_id == "0021814"
@@ -91,7 +76,7 @@ def test_rejects_duplicate_member_paths(tmp_path: Path) -> None:
         warnings.simplefilter("ignore", UserWarning)
         write_zip(archive, [("same.swc", VALID_SWC), ("same.swc", VALID_SWC)])
     with pytest.raises(InvalidInputError, match="duplicate member path"):
-        scan_archive(request(archive), settings())
+        scan_archive(request(archive), settings(), bounds_nm=(((0, 0, 0), (10000, 20000, 30000)),))
 
 
 def test_rejects_nonregular_swc_member(tmp_path: Path) -> None:
@@ -101,7 +86,7 @@ def test_rejects_nonregular_swc_member(tmp_path: Path) -> None:
     info.external_attr = (stat.S_IFLNK | 0o777) << 16
     write_zip(archive, [(info, b"target")])
     with pytest.raises(InvalidInputError, match="not a regular file"):
-        scan_archive(request(archive), settings())
+        scan_archive(request(archive), settings(), bounds_nm=(((0, 0, 0), (10000, 20000, 30000)),))
 
 
 def test_rejects_encrypted_member_before_opening(tmp_path: Path) -> None:
@@ -117,7 +102,7 @@ def test_rejects_encrypted_member_before_opening(tmp_path: Path) -> None:
     archive.write_bytes(data)
 
     with pytest.raises(InvalidInputError, match="encrypted member"):
-        scan_archive(request(archive), settings())
+        scan_archive(request(archive), settings(), bounds_nm=(((0, 0, 0), (10000, 20000, 30000)),))
 
 
 @pytest.mark.parametrize(
@@ -135,7 +120,7 @@ def test_enforces_deployment_limits(
     archive = tmp_path / "limits.zip"
     write_zip(archive, [("a.swc", VALID_SWC), ("b.swc", VALID_SWC)])
     with pytest.raises(InvalidInputError, match=message):
-        scan_archive(request(archive), settings(**overrides))
+        scan_archive(request(archive), settings(**overrides), bounds_nm=(((0, 0, 0), (10000, 20000, 30000)),))
 
 
 def test_archive_ignores_directories_and_non_swc_files(tmp_path: Path) -> None:
@@ -146,7 +131,7 @@ def test_archive_ignores_directories_and_non_swc_files(tmp_path: Path) -> None:
         archive,
         [(directory, b""), ("readme.md", b"metadata"), ("real.SWC", VALID_SWC)],
     )
-    scanned = scan_archive(request(archive), settings())
+    scanned = scan_archive(request(archive), settings(), bounds_nm=(((0, 0, 0), (10000, 20000, 30000)),))
     assert [member.member_path for member in scanned.members] == ["real.SWC"]
 
 
@@ -159,7 +144,7 @@ def test_reports_each_invalid_member_without_stopping_at_the_first(tmp_path: Pat
         ("valid.swc", VALID_SWC),
     ])
     with pytest.raises(InvalidInputError) as failure:
-        scan_archive(request(archive), settings())
+        scan_archive(request(archive), settings(), bounds_nm=(((0, 0, 0), (10000, 20000, 30000)),))
     details = failure.value.details
     assert details["invalid_swc_count"] == 3
     assert [error["member_path"] for error in details["member_errors"]] == [
@@ -185,12 +170,12 @@ def test_planning_reports_all_members_with_negative_coordinates(tmp_path: Path) 
     path = tmp_path / "request.json"
     path.write_text(json.dumps(request(archive).to_dict()))
     state_dir = tmp_path / "state"
+    write_stack_snapshot(state_dir, dimension=(10, 20, 30), resolution_nm=(1000, 1000, 1000))
     with pytest.raises(InvalidInputError) as failure:
         plan_ingestion(path, state_dir)
     errors = failure.value.details["member_errors"]
     assert [item["member_path"] for item in errors] == ["x.swc", "y.swc", "z.swc"]
-    assert all(f"{axis} must be non-negative" in item["message"]
-               for axis, item in zip("xyz", errors))
+    assert all("outside all associated target stack bounds" in item["message"] for item in errors)
     assert not (state_dir / "state.json").exists()
 
 
@@ -202,7 +187,7 @@ def test_planning_reports_all_members_beyond_declared_stack_without_a_partial_pl
     archive = tmp_path / "outside.zip"
     ingestion_request = replace(request(archive), coordinate_unit=unit)
     members = [("valid.swc", VALID_SWC)]
-    for axis, extent in enumerate(ingestion_request.max_nm):
+    for axis, extent in enumerate((10000, 20000, 30000)):
         coordinates = ["0", "0", "0"]
         coordinates[axis] = str((extent + 1) / ingestion_request.scale_nm)
         content = ("# header\n1 1 " + " ".join(coordinates) + " -1 -1\n").encode()
@@ -211,6 +196,7 @@ def test_planning_reports_all_members_beyond_declared_stack_without_a_partial_pl
     path = tmp_path / "request.json"
     path.write_text(json.dumps(ingestion_request.to_dict()))
     state_dir = tmp_path / "state"
+    write_stack_snapshot(state_dir, dimension=(10, 20, 30), resolution_nm=(1000, 1000, 1000))
 
     with pytest.raises(InvalidInputError) as failure:
         plan_ingestion(path, state_dir)
@@ -218,8 +204,8 @@ def test_planning_reports_all_members_beyond_declared_stack_without_a_partial_pl
     assert failure.value.details["invalid_swc_count"] == 3
     assert [item["member_path"] for item in errors] == ["x.swc", "y.swc", "z.swc"]
     for axis, item in zip("xyz", errors):
-        assert f"outside.zip:{axis}.swc:2: {axis} coordinate" in item["message"]
-        assert "exceeds declared stack extent" in item["message"]
+        assert f"outside.zip:{axis}.swc:2: point" in item["message"]
+        assert "outside all associated target stack bounds" in item["message"]
     assert not (state_dir / "plan.jsonl.gz").exists()
     assert not (state_dir / "state.json").exists()
 
@@ -227,9 +213,9 @@ def test_planning_reports_all_members_beyond_declared_stack_without_a_partial_pl
 def test_append_requires_resolved_target_stack_bounds(tmp_path):
     archive_path = tmp_path / "append.zip"
     write_zip(archive_path, [("cell.swc", b"1 1 1000000000 0 0 -1 -1\n")])
-    ingestion_request = IngestionRequest(1, archive_path, "um", target_project_id=123)
+    ingestion_request = IngestionRequest(1, archive_path, 'um', target_project_id=123)
     with pytest.raises(InvalidInputError, match="requires associated target stack bounds"):
-        scan_archive(ingestion_request, settings())
+        scan_archive(ingestion_request, settings(), bounds_nm=())
     with pytest.raises(InvalidInputError, match="outside all associated target stack bounds"):
         scan_archive(ingestion_request, settings(), bounds_nm=(((0, 0, 0), (1000, 1000, 1000)),))
 
@@ -245,7 +231,7 @@ def test_reports_member_metadata_errors_and_fragment_collisions_together(tmp_pat
         ("oversize.swc", b"#" * 100),
     ])
     with pytest.raises(InvalidInputError) as failure:
-        scan_archive(request(archive), settings(max_swc_bytes=90))
+        scan_archive(request(archive), settings(max_swc_bytes=90), bounds_nm=(((0, 0, 0), (10000, 20000, 30000)),))
     errors = {item["member_path"]: item["message"]
               for item in failure.value.details["member_errors"]}
     assert len(errors) == failure.value.details["invalid_swc_count"] == 5
@@ -271,7 +257,7 @@ def test_scan_and_plan_do_not_limit_files_to_the_batch_node_budget(tmp_path):
     from catmaid_skeleton_batch_import.planner import plan_archive
     archive = tmp_path / "many-small.swc.zip"
     write_zip(archive, [(f"{i}.swc", VALID_SWC) for i in range(101)])
-    scanned = scan_archive(request(archive), settings(max_nodes_per_batch=10))
+    scanned = scan_archive(request(archive), settings(max_nodes_per_batch=10), bounds_nm=(((0, 0, 0), (10000, 20000, 30000)),))
     plan = plan_archive(scanned, settings(max_nodes_per_batch=10))
     assert scanned.swc_count == 101
     assert plan.member_count == 101

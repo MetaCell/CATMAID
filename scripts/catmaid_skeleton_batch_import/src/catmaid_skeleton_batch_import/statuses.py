@@ -28,12 +28,10 @@ class ImportStatus(_Status):
     """Overall ingestion progress exposed in state and command results."""
     PLANNED = "planned"
     IN_PROGRESS = "in_progress"
-    PROJECT_IN_PROGRESS = "project_in_progress"
     DATABASE_IN_PROGRESS = "database_in_progress"
     DATABASE_COMPLETE = "database_complete"
     MAINTENANCE_COMPLETE = "maintenance_complete"
     CACHE_COMPLETE = "cache_complete"
-    READY_FOR_PUBLICATION = "ready_for_publication"
     COMPLETE = "complete"
     FAILED = "failed"
 

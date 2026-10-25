@@ -52,12 +52,6 @@ class Cursor:
             self.row = (len(c.cells[params[-1]]), c.invalid)
         elif "SELECT count(*)" in sql:
             self.row = (len(c.cells[params[0]]),)
-        elif "INSERT INTO node_grid_cache" in sql:
-            c.grids.append(grid(n_lod_levels=params[4], lod_min_bucket_size=params[5],
-                                lod_strategy=params[6], cell_width=params[1],
-                                cell_height=params[2], cell_depth=params[3],
-                                has_json_data=False, has_json_text_data=False))
-            c.cells[11] = set()
 
     def fetchone(self):
         return self.row
@@ -142,16 +136,6 @@ def test_project_without_grids_needs_no_cache_or_extent_queries():
     cache = tracker(connection)
     assert cache.verify(cache.rebuild())["grid_count"] == 0
     assert not any("DELETE" in sql or "FROM treenode" in sql for sql, _ in connection.statements)
-
-
-def test_default_grid_is_only_created_when_explicitly_requested_for_a_new_project():
-    connection = Connection()
-    cache = tracker(connection)
-    cache.ensure_import_grid(cell_size_nm=100, lod_levels=3, lod_bucket_size=500, lod_strategy="linear")
-    before = copy.deepcopy(connection.grids)
-    cache.ensure_import_grid(cell_size_nm=200, lod_levels=1, lod_bucket_size=100, lod_strategy="linear")
-    assert connection.grids == before
-    assert sum("INSERT INTO node_grid_cache" in s for s, _ in connection.statements) == 1
 
 
 def test_failed_rebuild_can_restart_without_accepting_partial_payloads(monkeypatch):
@@ -239,7 +223,6 @@ def test_rebuild_passes_original_formats_lod_filters_and_grid_id(monkeypatch):
 def test_invalid_grid_is_rejected_before_loading_any_batches():
     with pytest.raises(VerificationError, match="invalid dimensions"):
         tracker(Connection([grid(cell_width=0)]))
-
 
 
 def test_cache_progress_counts_successful_cells_across_grids_including_empty(monkeypatch):

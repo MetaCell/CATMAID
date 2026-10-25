@@ -28,9 +28,8 @@ from .config import (
     load_operational_settings,
     load_request,
     load_settings,
-    settings_from_state,
 )
-from .domain import ImportSettings, IngestionRequest, PlannedBatch, PlannedMember, SwcNode
+from .domain import IngestionRequest, PlannedBatch, PlannedMember, SwcNode
 from .errors import (
     ImporterError,
     ImmutableStateError,
@@ -50,7 +49,6 @@ from .util import atomic_write_json, load_json, sha256_file
 
 PLAN_FILENAME = "plan.jsonl.gz"
 DATABASE_FILENAME = "database.json"
-PROJECT_RESERVATION_FILENAME = "project-reservation.json"
 PROJECT_CONTEXT_FILENAME = "project-context.json"
 MANIFEST_FILENAME = "manifest.csv.gz"
 VERIFICATION_FILENAME = "verification.json"
@@ -108,19 +106,16 @@ def preflight_ingestion(request_path: Path, state_dir: Path) -> dict[str, object
             raise InvalidInputError("Preflight must run before planning in a new state directory")
         request = load_request(request_path)
         geometry = _append_geometry(request)
-        if geometry is not None:
-            atomic_write_json(store.state_dir / STACK_GEOMETRY_FILENAME, geometry)
+        atomic_write_json(store.state_dir / STACK_GEOMETRY_FILENAME, geometry)
         return _write_result(store.state_dir, _success_result(
-            "preflight", store.state_dir, required=geometry is not None,
+            "preflight", store.state_dir, required=True,
             project_id=request.target_project_id,
-            stack_count=len(geometry["stacks"]) if geometry is not None else 0,
+            stack_count=len(geometry["stacks"]),
         ))
 
 
-def _planning_geometry(request: IngestionRequest, store: StateStore) -> dict[str, Any] | None:
+def _planning_geometry(request: IngestionRequest, store: StateStore) -> dict[str, Any]:
     """Read only the local preflight snapshot; planning must not bootstrap Django."""
-    if request.target_project_id is None:
-        return None
     path = store.state_dir / STACK_GEOMETRY_FILENAME
     if not path.is_file():
         raise InvalidInputError(
@@ -148,9 +143,9 @@ def plan_ingestion(request_path: Path, state_dir: Path) -> dict[str, object]:
         if store.state_path.exists() or (store.state_dir / PLAN_FILENAME).exists():
             raise InvalidInputError("This workspace already contains a planning attempt; use a new state directory")
         request = load_request(request_path)
-        settings = load_settings(use_django=False)
+        settings = load_settings()
         geometry = _planning_geometry(request, store)
-        bounds = geometry_bounds(geometry) if geometry is not None else None
+        bounds = geometry_bounds(geometry)
         _progress(f"Scanning and validating local archive {request.archive_path}")
         started = time.monotonic()
         with tempfile.TemporaryDirectory(prefix=".source-snapshot-", dir=store.state_dir) as staging:
@@ -170,9 +165,8 @@ def plan_ingestion(request_path: Path, state_dir: Path) -> dict[str, object]:
                 store.state_dir, store.state_dir / descriptor["path"], count=batch.node_count)}
             for batch, descriptor in zip(plan.batches, plan.source_snapshots)
         }
-        if geometry is not None:
-            artifacts["stack_geometry"] = artifact_descriptor(
-                store.state_dir, store.state_dir / STACK_GEOMETRY_FILENAME, count=len(geometry["stacks"]))
+        artifacts["stack_geometry"] = artifact_descriptor(
+            store.state_dir, store.state_dir / STACK_GEOMETRY_FILENAME, count=len(geometry["stacks"]))
         metrics = MetricsStore(store.state_dir)
         metrics.initialize(planned_batches=plan.batch_count, planned_nodes=plan.total_nodes,
                            planned_skeletons=plan.member_count)
@@ -277,7 +271,7 @@ def _classified_runtime_error(
 
 
 def _database_context(
-    store: StateStore, state: Mapping[str, Any], *, require_replica_role: bool = True,
+    store: StateStore, state: Mapping[str, Any],
 ) -> tuple[Any, dict[str, Any]]:
     from .database import (
         DatabasePreflightError,
@@ -289,7 +283,7 @@ def _database_context(
         connection = bootstrap_django()
         current = {
             "schema_version": 1,
-            **preflight_database(connection, require_replica_role=require_replica_role),
+            **preflight_database(connection),
         }
     except DatabasePreflightError as exc:
         raise InvalidInputError(f"CATMAID database preflight failed: {exc}") from exc
@@ -303,17 +297,14 @@ def _database_context(
 
     # Bind this run to the database used for append planning before recording
     # its runtime fingerprint.
-    if "stack_geometry" in state.get("artifacts", {}):
-        geometry = _load_registered_json(store, state, "stack_geometry")
-        if geometry["database_target"] != current["target"]:
-            raise ImmutableStateError("Configured CATMAID database differs from append planning")
+    geometry = _load_registered_json(store, state, "stack_geometry")
+    if geometry["database_target"] != current["target"]:
+        raise ImmutableStateError("Configured CATMAID database differs from append planning")
     _write_registered_json(store, "database", DATABASE_FILENAME, current)
     return connection, current
 
 
-def _append_geometry(request: IngestionRequest, connection: Any = None) -> dict[str, Any] | None:
-    if request.target_project_id is None:
-        return None
+def _append_geometry(request: IngestionRequest, connection: Any = None) -> dict[str, Any]:
     try:
         return read_project_stack_geometry(request.target_project_id, connection)
     except ImporterError:
@@ -328,83 +319,12 @@ def _append_geometry(request: IngestionRequest, connection: Any = None) -> dict[
 def _check_saved_geometry(
     store: StateStore,
     state: Mapping[str, Any],
-    geometry: Mapping[str, Any] | None,
+    geometry: Mapping[str, Any],
 ) -> None:
-    if geometry is not None and _load_registered_json(store, state, "stack_geometry") != geometry:
+    if _load_registered_json(store, state, "stack_geometry") != geometry:
         raise ImmutableStateError(
             "Target stack geometry or database identity changed since planning; use a new plan"
         )
-
-
-def _project_title(state: Mapping[str, Any], request: IngestionRequest) -> str:
-    digest = str(state["request"]["sha256"])
-    stem = request.archive_path.stem.strip() or "skeletons"
-    return f"Skeleton import {stem} {digest[:12]}"
-
-
-def _project_reservation(
-    store: StateStore,
-    state: Mapping[str, Any],
-    connection: Any,
-    request: IngestionRequest,
-) -> dict[str, Any]:
-    from .database import allocate_project_ids
-
-    try:
-        ids = allocate_project_ids(connection)
-    except Exception as exc:
-        classified = _classified_runtime_error(
-            exc, context="project and stack ID reservation"
-        )
-        if classified is not None:
-            raise classified from exc
-        raise
-    value = {
-        "schema_version": 1,
-        **ids,
-        "title": _project_title(state, request),
-        "request_sha256": state["request"]["sha256"],
-        "archive_sha256": state["archive"]["sha256"],
-    }
-    return _write_registered_json(
-        store,
-        "project_reservation",
-        PROJECT_RESERVATION_FILENAME,
-        value,
-    )
-
-
-def _ensure_project(
-    store: StateStore,
-    state: Mapping[str, Any],
-    request: IngestionRequest,
-    settings: ImportSettings,
-    connection: Any,
-    metrics: MetricsStore,
-) -> ProjectContext:
-    if request.target_project_id is not None:
-        return _ensure_existing_project(store, request.target_project_id, metrics)
-    from .project import ProjectSetupError, create_hidden_project
-    reservation = _project_reservation(store, state, connection, request)
-    store.mark_project_prepared(int(reservation["project_id"]), int(reservation["stack_id"]))
-    _progress(f"Creating hidden CATMAID project {reservation['project_id']}")
-    started = time.monotonic()
-    try:
-        created = create_hidden_project(
-            project_id=int(reservation["project_id"]), stack_id=int(reservation["stack_id"]),
-            project_stack_id=int(reservation["project_stack_id"]), title=str(reservation["title"]),
-            dimension=request.dimension, resolution_nm=request.resolution_nm,
-            cache_cell_size_nm=settings.cache_cell_size_nm,
-            comment=f"Hidden skeleton batch import. Archive SHA-256: {state['archive']['sha256']}",
-        )
-    except ProjectSetupError as exc:
-        raise InvalidInputError(f"Project setup failed: {exc}") from exc
-    _write_registered_json(store, "project_context", PROJECT_CONTEXT_FILENAME,
-                           {"schema_version": 1, **created})
-    store.mark_project_committed()
-    metrics.record_phase("project_creation", duration_seconds=time.monotonic() - started,
-                         row_counts={"project": 1, "stack": 1, "project_stack": 1})
-    return ProjectContext.from_dict(created)
 
 
 def _ensure_existing_project(
@@ -551,7 +471,7 @@ def _run_batch(
     store: StateStore,
     batch: PlannedBatch,
     request: IngestionRequest,
-    settings: ImportSettings,
+    timeouts: Mapping[str, int],
     project: ProjectContext,
     connection: Any,
     archive: SourceSnapshotReader,
@@ -571,7 +491,7 @@ def _run_batch(
         started = time.monotonic()
         try:
             counts = execute_batch_transaction(
-                prepared, project, settings, _buffer_loader_timing(timings))
+                prepared, project, **timeouts, record_timing=_buffer_loader_timing(timings))
         except BaseException as exc:
             _flush_loader_timings(metrics, batch.index, timings)
             metrics.record_phase(
@@ -640,7 +560,6 @@ def _verify_database_by_batch(
     """Verify exact rows with memory bounded by the planned batch size."""
 
     from .materialization import validate_batch
-    from .project_checks import verify_project_aggregate_counts
     from .loader import verify_exact_treenodes
 
     validated_batches = 0
@@ -707,21 +626,7 @@ def _verify_database_by_batch(
             },
         )
 
-    if project.existing_project:
-        # Other skeletons, annotations and stacks belong to the target project,
-        # not this ingestion. Only our recorded IDs are authoritative here.
-        return imported_counts
-    return verify_project_aggregate_counts(
-        project_id=project.project_id,
-        neuron_class_id=project.neuron_class_id,
-        skeleton_class_id=project.skeleton_class_id,
-        model_of_relation_id=project.model_of_relation_id,
-        annotation_class_id=project.annotation_class_id,
-        annotated_with_relation_id=project.annotated_with_relation_id,
-        expected_skeleton_count=plan.member_count,
-        expected_node_count=plan.total_nodes,
-        connection=connection,
-    )
+    return imported_counts
 
 
 def run_ingestion(state_dir: Path) -> dict[str, object]:
@@ -753,8 +658,7 @@ def run_ingestion(state_dir: Path) -> dict[str, object]:
 def _execute_ingestion(store: StateStore, resources: ExitStack) -> dict[str, object]:
     state = store.verify_immutable()
     request = load_request(store.request_path)
-    operational_settings = load_operational_settings()
-    settings = settings_from_state(state["settings"], operational_settings)
+    timeouts = load_operational_settings()
     plan_path = _artifact_path(store, state, "plan")
     plan = read_plan(plan_path)
     if sha256_file(plan_path) != state["plan"]["digest"]:
@@ -772,38 +676,19 @@ def _execute_ingestion(store: StateStore, resources: ExitStack) -> dict[str, obj
         planned_nodes=plan.total_nodes,
         planned_skeletons=plan.member_count,
     )
-    metrics.record_operational_settings(
-        statement_timeout_ms=settings.statement_timeout_ms,
-        lock_timeout_ms=settings.lock_timeout_ms,
-    )
+    metrics.record_operational_settings(**timeouts)
     metrics.set_status(MetricsStatus.IN_PROGRESS)
-    connection, _preflight = _database_context(
-        store, state, require_replica_role=True,
+    connection, _preflight = _database_context(store, state)
+    from .database import existing_project_import_lock
+    resources.enter_context(
+        existing_project_import_lock(request.target_project_id, connection)
     )
-    if request.target_project_id is not None:
-        from .database import existing_project_import_lock
-        resources.enter_context(
-            existing_project_import_lock(request.target_project_id, connection)
-        )
     geometry = _append_geometry(request, connection)
     _check_saved_geometry(store, store.load(), geometry)
-    state = store.load()
-    project = _ensure_project(
-        store, state, request, settings, connection, metrics
-    )
-    if project.existing_project:
-        _check_existing_fragment_conflicts(plan, project, connection)
+    project = _ensure_existing_project(store, request.target_project_id, metrics)
+    _check_existing_fragment_conflicts(plan, project, connection)
     from .offline_cache import OfflineGridCache
-    grid_cache = OfflineGridCache(
-        project.project_id, connection,
-        lock_timeout_ms=settings.lock_timeout_ms,
-        statement_timeout_ms=settings.statement_timeout_ms,
-    )
-    if not project.existing_project:
-        grid_cache.ensure_import_grid(
-            cell_size_nm=settings.cache_cell_size_nm, lod_levels=settings.lod_levels,
-            lod_bucket_size=settings.lod_bucket_size, lod_strategy=settings.lod_strategy,
-        )
+    grid_cache = OfflineGridCache(project.project_id, connection, **timeouts)
     _progress("Offline import: keep the Neuroglass managed layer inactive until verification succeeds")
 
     with SourceSnapshotReader(store.state_dir, plan) as archive:
@@ -812,7 +697,7 @@ def _execute_ingestion(store: StateStore, resources: ExitStack) -> dict[str, obj
                 store,
                 batch,
                 request,
-                settings,
+                timeouts,
                 project,
                 connection,
                 archive,
@@ -823,7 +708,6 @@ def _execute_ingestion(store: StateStore, resources: ExitStack) -> dict[str, obj
     _combine_manifest(store, state)
 
     from .database import analyze_tables
-    from .project_checks import verify_project_stack
 
     _run_phase(
         store,
@@ -855,30 +739,15 @@ def _execute_ingestion(store: StateStore, resources: ExitStack) -> dict[str, obj
     state = store.load()
 
     def verify() -> Mapping[str, Any]:
-        if project.existing_project:
-            _check_saved_geometry(store, store.load(), _append_geometry(request, connection))
-            from .project import ProjectSetupError, existing_project_context
-            try:
-                current_project = ProjectContext.from_dict(
-                    existing_project_context(project.project_id)
-                )
-            except ProjectSetupError as exc:
-                raise VerificationError(str(exc)) from exc
-            if current_project != project:
-                raise VerificationError("Existing project tracing context changed during import")
-            project_result = {"project_id": project.project_id, "existing_project": True}
-        else:
-            project_result = verify_project_stack(
-                project_id=project.project_id,
-                stack_id=project.stack_id,
-                project_stack_id=project.project_stack_id,
-                system_user_id=project.user_id,
-                title=_project_title(state, request),
-                dimension=request.dimension,
-                resolution_nm=request.resolution_nm,
-                cache_cell_size_nm=settings.cache_cell_size_nm,
-                connection=connection,
-            )
+        _check_saved_geometry(store, store.load(), _append_geometry(request, connection))
+        from .project import ProjectSetupError, existing_project_context
+        try:
+            current_project = ProjectContext.from_dict(existing_project_context(project.project_id))
+        except ProjectSetupError as exc:
+            raise VerificationError(str(exc)) from exc
+        if current_project != project:
+            raise VerificationError("Existing project tracing context changed during import")
+        project_result = {"project_id": project.project_id, "existing_project": True}
         with SourceSnapshotReader(store.state_dir, plan) as verification_archive:
             database_result = _verify_database_by_batch(
                 store,
@@ -925,8 +794,7 @@ def _execute_ingestion(store: StateStore, resources: ExitStack) -> dict[str, obj
         store.state_dir,
         status=state["status"],
         project_id=project.project_id,
-        stack_id=project.stack_id,
-        existing_project=project.existing_project,
+        existing_project=True,
         batches=plan.batch_count,
         skeletons=plan.member_count,
         nodes=plan.total_nodes,

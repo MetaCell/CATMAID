@@ -10,6 +10,8 @@ from pathlib import Path
 import zipfile
 
 import pytest
+
+from catmaid_skeleton_batch_import.config import load_operational_settings
 from catmaid_skeleton_batch_import.errors import InvalidInputError
 
 pytestmark = [
@@ -27,19 +29,16 @@ def local_database(isolated_database):
 
 
 @pytest.fixture(scope="module")
-def project(local_database):
-    from catmaid_skeleton_batch_import.database import allocate_project_ids
-    from catmaid_skeleton_batch_import.project import create_hidden_project
+def project(local_database, existing_project_factory):
+    from catmaid_skeleton_batch_import.project import existing_project_context
     from catmaid_skeleton_batch_import.loader import ProjectContext
-    return ProjectContext.from_dict(create_hidden_project(
-        **allocate_project_ids(), title="Disposable edge regression tests",
-        dimension=(100000000, 100000000, 100000000), resolution_nm=(1, 1, 1),
-    ))
+    project_id = existing_project_factory(dimension=(100000000,) * 3, resolution_nm=(1, 1, 1))
+    return ProjectContext.from_dict(existing_project_context(project_id))
 
 
 @pytest.fixture
 def prepared(project):
-    from catmaid_skeleton_batch_import.database import allocate_batch_ids
+    from catmaid_skeleton_batch_import.database import allocate_sequence_ids
     from catmaid_skeleton_batch_import.domain import IngestionRequest, PlannedBatch, PlannedMember, SwcNode
     from catmaid_skeleton_batch_import.loader import prepare_copy_rows
     # Unordered, noncontiguous source AND allocated IDs; two roots, branches,
@@ -55,10 +54,10 @@ def prepared(project):
     members = tuple(PlannedMember(name, 4, 0, 0, name, cable_length, name[:-4])
                     for name in ("a.swc", "b.swc"))
     batch = PlannedBatch(1, members)
-    ids = allocate_batch_ids(2, 16)
+    ids = {"concept_ids": allocate_sequence_ids("concept_id_seq", 10),
+           "location_ids": allocate_sequence_ids("location_id_seq", 16)}
     locations = tuple(reversed(ids["location_ids"][::2]))
-    request = IngestionRequest(1, Path("/unused.zip"), "nm",
-                               (100000000,) * 3, (1, 1, 1))
+    request = IngestionRequest(1, Path('/unused.zip'), 'nm', target_project_id=project.project_id)
     with prepare_copy_rows(batch, request, project, ids["concept_ids"], locations,
                            lambda _: nodes) as result:
         yield result
@@ -114,7 +113,6 @@ class RollbackTrial(Exception):
 def test_exact_canonical_geometry_summary_and_connectors(local_database, project, prepared, monkeypatch):
     from django.db import connection
     from catmaid.control.edge import rebuild_edges_selectively
-    from catmaid_skeleton_batch_import.config import load_settings
     from catmaid_skeleton_batch_import.loader import execute_batch_transaction
 
     before = connector_snapshot(connection)
@@ -181,7 +179,7 @@ def test_exact_canonical_geometry_summary_and_connectors(local_database, project
         if name == "exact_treenode_validation":
             compare()
     with pytest.raises(RollbackTrial):
-        execute_batch_transaction(prepared, project, load_settings(), timing)
+        execute_batch_transaction(prepared, project, **load_operational_settings(), record_timing=timing)
     assert {"edge_staging", "edge_creation", "summary_refresh", "materialization"} <= observed.keys()
     assert_absent(connection, prepared)
     assert connector_snapshot(connection) == before
@@ -224,7 +222,6 @@ def test_rejects_bad_staged_rows(local_database, project, prepared, corruption):
 
 def test_existing_edge_fails_without_deletion(local_database, project, prepared):
     from django.db import transaction, IntegrityError
-    from catmaid_skeleton_batch_import.config import load_settings
     from catmaid_skeleton_batch_import.edges import create_batch_edges
     from catmaid_skeleton_batch_import.loader import execute_batch_transaction
     def conflict():
@@ -242,33 +239,31 @@ def test_existing_edge_fails_without_deletion(local_database, project, prepared)
         assert edge_rows(local_database, prepared.location_ids) == before
         raise RollbackTrial
     with pytest.raises(RollbackTrial):
-        execute_batch_transaction(prepared, project, load_settings(),
-                                  lambda name, *_args: conflict() if name == "exact_treenode_validation" else None)
+        execute_batch_transaction(prepared, project, **load_operational_settings(), record_timing=lambda name, *_args: conflict() if name == 'exact_treenode_validation' else None)
     assert_absent(local_database, prepared)
 
 
-def make_request(tmp_path):
+def make_request(tmp_path, project_id):
     archive = tmp_path / "small.zip"
     with zipfile.ZipFile(archive, "w") as z:
         for name in ("a.swc", "b.swc"):
             z.writestr(name, "10 1 1 1 1 -1 -1\n90 3 2 1 1 .5 10\n30 3 1 2 1 .3 10\n")
     request = tmp_path / "request.json"
-    request.write_text(json.dumps({"schema_version": 1,
-        "source": {"archive_path": str(archive), "coordinate_unit": "nm"},
-        "stack": {"dimension": [10, 10, 10], "resolution_nm": [1, 1, 1]}}))
+    request.write_text(json.dumps({'schema_version': 1, 'source': {'archive_path': str(archive), 'coordinate_unit': 'nm'}, 'target': {'project_id': project_id}}))
     return request
 
 
 @pytest.mark.parametrize("phase", ["edge_staging", "edge_creation", "summary_refresh"])
-def test_phase_failure_rolls_back_second_batch_and_is_terminal(local_database, tmp_path, monkeypatch, phase):
+def test_phase_failure_rolls_back_second_batch_and_is_terminal(local_database, tmp_path, monkeypatch, phase, existing_project_factory):
     from catmaid_skeleton_batch_import import materialization
     from catmaid_skeleton_batch_import.errors import OperationalFailureError
-    from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, run_ingestion
+    from catmaid_skeleton_batch_import.orchestrator import plan_ingestion, preflight_ingestion, run_ingestion
     from catmaid_skeleton_batch_import.state import StateStore
     from catmaid_skeleton_batch_import.artifacts import read_id_artifact
     monkeypatch.setenv("CATMAID_BATCH_IMPORT_MAX_NODES_PER_BATCH", "3")
-    request = make_request(tmp_path)
+    request = make_request(tmp_path, existing_project_factory(dimension=(10, 10, 10), resolution_nm=(1, 1, 1)))
     state_dir = tmp_path / "state"
+    preflight_ingestion(request, state_dir)
     plan_ingestion(request, state_dir)
     original = materialization.materialize_and_verify_batch
     calls = 0
@@ -315,7 +310,6 @@ def test_phase_failure_rolls_back_second_batch_and_is_terminal(local_database, t
 @pytest.mark.parametrize("corruption", ["annotation_name", "duplicate_annotation", "duplicate_link"])
 def test_fragment_metadata_failure_rolls_back_entire_batch(local_database, project, prepared, monkeypatch, corruption):
     from catmaid_skeleton_batch_import import materialization
-    from catmaid_skeleton_batch_import.config import load_settings
     from catmaid_skeleton_batch_import.errors import VerificationError
     from catmaid_skeleton_batch_import.loader import execute_batch_transaction
     original = materialization.materialize_and_verify_batch
@@ -337,5 +331,5 @@ def test_fragment_metadata_failure_rolls_back_entire_batch(local_database, proje
 
     monkeypatch.setattr(materialization, "materialize_and_verify_batch", corrupted)
     with pytest.raises(VerificationError):
-        execute_batch_transaction(prepared, project, load_settings())
+        execute_batch_transaction(prepared, project, **load_operational_settings())
     assert_absent(local_database, prepared)

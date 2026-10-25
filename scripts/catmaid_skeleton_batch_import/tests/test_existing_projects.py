@@ -9,8 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from catmaid_skeleton_batch_import import database, loader, materialization, offline_cache, orchestrator, project, project_checks
-from catmaid_skeleton_batch_import.config import load_request, load_settings
+from catmaid_skeleton_batch_import import database, loader, materialization, offline_cache, orchestrator, project
+from catmaid_skeleton_batch_import.config import load_request, load_operational_settings
 from catmaid_skeleton_batch_import.artifacts import read_id_artifact
 from catmaid_skeleton_batch_import.errors import ImmutableStateError, InvalidInputError, OperationalFailureError
 from catmaid_skeleton_batch_import.loader import ProjectContext
@@ -19,7 +19,7 @@ from catmaid_skeleton_batch_import.state import StateStore
 
 SWC = "1 1 1 1 1 0.5 -1\n2 3 2 1 1 -1 1\n3 3 3 1 1 0.4 2\n"
 CONTEXT = {
-    "project_id": 123, "stack_id": None, "project_stack_id": None,
+    "project_id": 123,
     "user_id": 7, "neuron_class_id": 31, "skeleton_class_id": 32,
     "annotation_class_id": 33, "model_of_relation_id": 41,
     "annotated_with_relation_id": 42, "existing_project": True,
@@ -101,12 +101,8 @@ def test_existing_request_needs_only_project_and_physical_source(tmp_path):
     path = request_file(tmp_path)
     request = load_request(path)
     assert request.target_project_id == 123
-    assert request.dimension is None
-    assert request.resolution_nm is None
     assert request.scale_nm == 1000
     assert request.to_dict() == json.loads(path.read_text())
-    with pytest.raises(ValueError, match="no stack geometry"):
-        _ = request.max_nm
 
 
 @pytest.mark.parametrize("target", [True, False, 0, -1, "123", 1.5, None, 2**31])
@@ -155,8 +151,7 @@ def test_existing_project_lock_is_released_on_failure_and_busy_is_retryable():
             forbidden()
 
 
-@pytest.mark.parametrize("existing", [False, True])
-def test_both_target_modes_use_bulk_materialization_in_one_atomic_batch(monkeypatch, existing):
+def test_append_uses_bulk_materialization_in_one_atomic_batch(monkeypatch):
     connection = Connection()
     monkeypatch.setitem(sys.modules, "django.db", SimpleNamespace(
         connection=connection, transaction=SimpleNamespace(atomic=lambda **_kwargs: nullcontext())))
@@ -176,9 +171,9 @@ def test_both_target_modes_use_bulk_materialization_in_one_atomic_batch(monkeypa
         expected_skeletons=[SimpleNamespace(to_validation_dict=lambda: {})],
         location_ids=(100, 101, 102),
     )
-    context = CONTEXT | {"existing_project": existing}
+    context = CONTEXT
     loader.execute_batch_transaction(prepared, ProjectContext.from_dict(context),
-                                     load_settings())
+                                     **load_operational_settings())
     assert len(copied) == 3
     assert [sql for sql, _params in connection.statements if "session_replication_role" in sql] == [
         "SET LOCAL session_replication_role = replica", "SET LOCAL session_replication_role = origin"]
@@ -190,13 +185,8 @@ def configure_run(monkeypatch, connection):
     monkeypatch.setitem(sys.modules, "django.conf", SimpleNamespace(
         settings=SimpleNamespace(NODE_LIST_MAXIMUM_COUNT=None)))
     monkeypatch.setattr(project, "existing_project_context", lambda _pid: dict(CONTEXT))
-    monkeypatch.setattr(project, "create_hidden_project", forbidden)
-    monkeypatch.setattr(database, "allocate_project_ids", forbidden)
-    monkeypatch.setattr(project_checks, "verify_project_stack", forbidden)
-    monkeypatch.setattr(project_checks, "verify_project_aggregate_counts", forbidden)
     monkeypatch.setattr(database, "analyze_tables", lambda *_args: {"count": 5})
-    def database_context(_store, _state, *, require_replica_role):
-        assert require_replica_role is True
+    def database_context(_store, _state):
         return connection, {}
     monkeypatch.setattr(orchestrator, "_database_context", database_context)
     monkeypatch.setattr(orchestrator, "read_project_stack_geometry",
@@ -343,7 +333,7 @@ def test_geometry_change_during_import_prevents_completion(tmp_path, monkeypatch
     configure_run(monkeypatch, connection)
     state_dir = tmp_path / "state"
     plan_append(request_file(tmp_path), state_dir)
-    def commit(_prepared, _context, _settings, _timings):
+    def commit(_prepared, _context, **_timeouts):
         connection.geometry["stacks"][0]["dimension"][0] += 1
         return dict(COUNTS)
     monkeypatch.setattr(orchestrator, "execute_batch_transaction", commit)
@@ -361,8 +351,8 @@ def test_complete_append_is_scoped_and_preserves_target_configuration(tmp_path, 
     plan_append(request_file(tmp_path), state_dir)
     batches = []
     exact_checks = []
-    def commit(prepared, context, _settings, _timings):
-        assert context.existing_project
+    def commit(prepared, context, **_timeouts):
+        assert context.project_id == 123
         batches.append(prepared.batch.index)
         return dict(COUNTS)
     monkeypatch.setattr(orchestrator, "execute_batch_transaction", commit)
@@ -374,7 +364,7 @@ def test_complete_append_is_scoped_and_preserves_target_configuration(tmp_path, 
     with pytest.raises(InvalidInputError, match="terminal"):
         orchestrator.run_ingestion(state_dir)
     assert first["project_id"] == 123
-    assert first["stack_id"] is None
+    assert first.get("stack_id") is None
     assert first["status"] == "complete"
     assert first["existing_project"] is True
     assert batches == [1]
@@ -409,7 +399,7 @@ def test_cache_or_verification_failure_is_terminal(tmp_path, monkeypatch, phase)
     state_dir = tmp_path / "state"
     plan_append(request_file(tmp_path), state_dir)
     events = []
-    def commit(*_args):
+    def commit(*_args, **_kwargs):
         events.append("commit")
         return dict(COUNTS)
     def rebuild(self, **_kwargs):
@@ -447,7 +437,7 @@ def test_cache_is_rebuilt_once_after_all_batches(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     plan_append(path, state_dir)
     events = []
-    def commit(prepared, _context, _settings, _timings):
+    def commit(prepared, _context, **_timeouts):
         events.append(f"commit_{prepared.batch.index}")
         return dict(COUNTS)
     monkeypatch.setattr(orchestrator, "execute_batch_transaction", commit)
@@ -471,14 +461,14 @@ def test_cache_is_rebuilt_once_after_all_batches(tmp_path, monkeypatch):
 
 
 def test_project_context_round_trips():
-    assert ProjectContext.from_dict(CONTEXT).to_dict() == CONTEXT
+    assert ProjectContext.from_dict(CONTEXT).to_dict() == {k: v for k, v in CONTEXT.items() if k != "existing_project"}
 
 
 def test_cache_observation_starts_before_coverage_planning(tmp_path, monkeypatch):
     configure_run(monkeypatch, Connection())
     state_dir = tmp_path / "state"
     plan_append(request_file(tmp_path), state_dir)
-    monkeypatch.setattr(orchestrator, "execute_batch_transaction", lambda *_args: dict(COUNTS))
+    monkeypatch.setattr(orchestrator, "execute_batch_transaction", lambda *_args, **_kwargs: dict(COUNTS))
     monkeypatch.setattr(loader, "verify_exact_treenodes", lambda *_args: None)
     original = offline_cache.OfflineGridCache.plan
     observations = []
@@ -506,3 +496,29 @@ def test_planning_failure_does_not_publish_partial_state(tmp_path, monkeypatch):
     assert not (state_dir / "state.json").exists()
     with pytest.raises(InvalidInputError, match="not been planned"):
         orchestrator.run_ingestion(state_dir)
+
+
+def test_run_uses_saved_batches_and_only_runtime_timeouts(tmp_path, monkeypatch):
+    configure_run(monkeypatch, Connection())
+    state_dir = tmp_path / "state"
+    plan_append(request_file(tmp_path), state_dir)
+    monkeypatch.setenv("CATMAID_BATCH_IMPORT_MAX_NODES_PER_BATCH", "not-a-runtime-setting")
+    monkeypatch.setenv("CATMAID_BATCH_IMPORT_STATEMENT_TIMEOUT_MS", "123")
+    monkeypatch.setenv("CATMAID_BATCH_IMPORT_LOCK_TIMEOUT_MS", "456")
+    observed = []
+
+    def commit(prepared, context, *, statement_timeout_ms, lock_timeout_ms, record_timing):
+        observed.append((prepared.batch.index, context.project_id,
+                         statement_timeout_ms, lock_timeout_ms))
+        assert callable(record_timing)
+        return dict(COUNTS)
+
+    monkeypatch.setattr(orchestrator, "execute_batch_transaction", commit)
+    monkeypatch.setattr(loader, "verify_exact_treenodes", lambda *_args: None)
+    assert orchestrator.run_ingestion(state_dir)["status"] == "complete"
+    assert observed == [(1, 123, 123, 456)]
+    state = StateStore(state_dir).load()
+    assert state["project"]["mode"] == "existing"
+    context = json.loads((state_dir / state["artifacts"]["project_context"]["path"]).read_text())
+    assert context["existing_project"] is True
+    assert context["project_id"] == 123

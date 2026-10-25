@@ -5,6 +5,8 @@ import zipfile
 from decimal import Decimal
 from pathlib import Path
 
+from helpers import write_stack_snapshot
+
 from catmaid_skeleton_batch_import import cli, orchestrator
 from catmaid_skeleton_batch_import.errors import InvalidInputError, VerificationError
 from catmaid_skeleton_batch_import.util import atomic_write_json
@@ -73,7 +75,7 @@ def test_preflight_is_forwarded(tmp_path, monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out) == {"ok": True}
 
 
-def test_new_project_preflight_and_plan_do_not_initialize_django(tmp_path, monkeypatch):
+def test_append_planning_uses_saved_metadata_without_initializing_django(tmp_path, monkeypatch):
     monkeypatch.setenv("DJANGO_SETTINGS_MODULE", "must.not.be.loaded")
     def forbidden(*_args):
         raise AssertionError("Database lookup during planning")
@@ -82,12 +84,9 @@ def test_new_project_preflight_and_plan_do_not_initialize_django(tmp_path, monke
     with zipfile.ZipFile(archive, "w") as source:
         source.writestr("point.swc", "1 1 1 2 3 -1 -1\n")
     request = tmp_path / "request.json"
-    atomic_write_json(request, {"schema_version": 1, "source": {
-        "archive_path": str(archive), "coordinate_unit": "nm"},
-        "stack": {"dimension": [10, 10, 10], "resolution_nm": [1, 1, 1]}})
+    atomic_write_json(request, {'schema_version': 1, 'source': {'archive_path': str(archive), 'coordinate_unit': 'nm'}, 'target': {'project_id': 123}})
     state_dir = tmp_path / "state"
-    assert orchestrator.preflight_ingestion(request, state_dir)["required"] is False
-    assert not (state_dir / "stack-geometry.json").exists()
+    write_stack_snapshot(state_dir)
     assert orchestrator.plan_ingestion(request, state_dir)["ok"]
 
 
@@ -101,10 +100,9 @@ def test_invalid_archive_reports_all_members_without_writing_a_partial_plan(
         source.writestr("b.swc", "1 1 0 0 0 1 -1\n2 3 1 0 0 1 99\n")
         source.writestr("valid.swc", "42 1 1 2 3 1 -1 # point\n")
     request = tmp_path / "request.json"
-    atomic_write_json(request, {"schema_version": 1, "source": {
-        "archive_path": str(archive), "coordinate_unit": "nm"},
-        "stack": {"dimension": [10, 10, 10], "resolution_nm": [1, 1, 1]}})
+    atomic_write_json(request, {'schema_version': 1, 'source': {'archive_path': str(archive), 'coordinate_unit': 'nm'}, 'target': {'project_id': 123}})
     state_dir = tmp_path / "state"
+    write_stack_snapshot(state_dir)
     assert cli.execute(["plan", "--request", str(request),
                         "--state-dir", str(state_dir)]) == 2
     result = json.loads(capsys.readouterr().out)

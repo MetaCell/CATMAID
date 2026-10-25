@@ -42,3 +42,36 @@ def micrometre_zigzag_swc():
         f"{index * 0.01:.8f} 0 1 {-1 if index == 0 else index}" + chr(10)
         for index in range(10001)
     )
+
+
+@pytest.fixture(scope="module")
+def existing_project_factory(isolated_database):
+    """Provision targets through ordinary CATMAID models, outside the importer."""
+    from catmaid.apps import get_system_user
+    from catmaid.control.tracing import setup_tracing
+    from catmaid.models import NodeGridCache, Project, ProjectStack, Stack
+    from django.db import transaction
+    from guardian.shortcuts import assign_perm
+
+    def create(*, dimension=(100, 100, 100), resolution_nm=(1000, 1000, 1000)):
+        system_user = get_system_user()
+        with transaction.atomic():
+            project = Project.objects.create(title="Existing append regression target")
+            setup_tracing(project.id, system_user)
+            stack = Stack.objects.create(
+                title="Existing regression stack", dimension=dimension,
+                resolution=resolution_nm, downsample_factors=None,
+                metadata={"cache_provider": "cached_msgpack_grid", "read_only": False,
+                          "spatial": [{"chunk_size": [1500000] * 3, "limit": 0}]},
+            )
+            ProjectStack.objects.create(project=project, stack=stack)
+            NodeGridCache.objects.create(
+                project=project, orientation=0, cell_width=1500000,
+                cell_height=1500000, cell_depth=1500000, has_msgpack_data=True,
+                hidden_last_editor_id=None,
+            )
+            for permission in ("can_browse", "can_annotate", "can_import"):
+                assign_perm(permission, system_user, project)
+        return project.id
+
+    return create

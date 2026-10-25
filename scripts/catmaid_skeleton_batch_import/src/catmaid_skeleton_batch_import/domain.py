@@ -14,74 +14,37 @@ class IngestionRequest:
     schema_version: int
     archive_path: Path
     coordinate_unit: str
-    dimension: tuple[int, int, int] | None = None
-    resolution_nm: tuple[float, float, float] | None = None
-    target_project_id: int | None = None
+    target_project_id: int
 
     @property
     def scale_nm(self) -> float:
         return 1.0 if self.coordinate_unit == "nm" else 1000.0
 
-    @property
-    def max_nm(self) -> tuple[float, float, float]:
-        if self.dimension is None or self.resolution_nm is None:
-            raise ValueError("An existing-project request has no stack geometry")
-        return tuple(
-            float(dimension) * resolution
-            for dimension, resolution in zip(self.dimension, self.resolution_nm)
-        )  # type: ignore[return-value]
-
     def to_dict(self) -> dict[str, Any]:
-        source: dict[str, Any] = {
-            "archive_path": str(self.archive_path),
-            "coordinate_unit": self.coordinate_unit,
-        }
-        result: dict[str, Any] = {
+        return {
             "schema_version": self.schema_version,
-            "source": source,
+            "source": {
+                "archive_path": str(self.archive_path),
+                "coordinate_unit": self.coordinate_unit,
+            },
+            "target": {"project_id": self.target_project_id},
         }
-        if self.target_project_id is not None:
-            result["target"] = {"project_id": self.target_project_id}
-        else:
-            if self.dimension is None or self.resolution_nm is None:
-                raise ValueError("A new-project request requires stack geometry")
-            result["stack"] = {
-                "dimension": list(self.dimension),
-                "resolution_nm": list(self.resolution_nm),
-            }
-        return result
 
 
 @dataclass(frozen=True)
 class ImportSettings:
+    """Planning limits; execution reads batches from the retained plan."""
     max_nodes_per_batch: int
     max_archive_bytes: int
     max_swc_bytes: int
     max_total_nodes: int | None
-    cache_cell_size_nm: int
-    lod_levels: int
-    lod_bucket_size: int
-    lod_strategy: str
-    statement_timeout_ms: int
-    lock_timeout_ms: int
 
     def plan_dict(self) -> dict[str, Any]:
-        """Values that must remain immutable after planning."""
         return {
             "max_nodes_per_batch": self.max_nodes_per_batch,
             "max_archive_bytes": self.max_archive_bytes,
             "max_swc_bytes": self.max_swc_bytes,
             "max_total_nodes": self.max_total_nodes,
-            "cache_cell_size_nm": self.cache_cell_size_nm,
-            "lod_levels": self.lod_levels,
-            "lod_bucket_size": self.lod_bucket_size,
-            "lod_strategy": self.lod_strategy,
-        }
-
-    def operational_dict(self) -> dict[str, int]:
-        return {
-            "statement_timeout_ms": self.statement_timeout_ms,
-            "lock_timeout_ms": self.lock_timeout_ms,
         }
 
 

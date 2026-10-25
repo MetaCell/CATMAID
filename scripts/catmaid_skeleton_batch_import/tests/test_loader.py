@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from helpers import write_stack_snapshot
+
 from catmaid_skeleton_batch_import.archive import scan_archive
 from catmaid_skeleton_batch_import.artifacts import NODE_MAP_FIELDS, manifest_rows, read_manifest, write_manifest
 from catmaid_skeleton_batch_import.config import DEFAULTS
@@ -37,17 +39,13 @@ def test_display_name_sanitization_matches_copy_expectations_and_manifest(
     member_path = f"folder/{source_name}.swc"
     with zipfile.ZipFile(archive, "w") as target:
         target.writestr(member_path, content)
-    request = IngestionRequest(schema_version=1, archive_path=archive,
-                               coordinate_unit="nm", target_project_id=5)
+    request = IngestionRequest(schema_version=1, archive_path=archive, coordinate_unit='nm', target_project_id=5)
     settings = ImportSettings(**DEFAULTS)
     plan = plan_archive(scan_archive(request, settings,
                                     bounds_nm=(((0, 0, 0), (1000, 1000, 1000)),)), settings)
     batch = plan.batches[0]
     assert batch.members[0].display_name == source_name
-    project = ProjectContext(project_id=5, stack_id=None, project_stack_id=None,
-                             user_id=1, neuron_class_id=8, skeleton_class_id=9,
-                             model_of_relation_id=10, annotation_class_id=11,
-                             annotated_with_relation_id=12, existing_project=True)
+    project = ProjectContext(project_id=5, user_id=1, neuron_class_id=8, skeleton_class_id=9, model_of_relation_id=10, annotation_class_id=11, annotated_with_relation_id=12)
     concept_ids = [100, 101, 102, 103, 104]
     nodes = parse_swc(io.BytesIO(content), member_path).nodes
     with prepare_copy_rows(batch, request, project, concept_ids, [200, 201],
@@ -68,13 +66,7 @@ def test_display_name_sanitization_matches_copy_expectations_and_manifest(
 def test_copy_rows_scale_coordinates_and_preserve_unknown_radius(
     tmp_path: Path,
 ) -> None:
-    request = IngestionRequest(
-        schema_version=1,
-        archive_path=tmp_path / "input.zip",
-        coordinate_unit="um",
-        dimension=(10, 10, 10),
-        resolution_nm=(1000, 1000, 1000),
-    )
+    request = IngestionRequest(schema_version=1, archive_path=tmp_path / 'input.zip', coordinate_unit='um', target_project_id=123)
     member = PlannedMember(
         member_path="folder/cell.swc",
         node_count=2,
@@ -86,17 +78,7 @@ def test_copy_rows_scale_coordinates_and_preserve_unknown_radius(
         batch_index=1,
     )
     batch = PlannedBatch(index=1, members=(member,))
-    project = ProjectContext(
-        project_id=5,
-        stack_id=6,
-        project_stack_id=7,
-        user_id=1,
-        neuron_class_id=8,
-        skeleton_class_id=9,
-        model_of_relation_id=10,
-        annotation_class_id=11,
-        annotated_with_relation_id=12,
-    )
+    project = ProjectContext(project_id=5, user_id=1, neuron_class_id=8, skeleton_class_id=9, model_of_relation_id=10, annotation_class_id=11, annotated_with_relation_id=12)
     nodes = (
         SwcNode(1, 3, 1.0, 2.0, 3.0, -1.0, -1),
         SwcNode(2, 3, 2.0, 2.0, 3.0, 2.0, 1),
@@ -148,8 +130,8 @@ def test_node_map_uses_exact_copy_assignments_and_full_csv_quoted_member_paths(t
         batch_index=1,
     ) for i, path in enumerate(['folder/细胞,"one".swc', 'other/line\nbreak.swc']))
     batch = PlannedBatch(index=1, members=members)
-    request = IngestionRequest(1, tmp_path / "source.zip", "nm", target_project_id=5)
-    project = ProjectContext(5, None, None, 1, 8, 9, 10, 11, 12, existing_project=True)
+    request = IngestionRequest(1, tmp_path / 'source.zip', 'nm', target_project_id=5)
+    project = ProjectContext(5, 1, 8, 9, 10, 11, 12)
     # Child before parent, with IDs repeated across SWCs. Sequence gaps and
     # integers above JavaScript's exact range must survive the CSV unchanged.
     nodes = (SwcNode(42, 3, 1, 0, 0, -1, 7), SwcNode(7, 1, 0, 0, 0, -1, -1))
@@ -172,13 +154,7 @@ def test_node_map_uses_exact_copy_assignments_and_full_csv_quoted_member_paths(t
 
 
 def test_expected_cable_uses_catmaid_float4_coordinates(tmp_path: Path) -> None:
-    request = IngestionRequest(
-        schema_version=1,
-        archive_path=tmp_path / "input.zip",
-        coordinate_unit="um",
-        dimension=(200_000, 10, 10),
-        resolution_nm=(1000, 1000, 1000),
-    )
+    request = IngestionRequest(schema_version=1, archive_path=tmp_path / 'input.zip', coordinate_unit='um', target_project_id=123)
     member = PlannedMember(
         member_path="cell.swc",
         node_count=2,
@@ -190,17 +166,7 @@ def test_expected_cable_uses_catmaid_float4_coordinates(tmp_path: Path) -> None:
         batch_index=1,
     )
     batch = PlannedBatch(index=1, members=(member,))
-    project = ProjectContext(
-        project_id=5,
-        stack_id=6,
-        project_stack_id=7,
-        user_id=1,
-        neuron_class_id=8,
-        skeleton_class_id=9,
-        model_of_relation_id=10,
-        annotation_class_id=11,
-        annotated_with_relation_id=12,
-    )
+    project = ProjectContext(project_id=5, user_id=1, neuron_class_id=8, skeleton_class_id=9, model_of_relation_id=10, annotation_class_id=11, annotated_with_relation_id=12)
     nodes = (
         SwcNode(1, 3, 100_000.001, 0.0, 0.0, -1.0, -1),
         SwcNode(2, 3, 100_000.002, 0.0, 0.0, -1.0, 1),
@@ -234,15 +200,12 @@ def test_planned_micrometre_snapshot_prepares_rows_at_large_coordinate_offsets(
     with zipfile.ZipFile(archive, "w") as output:
         output.writestr("zigzag.swc", micrometre_zigzag_swc)
     request_path = tmp_path / "request.json"
-    request_path.write_text(json.dumps({
-        "schema_version": 1,
-        "source": {"archive_path": str(archive), "coordinate_unit": "um"},
-        "stack": {"dimension": [17797, 30801, 10826], "resolution_nm": [350, 350, 1000]},
-    }))
+    request_path.write_text(json.dumps({'schema_version': 1, 'source': {'archive_path': str(archive), 'coordinate_unit': 'um'}, 'target': {'project_id': 123}}))
     state_dir = tmp_path / "state"
+    write_stack_snapshot(state_dir, dimension=(17797, 30801, 10826), resolution_nm=(350, 350, 1000))
     assert plan_ingestion(request_path, state_dir)["nodes"] == 10001
     plan = read_plan(state_dir / "plan.jsonl.gz")
-    project = ProjectContext(5, 6, 7, 1, 8, 9, 10, 11, 12)
+    project = ProjectContext(5, 1, 8, 9, 10, 11, 12)
 
     with SourceSnapshotReader(state_dir, plan) as source:
         with prepare_copy_rows(

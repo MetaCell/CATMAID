@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from catmaid_skeleton_batch_import import loader, materialization, orchestrator, project_checks
+from catmaid_skeleton_batch_import import loader, materialization, orchestrator
 from catmaid_skeleton_batch_import.artifacts import (
     artifact_descriptor, verify_artifact, write_id_artifact, write_node_map,
 )
@@ -26,7 +26,7 @@ def _member(path: str, node_count: int) -> PlannedMember:
     )
 
 
-def _verification_inputs(tmp_path, plan, *, existing=False, unit="nm"):
+def _verification_inputs(tmp_path, plan, *, unit="nm"):
     state = {"batches": []}
     for batch in plan.batches:
         artifacts = {}
@@ -38,11 +38,8 @@ def _verification_inputs(tmp_path, plan, *, existing=False, unit="nm"):
             write_id_artifact(path, list(range(start, start + count)))
             artifacts[name] = artifact_descriptor(tmp_path, path, count=count)
         state["batches"].append({"index": batch.index, "artifacts": artifacts})
-    project = ProjectContext(1, None if existing else 2, None if existing else 3,
-                             7, 31, 32, 41, 33, 42, existing_project=existing)
-    request = IngestionRequest(1, tmp_path / "source.zip", unit,
-                               target_project_id=1) if existing else IngestionRequest(
-        1, tmp_path / "source.zip", unit, (10, 10, 10), (1, 1, 1))
+    project = ProjectContext(1, 7, 31, 32, 41, 33, 42)
+    request = IngestionRequest(1, tmp_path / "source.zip", unit, target_project_id=1)
     connection = SimpleNamespace(cursor=lambda: nullcontext(object()))
     def register_artifact(name, path, *, count, compression, batch_index):
         batch = next(item for item in state["batches"] if item["index"] == batch_index)
@@ -76,13 +73,12 @@ def _counts(skeletons, nodes):
     }
 
 
-@pytest.mark.parametrize("existing", [False, True])
 def test_final_verification_reads_each_swc_once_and_finishes_one_batch_at_a_time(
-    tmp_path, monkeypatch, existing,
+    tmp_path, monkeypatch,
 ):
     plan = build_plan([_member("a.swc", 2), _member("b.swc", 3), _member("c.swc", 2)], 3)
     store, state, project, request, connection = _verification_inputs(
-        tmp_path, plan, existing=existing)
+        tmp_path, plan)
     events = []
     def load_nodes(member):
         events.append(("load", member.member_path))
@@ -94,13 +90,8 @@ def test_final_verification_reads_each_swc_once_and_finishes_one_batch_at_a_time
         return _counts(len(kwargs["skeletons"]), len(kwargs["location_ids"]))
     def exact(_cursor, prepared):
         events.append(("exact", prepared.batch.index))
-    def aggregate_counts(**kwargs):
-        assert not existing
-        events.append(("aggregate", kwargs["expected_node_count"]))
-        return _counts(plan.member_count, plan.total_nodes)
     monkeypatch.setattr(materialization, "validate_batch", validate_batch)
     monkeypatch.setattr(loader, "verify_exact_treenodes", exact)
-    monkeypatch.setattr(project_checks, "verify_project_aggregate_counts", aggregate_counts)
 
     _save_node_maps(store, plan, request, project, load_nodes)
     events.clear()
@@ -112,7 +103,7 @@ def test_final_verification_reads_each_swc_once_and_finishes_one_batch_at_a_time
         ("load", "a.swc"), ("validate", 2), ("exact", 1),
         ("load", "b.swc"), ("validate", 3), ("exact", 2),
         ("load", "c.swc"), ("validate", 2), ("exact", 3),
-    ] + ([] if existing else [("aggregate", 7)])
+    ]
     assert all(batch["artifacts"]["node_map"]["count"] == count
                for batch, count in zip(state["batches"], [2, 3, 2]))
 
@@ -123,7 +114,7 @@ def test_final_verification_uses_stored_float4_cable_and_exact_node_checks(tmp_p
     source_length_nm = math.dist((nodes[0].x, 0, 0), (nodes[1].x, 0, 0)) * 1000
     plan = build_plan([replace(_member("cell.swc", 2), cable_length_nm=source_length_nm)], 2)
     store, state, project, request, connection = _verification_inputs(
-        tmp_path, plan, existing=True, unit="um")
+        tmp_path, plan, unit="um")
     loads = []
     exact_checks = []
     def load_nodes(member):

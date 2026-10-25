@@ -82,17 +82,6 @@ class ArchiveMetadata:
     size_bytes: int
     sha256: str
 
-    @classmethod
-    def from_paths(cls, archive_path: Path) -> "ArchiveMetadata":
-        archive_path = archive_path.resolve()
-        if not archive_path.is_file():
-            raise InvalidInputError(f"Archive is not a readable regular file: {archive_path}")
-
-        return cls(
-            path=archive_path,
-            size_bytes=archive_path.stat().st_size,
-            sha256=sha256_file(archive_path),
-        )
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -259,7 +248,7 @@ class StateStore:
         settings: ImportSettings | Mapping[str, Any],
         batches: Sequence[PlannedBatch | Mapping[str, Any]],
         *,
-        plan_digest: str | None = None,
+        plan_digest: str,
         planner_version: int = 4,
         artifacts: Mapping[str, Mapping[str, Any]] | None = None,
         batch_artifacts: Mapping[int, Mapping[str, Mapping[str, Any]]] | None = None,
@@ -278,27 +267,13 @@ class StateStore:
         batch_plan = self._normalize_batches(batches)
         planner_version = _non_negative_int(planner_version, "planner version")
 
-        computed_plan_digest = sha256_bytes(
-            canonical_json_bytes(
-                {
-                    "planner_version": planner_version,
-                    "batches": batch_plan,
-                }
-            )
-        )
-        if plan_digest is None:
-            plan_digest = computed_plan_digest
-            digest_kind = "canonical_batches"
-        else:
-            plan_digest = _validate_sha256(plan_digest, "plan digest")
-            digest_kind = "external"
+        plan_digest = _validate_sha256(plan_digest, "plan digest")
 
         request_digest = sha256_bytes(canonical_json_bytes(request_value))
         archive_metadata_digest = sha256_bytes(canonical_json_bytes(archive_value))
         plan_value = {
             "planner_version": planner_version,
             "digest": plan_digest,
-            "digest_kind": digest_kind,
             "batches": batch_plan,
             "batch_count": len(batch_plan),
             "skeleton_count": sum(batch["skeleton_count"] for batch in batch_plan),
@@ -337,7 +312,6 @@ class StateStore:
                 "project": {
                     "status": DatabaseStatus.PLANNED,
                     "project_id": None,
-                    "stack_id": None,
                 },
                 "batches": [
                     {
@@ -393,19 +367,6 @@ class StateStore:
         self._verify_source_file(
             archive.path, archive.size_bytes, archive.sha256, "archive"
         )
-
-        plan = state["plan"]
-        if plan.get("digest_kind") == "canonical_batches":
-            actual_plan_digest = sha256_bytes(
-                canonical_json_bytes(
-                    {
-                        "planner_version": plan["planner_version"],
-                        "batches": plan["batches"],
-                    }
-                )
-            )
-            if actual_plan_digest != plan["digest"]:
-                raise ImmutableStateError("Persisted deterministic plan digest changed")
 
         for name, artifact in state.get("artifacts", {}).items():
             self._verify_artifact_value(name, artifact)
@@ -492,43 +453,6 @@ class StateStore:
             raise ImmutableStateError(f"Unknown artifact: {label}")
         return self._verify_artifact_value(label, target[name])
 
-    def transition_project(
-        self,
-        status: DatabaseStatus,
-        *,
-        project_id: int | None = None,
-        stack_id: int | None = None,
-        reason: str | None = None,
-    ) -> dict[str, Any]:
-        try:
-            status = DatabaseStatus(status)
-        except (ValueError, TypeError) as exc:
-            raise InvalidInputError(f"Unknown project state: {status}") from exc
-
-        def mutate(state: dict[str, Any]) -> None:
-            project = state["project"]
-            current = project["status"]
-            self._validate_database_transition(
-                "project", current, status
-            )
-            self._set_immutable_id(project, "project_id", project_id)
-            self._set_immutable_id(project, "stack_id", stack_id)
-            project["status"] = status
-            if reason is not None:
-                project["reason"] = str(reason)
-            elif status in (DatabaseStatus.PREPARED, DatabaseStatus.COMMITTED):
-                project.pop("reason", None)
-            self._derive_status(state)
-
-        return self._mutate(mutate)
-
-    def mark_project_prepared(self, project_id: int, stack_id: int) -> dict[str, Any]:
-        return self.transition_project(
-            DatabaseStatus.PREPARED, project_id=project_id, stack_id=stack_id
-        )
-
-    def mark_project_committed(self) -> dict[str, Any]:
-        return self.transition_project(DatabaseStatus.COMMITTED)
 
     def select_existing_project(self, project_id: int) -> dict[str, Any]:
         """Checkpoint a read-only project selection, without a COMMIT window."""
@@ -539,7 +463,7 @@ class StateStore:
         def mutate(state: dict[str, Any]) -> None:
             project = state["project"]
             if project["status"] != DatabaseStatus.PLANNED:
-                raise ImmutableStateError("Cannot replace a project creation in progress")
+                raise ImmutableStateError("Cannot replace an already selected target project")
             self._set_immutable_id(project, "project_id", project_id)
             project["mode"] = "existing"
             project["status"] = DatabaseStatus.COMMITTED
@@ -570,7 +494,7 @@ class StateStore:
             if status == DatabaseStatus.PREPARED:
                 if state["project"]["status"] != DatabaseStatus.COMMITTED:
                     raise ImmutableStateError(
-                        "Cannot prepare a batch before project creation is committed"
+                        "Cannot prepare a batch before target selection is recorded"
                     )
                 for prior in state["batches"]:
                     if prior["index"] == batch_index:
@@ -662,7 +586,7 @@ class StateStore:
                 return state
             state["run"] = {"status": OperationStatus.FAILED, "reason": reason}
             state["status"] = ImportStatus.FAILED
-            for item in [state["project"], *state["batches"]]:
+            for item in state["batches"]:
                 if item["status"] == DatabaseStatus.PREPARED:
                     item["status"] = DatabaseStatus.FAILED
                     item["reason"] = reason
@@ -879,11 +803,7 @@ class StateStore:
             return
         project_status = state["project"]["status"]
         if project_status != DatabaseStatus.COMMITTED:
-            state["status"] = (
-                ImportStatus.PLANNED
-                if project_status == DatabaseStatus.PLANNED
-                else ImportStatus.PROJECT_IN_PROGRESS
-            )
+            state["status"] = ImportStatus.PLANNED
             return
         if any(batch["status"] != DatabaseStatus.COMMITTED for batch in state["batches"]):
             state["status"] = ImportStatus.DATABASE_IN_PROGRESS
@@ -896,10 +816,7 @@ class StateStore:
             return
         state["status"] = ImportStatus.CACHE_COMPLETE
         if state["phases"]["verification"]["status"] == OperationStatus.COMPLETE:
-            state["status"] = (
-                ImportStatus.COMPLETE if state["project"].get("mode") == "existing"
-                else ImportStatus.READY_FOR_PUBLICATION
-            )
+            state["status"] = ImportStatus.COMPLETE
 
 
 @contextlib.contextmanager

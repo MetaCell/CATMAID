@@ -33,9 +33,6 @@ REQUIRED_TABLES = (
 )
 
 REQUIRED_SEQUENCES = (
-    "project_id_seq",
-    "stack_id_seq",
-    "project_stack_id_seq",
     "concept_id_seq",
     "location_id_seq",
 )
@@ -165,7 +162,6 @@ def preflight_database(
     connection: Any | None = None,
     *,
     atomic_factory: Any | None = None,
-    require_replica_role: bool = True,
 ) -> dict[str, Any]:
     """Verify schema objects, functions, role, and target identity.
 
@@ -217,14 +213,7 @@ def preflight_database(
     except Exception as exc:
         raise DatabasePreflightError("CATMAID system user is unavailable") from exc
 
-    if require_replica_role:
-        _check_replica_role(connection, atomic_factory)
-    else:
-        with connection.cursor() as cursor:
-            if _fetch_scalar(cursor, "SHOW session_replication_role") != "origin":
-                raise DatabasePreflightError(
-                    "Existing-project imports require enabled origin triggers"
-                )
+    _check_replica_role(connection, atomic_factory)
     target = database_target_fingerprint(connection)
     try:
         from mysite.utils import get_version
@@ -240,7 +229,7 @@ def preflight_database(
         "objects": sorted(REQUIRED_TABLES + REQUIRED_SEQUENCES),
         "functions": sorted(REQUIRED_FUNCTIONS),
         "system_user_id": int(system_user.id),
-        "replica_role": require_replica_role,
+        "replica_role": True,
     }
 
 
@@ -270,41 +259,6 @@ def allocate_sequence_ids(
             f"Sequence {sequence} returned {len(ids)} values for requested {count}"
         )
     return ids
-
-
-def allocate_project_ids(connection: Any | None = None) -> dict[str, int]:
-    """Reserve explicit IDs for one project, stack, and project-stack link."""
-
-    connection = _default_connection(connection)
-    return {
-        "project_id": allocate_sequence_ids("project_id_seq", 1, connection)[0],
-        "stack_id": allocate_sequence_ids("stack_id_seq", 1, connection)[0],
-        "project_stack_id": allocate_sequence_ids(
-            "project_stack_id_seq", 1, connection
-        )[0],
-    }
-
-
-def allocate_batch_ids(
-    skeleton_count: int,
-    node_count: int,
-    connection: Any | None = None,
-) -> dict[str, tuple[int, ...]]:
-    """Reserve exact concept and location IDs for one whole-skeleton batch."""
-
-    if isinstance(skeleton_count, bool) or skeleton_count <= 0:
-        raise ValueError("skeleton_count must be positive")
-    if isinstance(node_count, bool) or node_count <= 0:
-        raise ValueError("node_count must be positive")
-    connection = _default_connection(connection)
-    return {
-        "concept_ids": allocate_sequence_ids(
-            "concept_id_seq", skeleton_count * 5, connection
-        ),
-        "location_ids": allocate_sequence_ids(
-            "location_id_seq", node_count, connection
-        ),
-    }
 
 
 def analyze_tables(

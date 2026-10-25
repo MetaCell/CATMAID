@@ -1,13 +1,12 @@
 # CATMAID skeleton batch importer
 
-This package provides non-interactive CATMAID SWC batch ingestion. It owns
-validation, deterministic batch planning, database ingestion, CATMAID
-materialization, cache creation, verification, and retained audit state. It does
-not download inputs, publish a project, or delete a failed project. Imports can
-append to an existing tracing project (including one that already has skeletons)
-or create a new hidden project.
-Both use the same offline bulk ingestion path. Before running an import, make the
-managed layer **inactive in Neuroglass** and keep it inactive until all data and
+This package appends a local ZIP of SWC skeletons to an existing CATMAID
+tracing project, including one that already contains skeletons. It validates
+inputs, plans whole-skeleton batches, loads them atomically, rebuilds existing
+grid caches once and retains verification and audit files. Project, stack and
+grid provisioning are prerequisites handled outside ingestion.
+
+Before running an import, make the managed layer **inactive in Neuroglass** and keep it inactive until all data and
 cache verification succeeds. Layer activation is an operator action; this script
 does not call Neuroglass or change CATMAID permissions. The CATMAID web service
 can remain running, but no other client, administrator or background job may edit
@@ -25,7 +24,7 @@ python -m pip install ./scripts/catmaid_skeleton_batch_import
 Then prepare and run one ingestion:
 
 ```bash
-# Append only: capture the associated target stacks before offline planning.
+# Capture the associated target stacks before offline planning.
 DJANGO_SETTINGS_MODULE=mysite.settings \
 catmaid-skeleton-import preflight \
   --request /staging/request.json \
@@ -44,11 +43,10 @@ failure immediately. It does not retry, resume committed batches, or offer a
 `--rebuild-cache` recovery mode. Keep the workspace for diagnosis; use a new
 workspace only after inspecting any data left by the failed attempt.
 
-`plan` needs no database or Django initialization for either target mode. For
-append requests, first run `preflight` with the same request and state directory.
-It reads associated stack metadata and database identity into the local
-`state/stack-geometry.json` snapshot, without reading SWCs or changing CATMAID.
-New-project requests do not need preflight; calling it is a no-op.
+First run `preflight` with the same request and state directory. It reads
+associated stack metadata and database identity into the local
+`state/stack-geometry.json` snapshot without reading SWCs or changing CATMAID.
+`plan` reads that snapshot and needs no database or Django initialization.
 `run` reads only the durable state directory
 and the unchanged local input files recorded there. Run the command from a
 CATMAID application environment where `mysite.settings` and the `catmaid`
@@ -106,7 +104,7 @@ and readable by both `plan` and `run`.
 
 ### Request JSON
 
-Append to an existing tracing project (the common case):
+Every request targets an existing tracing project:
 
 ```json
 {
@@ -121,82 +119,48 @@ Append to an existing tracing project (the common case):
 }
 ```
 
-Create a new hidden project instead: replace `target` with `stack`:
-
-```json
-{
-  "schema_version": 1,
-  "source": {
-    "archive_path": "/staging/skeletons.zip",
-    "coordinate_unit": "um"
-  },
-  "stack": {
-    "dimension": [17797, 30801, 10826],
-    "resolution_nm": [350, 350, 1000]
-  }
-}
-```
-
 | Field | Required | Meaning |
 | --- | --- | --- |
 | `schema_version` | Always | Literal `1`. |
-| `source.archive_path` | Always | Non-empty local ZIP path, visible in the importer's runtime/container. Prefer an absolute path; relative paths resolve against the process working directory. URLs are not supported. |
-| `source.coordinate_unit` | Always | Exactly `"um"` or `"nm"`; applies to every SWC's XYZ coordinates and all known radii. No automatic detection or per-file unit override. |
-| `target.project_id` | Existing project only | Positive integer, at most 2147483647. The project must exist, have complete tracing setup and have at least one associated stack with valid geometry. |
-| `stack.dimension` | New project only | `[size_x, size_y, size_z]`, three positive integer voxel counts. |
-| `stack.resolution_nm` | New project only | `[nm_per_voxel_x, nm_per_voxel_y, nm_per_voxel_z]`, three positive finite numbers. Used to configure the new stack; does not scale SWC coordinates. |
+| `source.archive_path` | Always | Local ZIP path visible to all processing containers. Prefer an absolute path; relative paths resolve against the working directory. |
+| `source.coordinate_unit` | Always | Exactly `"um"` or `"nm"` for every SWC's XYZ and known radii. |
+| `target.project_id` | Always | Existing tracing project ID, a positive integer at most 2147483647. The project needs complete tracing setup and at least one associated stack with valid geometry. |
 
-The stack describes the viewer's image/coordinate extent; it is not a transform
-of the SWCs. `dimension[i] * resolution_nm[i]` gives its physical size along
-axis `i`. For example, dimensions `[100, 200, 50]` at resolution `[1000, 1000,
-2000]` describe a volume of `[100000, 200000, 100000]` nm (100 × 200 × 100 µm).
-The importer creates this stack with zero translation and XY orientation.
-SWC positions are converted solely by `source.coordinate_unit` and remain in
-their original coordinate frame. For a new project, planning rejects negative
-X, Y or Z values, reporting the member, line and axis. Each converted position
-must satisfy `0 <= coordinate_nm <= dimension[i] * resolution_nm[i]` on every
-axis; the physical extents must be positive and finite. Positions exactly on
-the boundary are accepted. In the example above, X = 100 µm is valid but
-X = 100.001 µm is rejected. All invalid members are collected in
-`error.details.member_errors` inside `error-details.json`, and no executable plan
-is produced. Loading and final verification reuse the validated source snapshots,
-checking their size and SHA-256 against the plan before decoding.
-Radius `-1` (unknown) and parent `-1` (root) remain valid. Positions are not
-clipped or translated.
-Append requests use the target project's associated stack geometry captured by
-the separate, read-only `preflight` step.
-Planning computes each stack's project-space bounds from its dimensions,
-resolution, XY/XZ/ZY orientation and translation. Every incoming node must lie
-within at least one associated stack, including the boundary. Gaps between
-disjoint stacks are outside their coverage. Negative incoming XYZ is accepted
-when the point lies within an associated stack's bounds. For example, a stack
-translated to `[-1000, -2000, -3000]` nm with physical size `[2000, 4000, 6000]`
-nm accepts `[-500, -1000, -1500]` nm; X = -1001 nm is outside it.
-Missing stacks or invalid stack geometry also prevent planning.
+Unknown fields, including a `stack` provisioning request, are rejected. The
+request has no annotation or cache override fields. The importer does not create
+projects, stacks or grid definitions, change permissions or repair tracing setup.
 
-`plan` reads this snapshot locally and registers its hash alongside the plan.
-Preflight may refresh the snapshot before planning and must finish before the
-plan is published. To use changed metadata, create a new
-state directory and repeat preflight and planning. The stack definitions and database
-identity are rechecked before loading and final verification; a changed
-target stops the run. A missing stack snapshot also stops the run before IDs
-are reserved or batches loaded.
-Existing stacks and morphology, including existing out-of-bounds or negative
-coordinates, remain unchanged. Choose metadata consistent with the intended
-coordinate frame and viewer.
+Preflight reads the associated stacks' dimensions, resolution, XY/XZ/ZY
+orientation and translation. Before orientation and translation,
+`dimension[i] * resolution_nm[i]` gives a stack's physical extent along axis
+`i`. For example, dimensions `[100, 200, 50]` at resolution
+`[1000, 1000, 2000]` describe `[100000, 200000, 100000]` nm
+(100 × 200 × 100 µm).
 
-Supply exactly one of `target` and `stack`. Unknown JSON fields are rejected;
-there are no request fields for arbitrary annotations or cache overrides. Cache
-and batch defaults are deployment settings documented below.
+Planning checks every converted node against the union of the associated
+stacks' project-space bounds. Boundary points are accepted; gaps between disjoint
+stacks are outside their coverage. Negative XYZ values are accepted inside an
+associated stack. For example, translation `[-1000, -2000, -3000]` nm and
+physical size `[2000, 4000, 6000]` nm accept `[-500, -1000, -1500]` nm;
+X = -1001 nm is outside that stack. SWC positions are converted by the declared
+source unit and are never clipped, translated or otherwise registered.
 
-An existing project does **not** need to be empty. Each SWC creates a new neuron
-and skeleton with fresh CATMAID IDs. Existing morphology, names, provenance,
-connectors, permissions, project visibility and stacks are retained. The importer
-does not merge incoming SWCs with existing skeletons or repair tracing setup.
-Source-fragment IDs already present in the project are rejected before loading;
-failed attempts must be inspected before starting another import. Existing targets
-finish with `status: "complete"`; new hidden projects finish with
-`status: "ready_for_publication"`.
+Invalid members are collected in `error.details.member_errors` inside
+`error-details.json`, and no executable plan is produced. Missing stacks or
+invalid geometry also prevent planning. Radius `-1` and root parent `-1`
+remain valid.
+
+`plan` hashes and registers the local stack snapshot. Preflight must finish
+before planning; changed metadata requires a new state directory and another
+preflight. Stack geometry and database identity are checked before loading and
+again during final verification. A missing or changed snapshot stops the run
+before rows are loaded.
+
+Existing skeletons, names, provenance, connectors, permissions, visibility,
+stacks and cache definitions are preserved. Existing out-of-bounds or negative
+coordinates are retained. Each incoming SWC creates a fresh neuron and skeleton;
+the importer does not merge it into existing morphology. A provenance collision
+is rejected before loading. Successful imports finish with `status: "complete"`.
 
 ### How source units are determined
 
@@ -224,8 +188,8 @@ request and the actual data.
 
 All SWCs in a ZIP must already share the declared physical unit and the target
 project's coordinate frame. Mixed-unit archives and raw voxel/pixel coordinates
-must be converted before ingestion. `stack.resolution_nm` does not perform that
-conversion; translation, axis reordering, rotation and registration are also the
+must be converted before ingestion. The associated stack's resolution does not
+perform that conversion; translation, axis reordering, rotation and registration are also the
 caller's responsibility.
 
 ### Files on disk and ZIP structure
@@ -297,11 +261,9 @@ included in errors.
 Node IDs are unique within a file and may be reused in other files: they are
 local topology references, not CATMAID IDs. There must be at least one node,
 exactly one root (`parent_id=-1`), valid parent references, and one connected
-acyclic tree. After conversion to nm, XYZ must fit the declared zero-origin
-stack for a new project or at least one associated target stack for an append.
-Append coordinates may be negative when the associated stack bounds include them.
-A radius must be non-negative or
-exactly `-1` for unknown.
+acyclic tree. After conversion to nm, XYZ must fit at least one associated target
+stack. Coordinates may be negative when that stack's bounds include them.
+A radius must be non-negative or exactly `-1` for unknown.
 A one-node SWC creates a neuron/skeleton with one root, a zero-length root edge,
 and a summary with `num_nodes=1` and `cable_length=0`; its provenance and cache
 generation use the same path as larger skeletons.
@@ -327,13 +289,12 @@ The sample root becomes `(10000, 20000, 30000)` nm with radius `2000` nm.
 For existing targets, grid IDs, dimensions, orientation, filters, ordering, LOD,
 JSON/JSON-text/MessagePack format flags, `allow_empty` and enabled/disabled state
 are preserved. Only payload cells are replaced, including those of disabled grids.
-Cache generation has no node query limit for either target mode. Existing
+Cache generation has no node query limit. Existing
 grid filters and ordering still apply; `NODE_LIST_MAXIMUM_COUNT` does not
 truncate the importer's rebuilt payloads. This workflow uses grid caches only.
 Bounds cover all project nodes and connectors, including negative coordinates
 and long edges. Intentionally cached empty coverage is retained for grids with
-`allow_empty`. New projects receive the configured default XY MessagePack grid
-and then use the same rebuild engine.
+`allow_empty`. Ingestion always uses the existing grid definitions.
 
 Cache payloads can be absent or partially rebuilt during import. The script does
 not promise browsing or editing availability for the target layer. Other projects
@@ -501,7 +462,7 @@ add viewer code or append all identifiers to visible labels.
 The CATMAID image includes the package and a headless runtime wrapper:
 
 ```bash
-# Append only; skip this step for a new project.
+# Capture target metadata before database-free planning.
 SKELETON_INGESTION_WORKSPACE=/staging \
 /home/env/bin/python /home/scripts/docker/run_catmaid_skeleton_import.py preflight
 
@@ -513,9 +474,9 @@ SKELETON_INGESTION_WORKSPACE=/staging \
 ```
 
 The existing absolute workspace must contain `request.json`; the wrapper creates
-its `state` directory for one attempt. `plan` needs no database for either mode and
-uses environment/default import settings without loading Django settings.
-Append `preflight` and every `run` require
+its `state` directory for one attempt. `plan` uses the preflight snapshot
+and environment/default planning limits without loading Django settings.
+Both `preflight` and `run` require
 `DB_HOST`, `DB_NAME`, `DB_USER` and `DB_PASS`, with optional `DB_PORT` (default
 5432), and use `mysite.ingestion_settings` without starting the web server or
 applying migrations. Readiness uses one `pg_isready` check; a failed check
@@ -534,46 +495,34 @@ result in `state/run-wrapper-result.json`. The wrapper refuses to start
 another child in a workspace with that marker. Success is reported through
 `result.json`.
 Input downloads, workflow submission,
-publication and failure cleanup remain the caller's responsibility.
+layer activation and failure cleanup remain the caller's responsibility.
 
 ## Deployment settings
 
-`plan` reads the environment variables below, then their defaults. During `run`,
-the two operational timeouts prefer Django settings, then the same-name
-environment variables, then defaults; other values come from the saved plan:
+Settings come from environment variables and defaults. Django settings overrides
+are not used. `plan` resolves four planning limits and records them in state
+for audit. `run` reads the recorded batches and existing database grid
+definitions directly; it resolves only its statement and lock timeouts.
 
-| Setting | Default |
-|---|---:|
-| `CATMAID_BATCH_IMPORT_MAX_NODES_PER_BATCH` | `250000` |
-| `CATMAID_BATCH_IMPORT_MAX_ARCHIVE_BYTES` | `2147483648` (2 GiB) |
-| `CATMAID_BATCH_IMPORT_MAX_SWC_BYTES` | `2147483648` (2 GiB) |
-| `CATMAID_BATCH_IMPORT_MAX_TOTAL_NODES` | disabled |
-| `CATMAID_BATCH_IMPORT_CACHE_CELL_SIZE_NM` | `1500000` |
-| `CATMAID_BATCH_IMPORT_LOD_LEVELS` | `1` |
-| `CATMAID_BATCH_IMPORT_LOD_BUCKET_SIZE` | `500` |
-| `CATMAID_BATCH_IMPORT_LOD_STRATEGY` | `quadratic` |
-| `CATMAID_BATCH_IMPORT_STATEMENT_TIMEOUT_MS` | `0` |
-| `CATMAID_BATCH_IMPORT_LOCK_TIMEOUT_MS` | `30000` |
+| Environment variable | Read by | Default |
+| --- | --- | --- |
+| `CATMAID_BATCH_IMPORT_MAX_NODES_PER_BATCH` | plan | `250000` |
+| `CATMAID_BATCH_IMPORT_MAX_ARCHIVE_BYTES` | plan | `2147483648` (2 GiB) |
+| `CATMAID_BATCH_IMPORT_MAX_SWC_BYTES` | plan | `2147483648` (2 GiB) |
+| `CATMAID_BATCH_IMPORT_MAX_TOTAL_NODES` | plan | disabled |
+| `CATMAID_BATCH_IMPORT_STATEMENT_TIMEOUT_MS` | run | `0` (unlimited) |
+| `CATMAID_BATCH_IMPORT_LOCK_TIMEOUT_MS` | run | `30000` |
 
-There is no SWC file-count cap. The ZIP size, each SWC's uncompressed byte
-limit and the per-batch node budget remain enforced.
-
-For newly created projects, the default cache is one 1.5 mm XY MessagePack grid with a single LOD bucket.
-The viewer requests the sole spatial profile at 100% LOD, so the bucket contains
-all entries without progressive subdivision. Bucket size and strategy remain
-configurable for explicit multi-level overrides.
-
-Planning resolves import settings from the environment and defaults, without
-loading Django settings, and snapshots all result-affecting settings. Supply
-planning overrides as the environment variables above. Existing plans retain their
-recorded LOD count for their single run. Database timeouts are resolved
-when `run` starts and recorded with its metrics.
+There is no SWC file-count cap. ZIP size, each SWC's uncompressed byte limit and
+the per-batch node budget remain enforced. Every SWC must fit one whole batch.
+Cache dimensions, LOD, filters and formats come from the target project's
+existing definitions; ingestion has no default-grid creation settings.
+Effective database timeouts are recorded in `metrics.json`.
 
 ## Single-use failure contract
 
 Each skeleton stays inside one atomic database batch. Core rows, model links,
-fragment provenance, edges, summaries and validation commit together. Both target
-modes use the same direct materialization path.
+fragment provenance, edges, summaries and validation commit together.
 
 The importer stops on the first failure and records a terminal failed attempt.
 Previously committed batches remain in CATMAID. A failure during COMMIT can leave
@@ -582,12 +531,11 @@ identify the rows to inspect. The importer does not retry, resume, reconcile or
 delete data automatically. A hard-killed run also cannot be started again from
 the same workspace.
 
-Planning publishes `state.json` once, after the plan, source snapshots and any
-append stack snapshot have been written and verified. Failed initialization
+Planning publishes `state.json` once, after the plan, source snapshots and the
+associated-stack snapshot have been written and verified. Failed initialization
 publishes no executable state.
 
-A new project stays hidden after successful verification; publication remains
-an operator action. Existing permissions and visibility remain unchanged. Keep
+Existing permissions and visibility remain unchanged. Keep
 the managed layer inactive until final success. After failure, inspect the
 database and retained evidence before manually choosing cleanup or a new import.
 
@@ -670,11 +618,12 @@ python manage.py test \
   catmaid.tests.apis.test_source_fragment_skeletons
 ```
 
-The opt-in PostgreSQL tests create hidden projects, inject failures, verify exact
-edge geometry and summary parity, and ensure failed workspaces cannot restart. Use only a
-disposable, migrated CATMAID/PostGIS database; the tests leave their hidden
-projects for inspection. Name that database and pin its PostgreSQL cluster
-identity explicitly before enabling either database test module:
+The opt-in PostgreSQL tests independently provision existing targets through
+ordinary CATMAID models, then test append behavior, exact geometry, summary
+parity, cache preservation, rollback and terminal failures. The importer itself
+never provisions those targets. Use only a disposable, migrated CATMAID/PostGIS
+database; the tests leave their targets for inspection. Name that database and
+pin its PostgreSQL cluster identity explicitly before enabling either database test module:
 
 ```bash
 CATMAID_BATCH_IMPORT_E2E=1 \
@@ -746,7 +695,9 @@ errors/results through Kafka; maps never travel through that callback.
 MNP and the standalone importer perform one attempt. Retained files support
 inspection and review-queue mapping; they are not automatic recovery inputs.
 Processing-pod loss or an importer failure leaves the layer inactive and requires
-operator inspection before another import is started.
+operator inspection before another import is started. MNP's terminal-state reader
+still needs alignment with the importer's failed status before deploying the
+updated pair together.
 
 
 ## Measured cache progress

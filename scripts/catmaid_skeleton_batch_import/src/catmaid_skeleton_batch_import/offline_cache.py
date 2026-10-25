@@ -52,19 +52,6 @@ class OfflineGridCache:
                 raise VerificationError(f"Grid {grid['id']} has no configured cache format")
         return grids
 
-    def ensure_import_grid(self, *, cell_size_nm, lod_levels, lod_bucket_size, lod_strategy):
-        """Only a newly created project gets an importer-owned default grid."""
-        if not self.grids:
-            with self.connection.cursor() as cursor:
-                cursor.execute("""
-                    INSERT INTO node_grid_cache (project_id, orientation,
-                        cell_width, cell_height, cell_depth, n_lod_levels,
-                        lod_min_bucket_size, lod_strategy, allow_empty,
-                        has_json_data, has_json_text_data, has_msgpack_data, enabled)
-                    VALUES (%s,0,%s,%s,%s,%s,%s,%s,false,false,false,true,true)
-                """, [self.project_id, cell_size_nm, cell_size_nm, cell_size_nm,
-                      lod_levels, lod_bucket_size, lod_strategy])
-            self.grids = self._read_grids()
 
     def _check_grids(self):
         if self._read_grids() != self.grids:

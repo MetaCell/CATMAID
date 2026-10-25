@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,7 +12,6 @@ from catmaid_skeleton_batch_import.errors import InvalidInputError
 from catmaid_skeleton_batch_import.fragments import fragment_id_from_member_path
 from catmaid_skeleton_batch_import.planner import (
     build_plan,
-    plan_sha256,
     read_plan,
     serialize_plan,
     write_plan,
@@ -67,11 +67,10 @@ def test_gzip_jsonl_is_deterministic_and_round_trips(tmp_path: Path) -> None:
     first = serialize_plan(plan)
     second = serialize_plan(plan)
     assert first == second
-    assert plan_sha256(plan) == plan_sha256(plan)
 
     path = tmp_path / "plan.jsonl.gz"
     digest = write_plan(path, plan)
-    assert digest == plan_sha256(plan)
+    assert digest == hashlib.sha256(path.read_bytes()).hexdigest()
     assert read_plan(path) == plan
 
     with gzip.open(path, "rt", encoding="utf-8") as source:

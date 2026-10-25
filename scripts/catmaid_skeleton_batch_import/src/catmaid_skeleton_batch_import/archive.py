@@ -8,7 +8,6 @@ import stat
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
 
 from .domain import ImportSettings, IngestionRequest, PlannedMember
 from .fragments import fragment_id_from_member_path
@@ -35,17 +34,6 @@ class ArchiveScan:
     @property
     def total_nodes(self) -> int:
         return sum(member.node_count for member in self.members)
-
-    def identity_dict(self) -> dict[str, Any]:
-        result: dict[str, Any] = {
-            "archive_path": str(self.archive_path),
-            "archive_bytes": self.archive_bytes,
-            "archive_sha256": self.archive_sha256,
-            "archive_mtime_ns": self.archive_mtime_ns,
-            "swc_count": self.swc_count,
-            "total_nodes": self.total_nodes,
-        }
-        return result
 
 
 def _regular_file_stat(path: Path, label: str) -> os.stat_result:
@@ -128,12 +116,12 @@ def _collect_swc_infos(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
 def scan_archive(
     request: IngestionRequest,
     settings: ImportSettings,
-    *, bounds_nm: tuple[StackBounds, ...] | None = None,
+    *, bounds_nm: tuple[StackBounds, ...],
     on_member=None,
 ) -> ArchiveScan:
     """Hash and validate one local SWC ZIP without extracting its members."""
 
-    if request.target_project_id is not None and bounds_nm is None:
+    if not bounds_nm:
         raise InvalidInputError("Append validation requires associated target stack bounds")
     archive_path = request.archive_path
     before = _regular_file_stat(archive_path, "SWC archive")
@@ -173,7 +161,6 @@ def scan_archive(
                             max_bytes=settings.max_swc_bytes,
                             max_nodes=settings.max_nodes_per_batch,
                             scale_nm=request.scale_nm,
-                            max_nm=request.max_nm if request.target_project_id is None else None,
                             bounds_nm=bounds_nm,
                         )
                     if parsed.bytes_read != info.file_size:

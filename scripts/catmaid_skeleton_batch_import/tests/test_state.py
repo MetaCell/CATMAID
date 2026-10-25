@@ -22,27 +22,8 @@ from catmaid_skeleton_batch_import.util import canonical_json_bytes, sha256_file
 def make_store(tmp_path: Path, *, batch_count: int = 2) -> tuple[StateStore, dict]:
     archive = tmp_path / "source.zip"
     archive.write_bytes(b"stable archive bytes")
-    request = {
-        "schema_version": 1,
-        "source": {
-            "archive_path": str(archive.resolve()),
-            "coordinate_unit": "um",
-        },
-        "stack": {
-            "dimension": [10, 20, 30],
-            "resolution_nm": [100.0, 100.0, 200.0],
-        },
-    }
-    settings = {
-        "max_nodes_per_batch": 10,
-        "max_archive_bytes": 1_000_000,
-        "max_swc_bytes": 10_000,
-        "max_total_nodes": None,
-        "cache_cell_size_nm": 1_500_000,
-        "lod_levels": 7,
-        "lod_bucket_size": 500,
-        "lod_strategy": "quadratic",
-    }
+    request = {'schema_version': 1, 'source': {'archive_path': str(archive.resolve()), 'coordinate_unit': 'um'}, 'target': {'project_id': 101}}
+    settings = {'max_nodes_per_batch': 10, 'max_archive_bytes': 1000000, 'max_swc_bytes': 10000, 'max_total_nodes': None}
     batches = [
         {
             "index": index,
@@ -56,17 +37,17 @@ def make_store(tmp_path: Path, *, batch_count: int = 2) -> tuple[StateStore, dic
     store = StateStore(tmp_path / "state")
     arguments = {
         "request": request,
-        "archive": ArchiveMetadata.from_paths(archive),
+        "archive": ArchiveMetadata(archive, archive.stat().st_size, sha256_file(archive)),
         "settings": settings,
         "batches": batches,
+        "plan_digest": "a" * 64,
     }
     store.initialize_plan(**arguments)
     return store, arguments
 
 
 def commit_project(store: StateStore) -> None:
-    store.mark_project_prepared(project_id=101, stack_id=202)
-    store.mark_project_committed()
+    store.select_existing_project(101)
 
 
 def commit_batch(store: StateStore, index: int) -> None:
@@ -83,8 +64,6 @@ def test_state_files_are_canonical_and_planning_is_single_use(tmp_path: Path) ->
     with pytest.raises(InvalidInputError, match="already has a plan"):
         store.initialize_plan(**arguments)
     assert store.state_path.read_bytes() == before
-
-
 
 
 def test_posix_state_lock_is_exclusive_and_reentrant(tmp_path: Path) -> None:
@@ -105,19 +84,13 @@ def test_archive_is_verified_before_loading(tmp_path: Path) -> None:
     archive = tmp_path / "source.zip"
     archive.write_bytes(b"archive")
     store = StateStore(tmp_path / "state")
-    request = {
-        "schema_version": 1,
-        "source": {
-            "archive_path": str(archive.resolve()),
-            "coordinate_unit": "nm",
-        },
-        "stack": {"dimension": [1, 1, 1], "resolution_nm": [1, 1, 1]},
-    }
+    request = {'schema_version': 1, 'source': {'archive_path': str(archive.resolve()), 'coordinate_unit': 'nm'}, 'target': {'project_id': 101}}
     store.initialize_plan(
         request,
-        ArchiveMetadata.from_paths(archive),
+        ArchiveMetadata(archive, archive.stat().st_size, sha256_file(archive)),
         {},
         [],
+        plan_digest="a" * 64,
     )
     store.verify_immutable()
 
@@ -204,7 +177,7 @@ def test_project_batch_and_phase_lifecycle(tmp_path: Path) -> None:
     for phase in ("database_maintenance", "cache", "verification"):
         store.mark_phase_running(phase)
         store.mark_phase_complete(phase)
-    assert store.finish_run()["status"] == "ready_for_publication"
+    assert store.finish_run()["status"] == "complete"
     with pytest.raises(InvalidInputError, match="terminal"):
         store.begin_run()
 
@@ -212,7 +185,7 @@ def test_project_batch_and_phase_lifecycle(tmp_path: Path) -> None:
 def test_whole_batch_order_and_phase_prerequisites_are_enforced(tmp_path: Path) -> None:
     store, _ = make_store(tmp_path, batch_count=2)
 
-    with pytest.raises(ImmutableStateError, match="project creation"):
+    with pytest.raises(ImmutableStateError, match="target selection"):
         store.mark_batch_prepared(1)
     commit_project(store)
     with pytest.raises(ImmutableStateError, match="batch 1"):
@@ -221,21 +194,13 @@ def test_whole_batch_order_and_phase_prerequisites_are_enforced(tmp_path: Path) 
         store.mark_phase_running("database_maintenance")
 
 
-
-
-
-
-
-
-
-
-
-
-def test_reserved_project_ids_cannot_change(tmp_path: Path) -> None:
+def test_selected_project_cannot_be_replaced(tmp_path: Path) -> None:
     store, _ = make_store(tmp_path)
-    store.mark_project_prepared(project_id=101, stack_id=202)
-    with pytest.raises(ImmutableStateError, match="project_id"):
-        store.transition_project("committed", project_id=999)
+    store.select_existing_project(101)
+    with pytest.raises(ImmutableStateError, match="planned target"):
+        store.select_existing_project(999)
+    assert store.load()["project"]["project_id"] == 101
+
 
 def test_failed_and_interrupted_attempts_cannot_be_resumed(tmp_path):
     store, _ = make_store(tmp_path)

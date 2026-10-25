@@ -75,20 +75,14 @@ def parse_swc(
     max_bytes: int | None = None,
     max_nodes: int | None = None,
     scale_nm: float = 1.0,
-    max_nm: tuple[float, float, float] | None = None,
     bounds_nm: tuple[StackBounds, ...] | None = None,
 ) -> ParsedSwc:
     """Parse and validate an SWC from a binary stream.
 
-    Parsing is strict UTF-8 and bounded by ``max_bytes`` and ``max_nodes`` when
-    supplied. Without associated stack bounds, XYZ must be non-negative.
-    If ``max_nm`` is supplied, converted XYZ must not exceed the declared
-    new stack's physical extent.
-    ``scale_nm`` is used to validate converted values; returned node values
-    remain in source units. Stack geometry does not transform coordinates.
-    ``bounds_nm`` checks the union of associated stacks in project space for
-    append imports, including their translation and orientation. Negative XYZ
-    is allowed when the point lies within one of those associated stacks.
+    Parsing is strict UTF-8 and bounded by max_bytes and max_nodes when supplied.
+    scale_nm validates conversion while returned nodes remain in source units.
+    Associated stack bounds are checked in project space without transforming
+    coordinates; negative values are allowed inside those bounds.
     """
 
     if max_bytes is not None and max_bytes <= 0:
@@ -97,10 +91,6 @@ def parse_swc(
         raise ValueError("max_nodes must be positive")
     if not math.isfinite(scale_nm) or scale_nm <= 0:
         raise ValueError("scale_nm must be positive and finite")
-    if max_nm is not None and (
-        len(max_nm) != 3 or any(not math.isfinite(value) or value <= 0 for value in max_nm)
-    ):
-        raise ValueError("max_nm must contain three positive finite extents")
     if bounds_nm is not None and not bounds_nm:
         raise ValueError("bounds_nm must contain at least one stack")
 
@@ -153,28 +143,13 @@ def parse_swc(
             columns[6], label, physical_line_number, "parent"
         )
 
-        for axis, (column, value) in enumerate((("x", x), ("y", y), ("z", z))):
-            # New projects start at zero. Appends instead use their associated
-            # stacks' actual bounds, which may extend into negative coordinates.
-            if value < 0 and bounds_nm is None:
-                raise _line_error(
-                    label, physical_line_number,
-                    f"{column} must be non-negative, got {value!r}",
-                )
+        for column, value in (("x", x), ("y", y), ("z", z)):
             coordinate_nm = value * scale_nm
             if not math.isfinite(coordinate_nm):
                 raise _line_error(
                     label,
                     physical_line_number,
                     f"{column} is non-finite after conversion to nanometres",
-                )
-            # A misplaced positive value can otherwise expand the cache rebuild
-            # over a huge volume and fall outside the viewer's declared extent.
-            if max_nm is not None and coordinate_nm > max_nm[axis]:
-                raise _line_error(
-                    label, physical_line_number,
-                    f"{column} coordinate {coordinate_nm!r} nm exceeds declared "
-                    f"stack extent {max_nm[axis]!r} nm",
                 )
         if bounds_nm is not None and not contains_point((x * scale_nm, y * scale_nm, z * scale_nm), bounds_nm):
             raise _line_error(

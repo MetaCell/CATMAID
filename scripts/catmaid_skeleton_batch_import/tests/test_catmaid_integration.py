@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import json
 import io
-from contextlib import nullcontext
-from types import SimpleNamespace
 
 import pytest
 
@@ -11,8 +8,6 @@ from catmaid_skeleton_batch_import import (
     edges,
     database,
     materialization,
-    project,
-    project_checks,
 )
 from catmaid_skeleton_batch_import.errors import VerificationError
 
@@ -96,69 +91,6 @@ def test_analyze_is_allowlisted_and_outside_atomic():
     connection.in_atomic_block = True
     with pytest.raises(RuntimeError, match="outside"):
         database.analyze_tables(connection)
-
-
-def test_stack_metadata_is_one_writable_profile():
-    assert project.build_stack_metadata() == {
-        "cache_provider": "cached_msgpack_grid",
-        "read_only": False,
-        "spatial": [{"chunk_size": [1_500_000] * 3, "limit": 0}],
-    }
-
-
-def test_create_hidden_project_is_create_only_and_returns_tracing_ids():
-    created = {}
-
-    class Manager:
-        def __init__(self, label):
-            self.label = label
-
-        def create(self, **kwargs):
-            created[self.label] = kwargs
-            return SimpleNamespace(**kwargs)
-
-    project_model = SimpleNamespace(objects=Manager("project"))
-    stack_model = SimpleNamespace(objects=Manager("stack"))
-    project_stack_model = SimpleNamespace(objects=Manager("project_stack"))
-    system_user = SimpleNamespace(id=7)
-    calls = []
-    components = {
-        "get_system_user": lambda: system_user,
-        "get_class_to_id_map": lambda *_args: {"neuron": 31, "skeleton": 32, "annotation": 33},
-        "get_relation_to_id_map": lambda *_args: {"model_of": 41, "annotated_with": 42},
-        "validate_project_setup": lambda *args, **kwargs: calls.append(
-            ("validate", args, kwargs)
-        ),
-        "check_tracing_setup": lambda _project_id: True,
-        "setup_tracing": lambda *args: calls.append(("tracing", args)),
-        "Project": project_model,
-        "ProjectStack": project_stack_model,
-        "Stack": stack_model,
-        "atomic": lambda **kwargs: nullcontext(),
-        "assign_perm": lambda permission, user, target: calls.append(
-            ("permission", permission, user.id, target.id)
-        ),
-    }
-
-    result = project.create_hidden_project(
-        project_id=1,
-        stack_id=2,
-        project_stack_id=3,
-        title="example",
-        dimension=(100, 200, 300),
-        resolution_nm=(4, 5, 6),
-        components=components,
-    )
-
-    assert created["project"]["id"] == 1
-    assert created["stack"]["metadata"]["read_only"] is False
-    assert created["stack"]["canary_location"] == (50, 100, 150)
-    assert created["project_stack"]["translation"] == (0.0, 0.0, 0.0)
-    assert result["system_user_id"] == 7
-    assert result["neuron_class_id"] == 31
-    assert sum(call[0] == "permission" for call in calls) == len(
-        project.SYSTEM_PROJECT_PERMISSIONS
-    )
 
 
 def _valid_batch_responses():
@@ -290,137 +222,5 @@ def test_batch_validation_detects_edge_parent_mismatch():
         annotated_with_relation_id=42,
             skeletons=expected,
             location_ids=[20, 21],
-            connection=connection,
-        )
-
-
-def test_final_project_stack_verification_checks_hidden_one_profile_project():
-    metadata = project.build_stack_metadata()
-    connection = ScriptedConnection(
-        [
-            [
-                (
-                    1,
-                    "example",
-                    2,
-                    "example",
-                    (10, 20, 30),
-                    (4.0, 5.0, 6.0),
-                    None,
-                    metadata,
-                    (5, 10, 15),
-                    3,
-                    (0.0, 0.0, 0.0),
-                    0,
-                )
-            ],
-            (1, 1),
-        ]
-    )
-    result = project_checks.verify_project_stack(
-        project_id=1,
-        stack_id=2,
-        project_stack_id=3,
-        system_user_id=7,
-        title="example",
-        dimension=(10, 20, 30),
-        resolution_nm=(4, 5, 6),
-        connection=connection,
-        permission_loader=lambda _project_id: {
-            "users": {7: set(project.SYSTEM_PROJECT_PERMISSIONS)},
-            "groups": {},
-        },
-        tracing_check=lambda _project_id: True,
-    )
-    assert result["hidden"] is True
-    assert result["tracing_setup"] is True
-
-
-def test_project_stack_verification_accepts_raw_json_driver_value():
-    metadata = project.build_stack_metadata()
-    connection = ScriptedConnection(
-        [
-            [
-                (
-                    1,
-                    "example",
-                    2,
-                    "example",
-                    (10, 20, 30),
-                    (4.0, 5.0, 6.0),
-                    None,
-                    json.dumps(metadata),
-                    (5, 10, 15),
-                    3,
-                    (0.0, 0.0, 0.0),
-                    0,
-                )
-            ],
-            (1, 1),
-        ]
-    )
-
-    result = project_checks.verify_project_stack(
-        project_id=1,
-        stack_id=2,
-        project_stack_id=3,
-        system_user_id=7,
-        title="example",
-        dimension=(10, 20, 30),
-        resolution_nm=(4, 5, 6),
-        connection=connection,
-        permission_loader=lambda _project_id: {
-            "users": {7: set(project.SYSTEM_PROJECT_PERMISSIONS)},
-            "groups": {},
-        },
-        tracing_check=lambda _project_id: True,
-    )
-
-    assert result["metadata"] == metadata
-
-
-def test_project_aggregate_counts_use_one_constant_size_result():
-    connection = ScriptedConnection([(3, 3, 3, 10, 10, 3, 3, 3)])
-
-    result = project_checks.verify_project_aggregate_counts(
-        project_id=1,
-        neuron_class_id=31,
-        skeleton_class_id=32,
-        model_of_relation_id=41,
-        annotation_class_id=33,
-        annotated_with_relation_id=42,
-        expected_skeleton_count=3,
-        expected_node_count=10,
-        connection=connection,
-    )
-
-    assert result == {
-        "class_instance_count": 9,
-        "annotation_count": 3,
-        "annotation_link_count": 3,
-        "model_of_count": 3,
-        "neuron_count": 3,
-        "skeleton_count": 3,
-        "relationship_count": 6,
-        "treenode_count": 10,
-        "edge_count": 10,
-        "summary_count": 3,
-    }
-    assert len(connection.executions) == 1
-    assert "SELECT count(*) FROM treenode" in connection.executions[0][0]
-
-
-def test_project_aggregate_counts_reject_extra_project_rows():
-    connection = ScriptedConnection([(3, 3, 4, 10, 10, 3, 3, 3)])
-    with pytest.raises(VerificationError, match="project-wide database counts"):
-        project_checks.verify_project_aggregate_counts(
-            project_id=1,
-            neuron_class_id=31,
-            skeleton_class_id=32,
-            model_of_relation_id=41,
-        annotation_class_id=33,
-        annotated_with_relation_id=42,
-            expected_skeleton_count=3,
-            expected_node_count=10,
             connection=connection,
         )

@@ -170,9 +170,9 @@ def test_copy_rows_preserve_literal_identifiers_without_name_template_expansion(
     import csv
     from catmaid_skeleton_batch_import.domain import IngestionRequest, SwcNode
     from catmaid_skeleton_batch_import.loader import ProjectContext, prepare_copy_rows
-    request = IngestionRequest(1, tmp_path / "source.zip", "nm", (10, 10, 10), (1, 1, 1))
+    request = IngestionRequest(1, tmp_path / 'source.zip', 'nm', target_project_id=123)
     plan = build_plan([member("folder/ 00001.0 {n} .SWC", 2)], 2)
-    project = ProjectContext(1, 2, 3, 7, 31, 32, 41, 33, 42)
+    project = ProjectContext(1, 7, 31, 32, 41, 33, 42)
     nodes = (SwcNode(1, 1, 1, 1, 1, 1, -1), SwcNode(2, 3, 2, 1, 1, 1, 1))
     # This helper checks cable length against the source independently of metadata.
     batch = replace(plan.batches[0], members=(replace(plan.members[0], cable_length_nm=1.0),))

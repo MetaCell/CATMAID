@@ -22,8 +22,8 @@ def test_status_enums_use_plain_json_strings(enum_type):
 def test_database_transition_rejects_a_phase_only_status(tmp_path):
     store, _ = make_store(tmp_path)
     before = store.state_path.read_bytes()
-    with pytest.raises(InvalidInputError, match="Unknown project state"):
-        store.transition_project(OperationStatus.COMPLETE)
+    with pytest.raises(InvalidInputError, match="Unknown batch state"):
+        store.transition_batch(1, OperationStatus.COMPLETE)
     assert store.state_path.read_bytes() == before
 
 

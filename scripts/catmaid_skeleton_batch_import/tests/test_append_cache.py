@@ -5,7 +5,6 @@ from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 import importlib.util
 from pathlib import Path
-import sys
 from types import SimpleNamespace
 
 import pytest

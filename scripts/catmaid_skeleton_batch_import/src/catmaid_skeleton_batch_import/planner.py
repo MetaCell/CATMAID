@@ -164,10 +164,6 @@ def serialize_plan(plan: ImportPlan) -> bytes:
     return deterministic_gzip_bytes(_plan_lines(plan))
 
 
-def plan_sha256(plan: ImportPlan) -> str:
-    return sha256_bytes(serialize_plan(plan))
-
-
 def write_plan(path: Path, plan: ImportPlan) -> str:
     payload = serialize_plan(plan)
     atomic_write_bytes(path, payload)

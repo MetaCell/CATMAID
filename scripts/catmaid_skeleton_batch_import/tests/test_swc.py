@@ -88,40 +88,34 @@ def test_geometry_without_declared_stack_has_no_upper_bound() -> None:
 
 @pytest.mark.parametrize("axis", ["x", "y", "z"])
 @pytest.mark.parametrize("scale_nm", [1, 1000])
-def test_rejects_coordinates_beyond_declared_extent_after_unit_conversion(axis, scale_nm):
+def test_rejects_coordinates_outside_associated_bounds_after_unit_conversion(axis, scale_nm):
     extents = (1000.0, 2000.0, 3000.0)
     index = ["x", "y", "z"].index(axis)
     coordinates = ["0", "0", "0"]
     coordinates[index] = str((extents[index] + 1) / scale_nm)
     content = ("# header\n1 1 " + " ".join(coordinates) + " -1 -1\n").encode()
-    with pytest.raises(InvalidInputError, match=rf"cell\.swc:2: {axis} coordinate .* exceeds declared stack extent"):
-        parse(content, scale_nm=scale_nm, max_nm=extents)
+    with pytest.raises(InvalidInputError, match=r"cell\.swc:2: point .* outside all associated target stack bounds"):
+        parse(content, scale_nm=scale_nm, bounds_nm=(((0, 0, 0), extents),))
 
 
 @pytest.mark.parametrize("scale_nm", [1, 1000])
-def test_origin_and_exact_declared_extent_are_accepted_without_scaling_source_nodes(scale_nm):
+def test_origin_and_exact_associated_extent_are_accepted_without_scaling_source_nodes(scale_nm):
     extents = (1000.0, 2000.0, 3000.0)
     coordinates = tuple(value / scale_nm for value in extents)
     content = ("1 1 0 0 0 -1 -1\n2 3 " +
                " ".join(map(str, coordinates)) + " -1 1\n").encode()
-    parsed = parse(content, scale_nm=scale_nm, max_nm=extents)
+    parsed = parse(content, scale_nm=scale_nm, bounds_nm=(((0, 0, 0), extents),))
     assert (parsed.nodes[1].x, parsed.nodes[1].y, parsed.nodes[1].z) == coordinates
-
-
-@pytest.mark.parametrize("extent", [(1, 2), (1, 2, 0), (1, 2, float("inf"))])
-def test_invalid_declared_extents_are_rejected(extent):
-    with pytest.raises(ValueError, match="positive finite extents"):
-        parse(b"1 1 0 0 0 -1 -1\n", max_nm=extent)
 
 
 @pytest.mark.parametrize("axis", ["x", "y", "z"])
 @pytest.mark.parametrize("scale_nm", [1, 1000])
-def test_rejects_negative_coordinates_without_associated_bounds_with_axis_member_and_line_context(axis, scale_nm):
+def test_rejects_negative_coordinates_outside_associated_bounds_with_axis_member_and_line_context(axis, scale_nm):
     coordinates = ["0", "0", "0"]
     coordinates[["x", "y", "z"].index(axis)] = "-0.001"
     content = ("# header\n1 1 " + " ".join(coordinates) + " -1 -1\n").encode()
-    with pytest.raises(InvalidInputError, match=rf"cell\.swc:2: {axis} must be non-negative"):
-        parse(content, scale_nm=scale_nm, max_nm=(1000, 2000, 3000))
+    with pytest.raises(InvalidInputError, match=r"cell\.swc:2: point .* outside all associated target stack bounds"):
+        parse(content, scale_nm=scale_nm, bounds_nm=(((0, 0, 0), (1000, 2000, 3000)),))
 
 
 def test_zero_coordinates_and_unknown_radius_and_root_sentinels_remain_valid():
