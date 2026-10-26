@@ -143,7 +143,6 @@ class FinalizeConfig:
 @dataclass(frozen=True)
 class FinalizationDecision:
     payload: dict[str, object]
-    cleanup_source: bool
 
 
 class WorkerArgumentParser(argparse.ArgumentParser):
@@ -1056,7 +1055,7 @@ def _invalid_workspace_decision(
     )
     if state_directory is not None and state is not None:
         _partial_state_payload(payload, state_directory, state)
-    return FinalizationDecision(payload=payload, cleanup_source=False)
+    return FinalizationDecision(payload=payload)
 
 
 def derive_finalization(config: FinalizeConfig) -> FinalizationDecision:
@@ -1109,7 +1108,7 @@ def derive_finalization(config: FinalizeConfig) -> FinalizationDecision:
                 success = _success_payload(config, state_directory, state, download_result)
             except WorkspaceStateError as exc:
                 return _invalid_workspace_decision(config, exc, state_directory=state_directory, state=state)
-            return FinalizationDecision(payload=success, cleanup_source=True)
+            return FinalizationDecision(payload=success)
         # Preparation/failed includes a possible COMMIT whose outcome was not saved.
         loading_started = any(batch["status"] != "planned" for batch in state["batches"])
         outcome = "operator_attention" if loading_started else "failed"
@@ -1167,21 +1166,7 @@ def derive_finalization(config: FinalizeConfig) -> FinalizationDecision:
         archive = _validated_archive(download_result.get("archive"))
         if archive:
             payload["archive"] = archive
-    return FinalizationDecision(payload=payload, cleanup_source=False)
-
-
-def cleanup_download_artifacts(workspace: Path) -> list[str]:
-    """Remove only the bounded source files after durable success acknowledgement."""
-
-    removed: list[str] = []
-    workspace = Path(workspace)
-    for filename in (SOURCE_FILENAME, PART_FILENAME):
-        path = workspace / filename
-        existed = _path_entry_exists(path)
-        _safe_unlink(path)
-        if existed:
-            removed.append(filename)
-    return removed
+    return FinalizationDecision(payload=payload)
 
 
 def _error_result(

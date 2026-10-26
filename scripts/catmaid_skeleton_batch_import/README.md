@@ -53,7 +53,9 @@ can expose this file as an output parameter so its exit notifier needs no disk
 access. Pod loss before that hand-off still requires inspection; there is no
 pod-loss recovery or automatic import retry.
 
-All source/audit files remain until explicit cleanup. Node maps are not sent
+All source/audit files remain until explicit cleanup. Workflow finalization only
+classifies the result; it has no source-deletion decision or cleanup hook.
+Retention belongs to the calling system or operator. Node maps are not sent
 through the terminal output. In MNP, only the processing pod mounts the retained
 RWO claim, workflows sharing it are serialized, and the managed layer stays
 listed but inactive in the client until a safe result. This client behavior

@@ -675,7 +675,6 @@ class FinalizationPayloadTests(SkeletonIngestionWorkerTestCase):
     def assert_attention(self, category=None):
         decision = self.decision()
         self.assertEqual(decision.payload["outcome"], "operator_attention")
-        self.assertFalse(decision.cleanup_source)
         if category:
             self.assertEqual(decision.payload["error"]["category"], category)
         return decision
@@ -685,7 +684,6 @@ class FinalizationPayloadTests(SkeletonIngestionWorkerTestCase):
         self.result(category="internal_error", message="stale diagnostic")
         decision = self.decision()
         self.assertEqual(decision.payload["outcome"], "succeeded")
-        self.assertTrue(decision.cleanup_source)
         self.assertEqual(decision.payload["project_id"], 41)
         self.assertEqual(decision.payload["nodes"], 101)
         self.assertNotIn("stack_id", decision.payload)
@@ -758,7 +756,6 @@ class FinalizationPayloadTests(SkeletonIngestionWorkerTestCase):
         self.assertEqual(decision.payload["error"]["category"], "invalid_input")
         self.assertIn("missing parent 9999", decision.payload["error"]["message"])
         self.assertNotIn("member_errors", json.dumps(decision.payload))
-        self.assertFalse(decision.cleanup_source)
         self.assertTrue(diagnostics.exists())
 
     def test_wrapper_setup_failure_supersedes_stale_plan_success(self):
@@ -911,43 +908,6 @@ class FinalizationPayloadTests(SkeletonIngestionWorkerTestCase):
         decision = self.decision()
         self.assertEqual(decision.payload["outcome"], "failed")
         self.assertEqual(decision.payload["error"]["message"], "NoSuchKey")
-
-
-class FinalizationCleanupTests(SkeletonIngestionWorkerTestCase):
-    """Delete only bounded source artifacts after durable success."""
-
-    def test_cleanup_helper_removes_only_fixed_download_artifacts(self) -> None:
-        source = self.workspace / worker.SOURCE_FILENAME
-        partial = self.workspace / worker.PART_FILENAME
-        request = self.workspace / worker.REQUEST_FILENAME
-        download_result = self.workspace / worker.DOWNLOAD_RESULT_FILENAME
-        unrelated = self.workspace / "operator-notes.zip"
-        source.write_bytes(b"source")
-        partial.write_bytes(b"partial")
-        request.write_text("request evidence", encoding="utf-8")
-        download_result.write_text("result evidence", encoding="utf-8")
-        unrelated.write_bytes(b"retain")
-
-        removed = worker.cleanup_download_artifacts(self.workspace)
-
-        self.assertEqual(
-            removed,
-            [worker.SOURCE_FILENAME, worker.PART_FILENAME],
-            "Cleanup should report only the two fixed download artifact names",
-        )
-        self.assertFalse(source.exists(), "Cleanup should delete source.zip")
-        self.assertFalse(partial.exists(), "Cleanup should delete source.zip.part")
-        for retained in (request, download_result, unrelated):
-            with self.subTest(path=retained.name):
-                self.assertTrue(
-                    retained.exists(),
-                    f"Cleanup must preserve diagnostic artifact {retained.name}",
-                )
-        self.assertEqual(
-            worker.cleanup_download_artifacts(self.workspace),
-            [],
-            "Cleanup replay should be idempotent after source files are gone",
-        )
 
 
 class WorkerCommandContractTests(SkeletonIngestionWorkerTestCase):

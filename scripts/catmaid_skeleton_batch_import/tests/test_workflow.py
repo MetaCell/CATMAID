@@ -25,7 +25,7 @@ def decision(outcome):
                      archive={"sha256": "a" * 64, "size_bytes": 12})
     else:
         value["error"] = {"category": "operation_failed", "message": "Failed"}
-    return io.FinalizationDecision(value, outcome == "succeeded")
+    return io.FinalizationDecision(value)
 
 
 def test_all_stages_run_once_in_one_process_and_expose_terminal_evidence(tmp_path):
