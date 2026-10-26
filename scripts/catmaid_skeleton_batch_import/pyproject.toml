@@ -11,6 +11,9 @@ requires-python = ">=3.10"
 license = {text = "GPL-3.0-or-later"}
 dependencies = []
 
+[project.optional-dependencies]
+workflow = ["boto3>=1.35", "cryptography>=42"]
+
 [project.scripts]
 catmaid-skeleton-import = "catmaid_skeleton_batch_import.cli:main"
 

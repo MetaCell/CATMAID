@@ -13,6 +13,52 @@ can remain running, but no other client, administrator or background job may edi
 the target project's morphology, stack geometry or cache configuration during the import.
 Deactivating one viewer's layer alone does not block other writers.
 
+## Optional single-pod workflow
+
+For an orchestrated ingestion, install the workflow extras and run one finite
+processing command:
+
+```bash
+python -m pip install './scripts/catmaid_skeleton_batch_import[workflow]'
+python -m catmaid_skeleton_batch_import.workflow
+```
+
+The orchestrator supplies `SKELETON_INGESTION_ID`, a fresh
+`SKELETON_INGESTION_WORKSPACE` ending in that UUID,
+`SKELETON_INGESTION_WORKFLOW_NAME` and
+`SKELETON_INGESTION_WORKFLOW_UID`. Source inputs are a public
+`SKELETON_INGESTION_S3_URI` or an encrypted
+`SKELETON_INGESTION_SOURCE_ENCRYPTED` with its
+`SKELETON_INGESTION_SOURCE_KEY`. Also supply
+`SKELETON_INGESTION_COORDINATE_UNIT`,
+`SKELETON_INGESTION_TARGET_PROJECT_ID` and
+`SKELETON_INGESTION_MAX_ARCHIVE_BYTES`, plus the normal database settings.
+
+The command owns download → preflight → plan → run in order. Run includes
+maintenance, updating existing caches and verification. It uses the same
+single-attempt importer, source validation, three-attempt transfer budget and
+retained-state checks. It refuses a nonempty workspace.
+
+`workflow_io.py` owns downloading and retained-evidence decisions;
+`archive_sources.py` validates/decrypts storage URLs.
+`workflow_progress.py` retains subprocess logs and bridges state/cache
+observations into the optional `ARGO_PROGRESS_FILE` five-stage ratio.
+These helpers moved from MNP; the core local-ZIP CLI below remains unchanged.
+The package never calls NeuroGlass or Kafka.
+
+Before exit it writes a bounded schema-1 `terminal-result.json` containing
+the workflow identity and verified outcome/counts or a useful error. Missing or
+conflicting execution evidence cannot establish success. A calling workflow
+can expose this file as an output parameter so its exit notifier needs no disk
+access. Pod loss before that hand-off still requires inspection; there is no
+pod-loss recovery or automatic import retry.
+
+All source/audit files remain until explicit cleanup. Node maps are not sent
+through the terminal output. In MNP, only the processing pod mounts the retained
+RWO claim, workflows sharing it are serialized, and the managed layer stays
+listed but inactive in the client until a safe result. This client behavior
+does not block direct CATMAID writers.
+
 ## File format contract
 
 All versioned ingestion formats use `schema_version: 1`, including plans,
@@ -730,5 +776,6 @@ rebuilding publishes 0/total and then successful cell counts. No configured cove
 This bounded observational file is replaced atomically at most once per second,
 plus the initial and final updates. A progress-file IO failure is nonfatal.
 The file is observational and is not registered as an immutable artifact. Cache receipts, state transitions and final verification still decide
-completion. MNP translates these observations and confirmed batch states into
-native Argo progress; the importer has no Argo or NeuroGlass dependency.
+completion. The optional CATMAID workflow bridge translates these observations
+and confirmed batches into native file progress. Core importer execution does
+not query Argo or depend on NeuroGlass.
