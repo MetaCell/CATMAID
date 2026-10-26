@@ -13,6 +13,18 @@ can remain running, but no other client, administrator or background job may edi
 the target project's morphology, stack geometry or cache configuration during the import.
 Deactivating one viewer's layer alone does not block other writers.
 
+## File format contract
+
+All versioned ingestion formats use `schema_version: 1`, including plans,
+state, requests, command results, artifact metadata and cache progress. The
+recorded `planner_version` is also `1`. These are file-format versions, separate
+from the importer package version.
+
+Only the current layouts are supported. Earlier development workspaces are not
+compatible and are not converted; use a fresh workspace with the matching MNP
+and CATMAID implementations. Do not edit a saved version number to reuse a
+partially loaded workspace.
+
 ## Interface
 
 Install the package in the same Python environment as CATMAID:

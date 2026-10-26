@@ -34,7 +34,7 @@ def planned(tmp_path, monkeypatch):
 
 def test_plan_retains_exact_validated_nodes_in_two_bounded_batches(tmp_path, monkeypatch):
     state, plan, text, request = planned(tmp_path, monkeypatch)
-    assert plan.schema_version == 4
+    assert plan.schema_version == 1
     assert [b.node_count for b in plan.batches] == [4, 2]
     expected = parse_swc(BytesIO(text), "test", max_bytes=1000, max_nodes=4, scale_nm=1, bounds_nm=(((0, 0, 0), (100, 100, 100)),)).nodes
     with patch("catmaid_skeleton_batch_import.archive.parse_swc", side_effect=AssertionError("SWCs must not be reparsed")):

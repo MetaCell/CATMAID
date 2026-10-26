@@ -70,7 +70,7 @@ def test_new_plan_and_manifest_preserve_identifier_and_five_id_layout(tmp_path):
     path = tmp_path / "plan.jsonl.gz"
     write_plan(path, plan)
     loaded = read_plan(path)
-    assert loaded.schema_version == 4
+    assert loaded.schema_version == 1
     assert loaded.members[0].fragment_id == "0021814"
     rows = manifest_rows(loaded.batches[0], [10, 11, 12, 13, 14])
     assert rows[0]["fragment_id"] == "0021814"
@@ -94,8 +94,8 @@ def test_old_plan_with_untrimmed_identifiers_is_rejected_instead_of_renormalized
         read_plan(path)
 
 
-@pytest.mark.parametrize("schema_version", [1, 2, 3])
-def test_rejects_old_development_plan_before_reading_old_member_layout(tmp_path, schema_version):
+@pytest.mark.parametrize("schema_version", [0, 2, 3, 4, 99])
+def test_rejects_unsupported_plan_schema_before_reading_members(tmp_path, schema_version):
     path = tmp_path / "old.jsonl.gz"
     with gzip.open(path, "wt") as target:
         target.write(json.dumps({"record_type": "header", "schema_version": schema_version}) + "\n")
@@ -103,7 +103,7 @@ def test_rejects_old_development_plan_before_reading_old_member_layout(tmp_path,
         read_plan(path)
 
 
-@pytest.mark.parametrize("schema_version", [1, 2])
+@pytest.mark.parametrize("schema_version", [0, 2, 3, 4, 99])
 def test_rejects_unsupported_state_schema(tmp_path, schema_version):
     (tmp_path / "state.json").write_text(json.dumps({"schema_version": schema_version}))
     with pytest.raises(ImmutableStateError, match="Unsupported or malformed"):

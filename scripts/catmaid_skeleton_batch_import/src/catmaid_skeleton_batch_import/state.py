@@ -34,7 +34,7 @@ from .util import (
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 1
 METADATA_SCHEMA_VERSION = 1
 REQUEST_FILENAME = "request.json"
 ARCHIVE_FILENAME = "archive.json"
@@ -249,7 +249,7 @@ class StateStore:
         batches: Sequence[PlannedBatch | Mapping[str, Any]],
         *,
         plan_digest: str,
-        planner_version: int = 4,
+        planner_version: int = 1,
         artifacts: Mapping[str, Mapping[str, Any]] | None = None,
         batch_artifacts: Mapping[int, Mapping[str, Mapping[str, Any]]] | None = None,
     ) -> dict[str, Any]:

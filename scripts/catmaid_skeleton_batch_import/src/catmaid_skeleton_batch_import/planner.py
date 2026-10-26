@@ -22,7 +22,7 @@ from .util import (
 )
 
 
-PLAN_SCHEMA_VERSION = 4
+PLAN_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)

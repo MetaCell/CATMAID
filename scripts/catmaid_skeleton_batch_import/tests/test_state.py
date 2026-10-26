@@ -57,7 +57,8 @@ def commit_batch(store: StateStore, index: int) -> None:
 
 def test_state_files_are_canonical_and_planning_is_single_use(tmp_path: Path) -> None:
     store, arguments = make_store(tmp_path)
-    assert store.load()["schema_version"] == SCHEMA_VERSION
+    assert store.load()["schema_version"] == SCHEMA_VERSION == 1
+    assert store.load()["plan"]["planner_version"] == 1
     for path in (store.request_path, store.archive_path, store.state_path):
         assert path.read_bytes() == canonical_json_bytes(json.loads(path.read_bytes()))
     before = store.state_path.read_bytes()
