@@ -43,7 +43,7 @@ def decision(outcome):
 def test_all_stages_run_once_in_one_process_and_expose_terminal_evidence(tmp_path):
     env = environment(tmp_path)
     with patch.object(io, "execute", return_value=0) as download, \
-         patch.object(workflow.progress, "run", return_value=0) as run, \
+         patch.object(workflow.runner, "run", return_value=0) as run, \
          patch.object(io, "derive_finalization", return_value=decision("succeeded")):
         assert workflow.execute(env) == 0
     download.assert_called_once_with(["download"], environ=env)
@@ -56,7 +56,7 @@ def test_all_stages_run_once_in_one_process_and_expose_terminal_evidence(tmp_pat
 def test_download_failure_skips_every_database_stage(tmp_path):
     env = environment(tmp_path)
     with patch.object(io, "execute", return_value=2), \
-         patch.object(workflow.progress, "run") as run, \
+         patch.object(workflow.runner, "run") as run, \
          patch.object(io, "derive_finalization", return_value=decision("failed")):
         assert workflow.execute(env) == 2
     run.assert_not_called()
@@ -65,7 +65,7 @@ def test_download_failure_skips_every_database_stage(tmp_path):
 def test_failed_stage_stops_without_retry_and_retains_evidence(tmp_path):
     env = environment(tmp_path)
     with patch.object(io, "execute", return_value=0), \
-         patch.object(workflow.progress, "run", side_effect=[0, 2]) as run, \
+         patch.object(workflow.runner, "run", side_effect=[0, 2]) as run, \
          patch.object(io, "derive_finalization", return_value=decision("failed")):
         assert workflow.execute(env) == 2
     assert [c.args[0] for c in run.call_args_list] == ["preflight", "plan"]
@@ -88,7 +88,7 @@ def test_existing_workspace_is_not_relabelled_or_overwritten(tmp_path):
 def test_preflight_readiness_failure_is_confirmed_before_loading(tmp_path):
     env = environment(tmp_path)
     with patch.object(io, "execute", return_value=0), \
-         patch.object(workflow.progress, "run", return_value=3), \
+         patch.object(workflow.runner, "run", return_value=3), \
          patch.object(io, "derive_finalization", return_value=decision("operator_attention")):
         assert workflow.execute(env) == 3
     record = json.loads((Path(env["SKELETON_INGESTION_WORKSPACE"]) / workflow.TERMINAL_FILENAME).read_text())
@@ -104,7 +104,7 @@ def test_preloading_failure_reports_the_cli_stage_name(tmp_path, project_lock, s
     result = decision("operator_attention")
     result.payload["error"]["category"] = "workspace_evidence_missing"
     with patch.object(io, "execute", return_value=0), \
-         patch.object(workflow.progress, "run", side_effect=exits) as run, \
+         patch.object(workflow.runner, "run", side_effect=exits) as run, \
          patch.object(io, "derive_finalization", return_value=result):
         assert workflow.execute(env) == 3
 
@@ -138,13 +138,13 @@ def test_signal_between_stages_stops_before_loading(tmp_path, signum, after_stag
 import os
 import signal
 import sys
-from catmaid_skeleton_batch_import import workflow, workflow_progress
+from catmaid_skeleton_batch_import import workflow, workflow_runner
 
-workflow_progress.CATMAID_WRAPPER = sys.argv[1]
+workflow_runner.CATMAID_WRAPPER = sys.argv[1]
 workflow.io.execute = lambda *_args, **_kwargs: 0
 from unittest.mock import Mock
 workflow.WorkflowProjectLock = lambda *_args: Mock()
-original_run = workflow_progress.run
+original_run = workflow_runner.run
 
 def run(action):
     code = original_run(action)
@@ -152,7 +152,7 @@ def run(action):
         os.kill(os.getpid(), int(sys.argv[2]))
     return code
 
-workflow_progress.run = run
+workflow_runner.run = run
 raise SystemExit(workflow.execute())
 """)
     child = subprocess.run(
@@ -176,7 +176,7 @@ def test_download_and_all_stages_start_after_acquiring_the_lock(tmp_path, projec
     project_lock.acquire.side_effect = lambda: events.append("lock")
     project_lock.finish.side_effect = lambda *_a, **_kw: events.append("finish")
     with patch.object(io, "execute", side_effect=lambda *_a, **_kw: events.append("download") or 0), \
-         patch.object(workflow.progress, "run", side_effect=lambda action: events.append(action) or 0), \
+         patch.object(workflow.runner, "run", side_effect=lambda action: events.append(action) or 0), \
          patch.object(io, "derive_finalization", return_value=decision("succeeded")):
         assert workflow.execute(env) == 0
     assert events == ["lock", "download", "preflight", "plan", "run", "finish"]

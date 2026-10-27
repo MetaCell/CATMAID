@@ -45,8 +45,9 @@ evidence is retained when it can be written during shutdown.
 
 `workflow_io.py` owns downloading and retained-evidence decisions;
 `archive_sources.py` validates/decrypts storage URLs.
-`workflow_progress.py` retains subprocess logs and bridges state/cache
-observations into the optional `ARGO_PROGRESS_FILE` five-stage ratio.
+`workflow_runner.py` launches command subprocesses, retains logs, forwards
+cancellation and bridges state/cache observations into the optional
+`ARGO_PROGRESS_FILE` five-stage ratio.
 These helpers moved from MNP; the core local-ZIP CLI below remains unchanged.
 The package never calls NeuroGlass or Kafka.
 

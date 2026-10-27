@@ -1321,7 +1321,7 @@ class SignedArchiveDownloadTests(SkeletonIngestionWorkerTestCase):
 
 class DownloadProgressTests(SkeletonIngestionWorkerTestCase):
     def test_real_stream_updates_byte_progress_before_download_finishes(self):
-        from catmaid_skeleton_batch_import import workflow_progress as runner
+        from catmaid_skeleton_batch_import import workflow_runner as runner
         native = self.root / "native-progress"
         observed = []
         class Body(_StreamingBody):

@@ -1,4 +1,4 @@
-"""Finite CATMAID subprocess with retained logs; no NeuroGlass transport."""
+"""Run CATMAID commands with retained logs, cancellation, and native Argo progress."""
 
 from __future__ import annotations
 import argparse

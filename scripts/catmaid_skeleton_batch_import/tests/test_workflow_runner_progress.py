@@ -1,5 +1,5 @@
 from unittest import TestCase
-from catmaid_skeleton_batch_import.workflow_progress import progress_units, FINAL_PHASES
+from catmaid_skeleton_batch_import.workflow_runner import progress_units, FINAL_PHASES
 
 class NativeProgressUnitsTests(TestCase):
     def state(self, statuses, **phases):

@@ -15,7 +15,7 @@ from contextlib import nullcontext
 
 import pytest
 
-from catmaid_skeleton_batch_import import workflow_progress as runner
+from catmaid_skeleton_batch_import import workflow_runner as runner
 
 
 class RetainedRunnerTests(TestCase):
@@ -28,7 +28,7 @@ class RetainedRunnerTests(TestCase):
     def start(self, source, setup="", **extra_env):
         self.child_script.write_text(source)
         code = (
-            "from catmaid_skeleton_batch_import import workflow_progress as r; "
+            "from catmaid_skeleton_batch_import import workflow_runner as r; "
             f"r.CATMAID_WRAPPER={str(self.child_script)!r}; "
             + (setup + "; " if setup else "")
             + "raise SystemExit(r.run('run'))"

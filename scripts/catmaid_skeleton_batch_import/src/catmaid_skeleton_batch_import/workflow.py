@@ -10,7 +10,7 @@ import os
 import sys
 from enum import Enum
 
-from . import workflow_io as io, workflow_progress as progress
+from . import workflow_io as io, workflow_runner as runner
 from .project_lock import WorkflowProjectLock
 
 TERMINAL_FILENAME = "terminal-result.json"
@@ -26,7 +26,7 @@ class WorkflowStage(Enum):
     RUN = "run"
 
 
-@progress.termination_signals()
+@runner.termination_signals()
 def execute(environ=None):
     environment = os.environ if environ is None else environ
     workspace = None
@@ -47,12 +47,12 @@ def execute(environ=None):
         stage = WorkflowStage.DOWNLOAD
         code = io.execute([stage.value], environ=environment)
         if code == 0:
-            progress.write_native_progress(*progress.stage_units(1))
+            runner.write_native_progress(*runner.stage_units(1))
             for stage in (WorkflowStage.PREFLIGHT, WorkflowStage.PLAN, WorkflowStage.RUN):
-                code = progress.run(stage.value)
+                code = runner.run(stage.value)
                 if code != 0:
                     break
-    except progress.WorkflowInterrupted as exc:
+    except runner.WorkflowInterrupted as exc:
         print(f"Workflow interrupted by signal {exc.signum}", file=sys.stderr)
         code = exc.code
     except io.WorkerError as exc:

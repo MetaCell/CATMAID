@@ -568,7 +568,7 @@ def _download_archive_once(
 
         digest = hashlib.sha256()
         downloaded = 0
-        from .workflow_progress import write_native_progress, stage_units
+        from .workflow_runner import write_native_progress, stage_units
         write_native_progress(*stage_units(1, 0, advertised_size or 0))
         last_progress = time.monotonic()
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
