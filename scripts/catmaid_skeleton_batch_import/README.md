@@ -133,9 +133,13 @@ pod-loss recovery or automatic import retry.
 All source/audit files remain until explicit cleanup. Workflow finalization only
 classifies the result; it has no source-deletion decision or cleanup hook.
 Retention belongs to the calling system or operator. Node maps are not sent
-through the terminal output. In MNP, only the processing pod mounts the retained
-RWO claim and workflows sharing it are serialized. The project-level lock blocks
-NeuroGlass mutations while the layer keeps its normal visibility.
+through the terminal output. In MNP, only processing pods mount the retained
+RWO claim. CloudHarness's built-in affinity places pods sharing that claim on the
+same node, allowing different projects to ingest concurrently when node resources
+permit. Each ingestion writes to its own UUID directory; there is no shared
+workflow mutex. The per-project lock still prevents competing ingestion and
+NeuroGlass mutations on the same target while the layer keeps its normal visibility.
+The exit notifier does not mount the claim.
 
 ## Project-level ingestion lock
 
