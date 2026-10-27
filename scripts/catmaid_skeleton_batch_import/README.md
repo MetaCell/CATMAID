@@ -13,7 +13,7 @@ updates and verification while reads remain available. No viewer polling or
 permission rewriting is involved. Native CATMAID clients and arbitrary database
 writers are outside this integration's contract and must not edit the target.
 
-## Optional single-pod workflow
+## Single-pod ingestion workflow
 
 For an orchestrated ingestion, install the workflow extras and run one finite
 processing command:
@@ -428,8 +428,13 @@ The sample root becomes `(10000, 20000, 30000)` nm with radius `2000` nm.
 
 ## Batch import and cache rebuild
 
-1. Make the target managed layer inactive in Neuroglass and stop other writes to
-   that project. No CATMAID service shutdown is required.
+1. Acquire the target project's ingestion lock. The single-pod workflow does
+   this before downloading; the standalone local-ZIP CLI does it at `run`.
+   Lock acquisition waits for existing guarded edits to finish. Matching
+   Neuroglass middleware rejects further mutations while the project is locked.
+   Native CATMAID clients and other writers outside that middleware must avoid
+   editing the target. No CATMAID service shutdown or layer-visibility change is
+   required.
 2. Run the import once. Every atomic batch uses bulk `COPY` with ordinary
    triggers bypassed only in the importer transaction, then explicitly creates
    and validates edges and summaries for that batch's new skeleton IDs. Existing
@@ -441,7 +446,8 @@ The sample root becomes `(10000, 20000, 30000)` nm with radius `2000` nm.
 4. Verify imported IDs and exact node values, unchanged grid definitions, payload
    formats, LOD counts, rebuild timestamps and absence of dirty cache markers.
    Cache payload verification runs once in this final phase.
-   Reactivate the Neuroglass layer only after successful completion.
+   The importer releases its project lock after verified run completion.
+   Refresh open viewers after success.
 
 For existing targets, grid IDs, dimensions, orientation, filters, ordering, LOD,
 JSON/JSON-text/MessagePack format flags, `allow_empty` and enabled/disabled state
@@ -453,14 +459,16 @@ Bounds cover all project nodes and connectors, including negative coordinates
 and long edges. Intentionally cached empty coverage is retained for grids with
 `allow_empty`. Ingestion always uses the existing grid definitions.
 
-Cache payloads can be absent or partially rebuilt during import. The script does
-not promise browsing or editing availability for the target layer. Other projects
-and the CATMAID service can remain available, although database load may slow
-requests. The importer does not automatically deactivate or reactivate a layer.
+Read endpoints remain available and the layer keeps its normal visibility,
+but reads can observe intermediate batch commits and cached views can be stale
+or incomplete while payloads are rebuilt. Guarded edits remain blocked through
+final verification. Other projects and the CATMAID service remain available,
+although database load may slow requests.
 
-A failed rebuild leaves committed skeleton batches intact and terminates the run.
-The saved cache plan and receipt are audit evidence. Keep the layer inactive after
-failure and inspect the database and retained files before deciding how to proceed.
+A failed rebuild leaves committed skeleton batches intact, retains the project
+lock and terminates the run. The saved cache plan and receipt are audit evidence.
+Inspect the database and retained files and resolve any partial import before
+manually releasing the matching ingestion's project lock.
 
 
 ## Source fragment identifiers
@@ -653,8 +661,9 @@ does not inspect migration history.
 result in `state/run-wrapper-result.json`. The wrapper refuses to start
 another child in a workspace with that marker. Success is reported through
 `result.json`.
-Input downloads, workflow submission,
-layer activation and failure cleanup remain the caller's responsibility.
+For these individual wrapper commands, input downloads, workflow submission and
+failure cleanup remain the caller's responsibility. The complete single-pod
+workflow handles downloading and project-lock ownership as described above.
 
 ## Deployment settings
 

@@ -8,11 +8,22 @@ from __future__ import annotations
 import json
 import os
 import sys
+from enum import Enum
 
 from . import workflow_io as io, workflow_progress as progress
 from .project_lock import WorkflowProjectLock
 
 TERMINAL_FILENAME = "terminal-result.json"
+
+
+class WorkflowStage(Enum):
+    """Execution steps, distinct from Argo's five reported progress stages."""
+
+    PROJECT_LOCK = "project_lock"
+    DOWNLOAD = "download"
+    PREFLIGHT = "preflight"
+    PLAN = "plan"
+    RUN = "run"
 
 
 @progress.termination_signals()
@@ -21,7 +32,7 @@ def execute(environ=None):
     workspace = None
     code = 1
     claimed = False
-    stage = "project_lock"
+    stage = WorkflowStage.PROJECT_LOCK
     project_lock = None
     lock_error = None
     try:
@@ -33,12 +44,12 @@ def execute(environ=None):
         claimed = True
         project_lock = WorkflowProjectLock(environment)
         project_lock.acquire()
-        stage = "download"
-        code = io.execute(["download"], environ=environment)
+        stage = WorkflowStage.DOWNLOAD
+        code = io.execute([stage.value], environ=environment)
         if code == 0:
             progress.write_native_progress(*progress.stage_units(1))
-            for stage in ("preflight", "plan", "run"):
-                code = progress.run(stage)
+            for stage in (WorkflowStage.PREFLIGHT, WorkflowStage.PLAN, WorkflowStage.RUN):
+                code = progress.run(stage.value)
                 if code != 0:
                     break
     except progress.WorkflowInterrupted as exc:
@@ -48,7 +59,14 @@ def execute(environ=None):
         print(io._sanitize_message(exc, "Workflow failed"), file=sys.stderr)
         code = exc.exit_code
         if workspace is not None and claimed:
-            io._persist_download_failure(environment, io._error_result("download", environment.get("SKELETON_INGESTION_ID"), exc))
+            io._persist_download_failure(
+                environment,
+                io._error_result(
+                    WorkflowStage.DOWNLOAD.value,
+                    environment.get("SKELETON_INGESTION_ID"),
+                    exc,
+                ),
+            )
     except (Exception, KeyboardInterrupt) as exc:
         print(io._sanitize_message(exc, "Workflow interrupted"), file=sys.stderr)
         code = 1
@@ -57,7 +75,7 @@ def execute(environ=None):
             try:
                 if project_lock is not None:
                     try:
-                        project_lock.finish(workspace, run_started=stage == "run")
+                        project_lock.finish(workspace, run_started=stage == WorkflowStage.RUN)
                     except Exception as exc:
                         lock_error = io._sanitize_message(exc, "Project ingestion lock release was not confirmed")
                 decision = io.derive_finalization(io.FinalizeConfig(
@@ -73,14 +91,14 @@ def execute(environ=None):
                     decision.payload.update(outcome="operator_attention", error={
                         "category": "project_ingestion_lock", "message": lock_error,
                     })
-                elif code != 0 and stage != "run":
+                elif code != 0 and stage != WorkflowStage.RUN:
                     decision.payload["outcome"] = "failed"
                     if decision.payload.get("error", {}).get("category") == "workspace_evidence_missing":
                         decision.payload["error"] = {
                             "category": "operation_failed",
-                            "message": f"CATMAID {stage} exited with code {code} before loading",
+                            "message": f"CATMAID {stage.value} exited with code {code} before loading",
                         }
-                if code != 0 and stage == "run" and decision.payload["outcome"] == "succeeded":
+                if code != 0 and stage == WorkflowStage.RUN and decision.payload["outcome"] == "succeeded":
                     decision.payload.update(outcome="operator_attention", error={
                         "category": "workflow_failed",
                         "message": "Import verified, but the processing command did not finish successfully",

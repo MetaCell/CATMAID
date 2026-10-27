@@ -46,7 +46,7 @@ def test_all_stages_run_once_in_one_process_and_expose_terminal_evidence(tmp_pat
          patch.object(workflow.progress, "run", return_value=0) as run, \
          patch.object(io, "derive_finalization", return_value=decision("succeeded")):
         assert workflow.execute(env) == 0
-    assert download.call_count == 1
+    download.assert_called_once_with(["download"], environ=env)
     assert [c.args[0] for c in run.call_args_list] == ["preflight", "plan", "run"]
     record = json.loads((Path(env["SKELETON_INGESTION_WORKSPACE"]) / workflow.TERMINAL_FILENAME).read_text())
     assert record["schema_version"] == 1 and record["terminal"]
@@ -93,6 +93,32 @@ def test_preflight_readiness_failure_is_confirmed_before_loading(tmp_path):
         assert workflow.execute(env) == 3
     record = json.loads((Path(env["SKELETON_INGESTION_WORKSPACE"]) / workflow.TERMINAL_FILENAME).read_text())
     assert record["result"]["outcome"] == "failed"
+
+
+@pytest.mark.parametrize("stage,exits", [
+    ("preflight", [3]),
+    ("plan", [0, 3]),
+])
+def test_preloading_failure_reports_the_cli_stage_name(tmp_path, project_lock, stage, exits):
+    env = environment(tmp_path)
+    result = decision("operator_attention")
+    result.payload["error"]["category"] = "workspace_evidence_missing"
+    with patch.object(io, "execute", return_value=0), \
+         patch.object(workflow.progress, "run", side_effect=exits) as run, \
+         patch.object(io, "derive_finalization", return_value=result):
+        assert workflow.execute(env) == 3
+
+    assert run.call_args.args == (stage,)
+    project_lock.finish.assert_called_once_with(
+        Path(env["SKELETON_INGESTION_WORKSPACE"]), run_started=False,
+    )
+    terminal = json.loads(
+        (Path(env["SKELETON_INGESTION_WORKSPACE"]) / workflow.TERMINAL_FILENAME).read_text()
+    )
+    assert terminal["result"]["outcome"] == "failed"
+    assert terminal["result"]["error"]["message"] == (
+        f"CATMAID {stage} exited with code 3 before loading"
+    )
 
 
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
