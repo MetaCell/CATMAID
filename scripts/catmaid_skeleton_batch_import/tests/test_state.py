@@ -259,3 +259,39 @@ def test_run_rejects_a_different_ingestion_uuid_before_acquisition(tmp_path, mon
     state = store.load()
     assert state["run"]["status"] == "pending"
     assert state["project_lock"]["status"] == "pending"
+
+
+def test_workspace_lock_rejects_another_process_before_database_access(tmp_path):
+    import subprocess
+    import sys
+
+    store, _ = make_store(tmp_path)
+    before = store.state_path.read_bytes()
+    marker = tmp_path / "database-accessed"
+    launcher = tmp_path / "second_importer.py"
+    launcher.write_text("""
+from pathlib import Path
+import sys
+from catmaid_skeleton_batch_import import orchestrator
+from catmaid_skeleton_batch_import.errors import OperationalFailureError
+
+def unexpected_database(*_args, **_kwargs):
+    Path(sys.argv[2]).touch()
+    raise AssertionError("A locked workspace must not reach the database")
+
+orchestrator._database_context = unexpected_database
+try:
+    orchestrator.run_ingestion(Path(sys.argv[1]))
+except OperationalFailureError as error:
+    print(str(error), file=sys.stderr)
+    raise SystemExit(error.exit_code)
+""")
+    with store.lock():
+        result = subprocess.run(
+            [sys.executable, str(launcher), str(store.state_dir), str(marker)],
+            capture_output=True, timeout=10,
+        )
+    assert result.returncode == 3, result.stderr.decode()
+    assert b"State directory is already locked" in result.stderr
+    assert not marker.exists()
+    assert store.state_path.read_bytes() == before

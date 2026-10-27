@@ -7,9 +7,8 @@ or a configured Django settings module.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 from .util import canonical_json_bytes
@@ -265,32 +264,3 @@ def analyze_tables(
         for table in normalized:
             cursor.execute(f"ANALYZE {table}")
     return {"tables": list(normalized), "count": len(normalized)}
-
-
-@contextlib.contextmanager
-def existing_project_import_lock(project_id: int, connection: Any) -> Iterator[None]:
-    """Serialize cooperating importers for one target across batch commits."""
-    from .errors import OperationalFailureError
-
-    lock_namespace = 0x4341544D  # CATM, a stable two-int advisory-lock namespace.
-    with connection.cursor() as cursor:
-        if not _fetch_scalar(
-            cursor, "SELECT pg_try_advisory_lock(%s, %s)", [lock_namespace, project_id]
-        ):
-            raise OperationalFailureError(
-                f"Another skeleton import is using project {project_id}; aborting this attempt"
-            )
-    session = getattr(connection, "connection", connection)
-    try:
-        yield
-    finally:
-        # Do not reconnect just to unlock a lost session: PostgreSQL has already
-        # released that session's advisory locks. Never mask the import failure.
-        if getattr(connection, "connection", connection) is session:
-            try:
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT pg_advisory_unlock(%s, %s)", [lock_namespace, project_id]
-                    )
-            except Exception:
-                connection.close()

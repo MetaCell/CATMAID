@@ -679,10 +679,6 @@ def _execute_ingestion(store: StateStore, resources: ExitStack) -> dict[str, obj
     metrics.record_operational_settings(**timeouts)
     metrics.set_status(MetricsStatus.IN_PROGRESS)
     connection, _preflight = _database_context(store, state)
-    from .database import existing_project_import_lock
-    resources.enter_context(
-        existing_project_import_lock(request.target_project_id, connection)
-    )
     from .project_lock import project_ingestion_lock
     resources.enter_context(project_ingestion_lock(
         store, request.target_project_id, connection,

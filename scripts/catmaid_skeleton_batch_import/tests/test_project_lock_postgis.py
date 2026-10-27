@@ -432,3 +432,105 @@ def test_importer_uses_retained_ingestion_uuid_and_embedded_lock_state(
     finally:
         if owner(isolated_database, project_id) == UUID(identity):
             release(project_id, identity)
+
+
+@pytest.mark.parametrize("scenario", ["wrapper_startup_failure", "success", "partial_import"])
+def test_workflow_project_and_workspace_locks_cover_parent_to_run_handoff(
+    isolated_database, existing_project_factory, tmp_path, monkeypatch, scenario,
+):
+    import json
+    from pathlib import Path
+    import zipfile
+    from uuid import UUID
+
+    from catmaid.ingestion_lock import release_project_ingestion
+    from catmaid_skeleton_batch_import import materialization
+    from catmaid_skeleton_batch_import.errors import OperationalFailureError
+    from catmaid_skeleton_batch_import.orchestrator import (
+        plan_ingestion, preflight_ingestion, run_ingestion,
+    )
+    from catmaid_skeleton_batch_import.project_lock import WorkflowProjectLock
+    from catmaid_skeleton_batch_import.state import StateStore
+    from catmaid_skeleton_batch_import.workflow_io import FinalizeConfig, derive_finalization
+
+    identity = str(uuid4())
+    project_id = existing_project_factory()
+    monkeypatch.setenv("SKELETON_INGESTION_ID", identity)
+    monkeypatch.setenv("SKELETON_INGESTION_TARGET_PROJECT_ID", str(project_id))
+    monkeypatch.setenv("SKELETON_INGESTION_WORKFLOW_NAME", "project-lock-handoff-test")
+    monkeypatch.setenv("CATMAID_PROJECTS_DIRECTORY",
+                       str(Path(__file__).resolve().parents[3] / "django/projects"))
+    monkeypatch.setenv("CATMAID_BATCH_IMPORT_MAX_NODES_PER_BATCH", "2")
+    workflow_lock = WorkflowProjectLock(os.environ)
+    try:
+        workflow_lock.acquire()
+        assert isolated_database.connection is None
+        assert owner(isolated_database, project_id) == UUID(identity)
+
+        archive = tmp_path / "source.zip"
+        swc = chr(10).join(["1 1 1 1 1 -1 -1", "2 3 2 2 2 1 1", ""])
+        with zipfile.ZipFile(archive, "w") as source:
+            source.writestr("a.swc", swc)
+            if scenario == "partial_import":
+                source.writestr("b.swc", swc)
+        request = tmp_path / "request.json"
+        request.write_text(json.dumps({
+            "schema_version": 1,
+            "source": {"archive_path": str(archive), "coordinate_unit": "nm"},
+            "target": {"project_id": project_id},
+        }))
+        store = StateStore(tmp_path / "state")
+        preflight_ingestion(request, store.state_dir)
+        plan_ingestion(request, store.state_dir)
+
+        if scenario == "wrapper_startup_failure":
+            (store.state_dir / "run-wrapper-result.json").write_text(json.dumps({
+                "schema_version": 1, "command": "run-wrapper", "terminal": True,
+                "attempts": 0, "importer_exit_code": 66,
+            }))
+        elif scenario == "success":
+            run_ingestion(store.state_dir)
+        else:
+            original = materialization.materialize_and_verify_batch
+            completed = []
+
+            def fail_second(**kwargs):
+                result = original(**kwargs)
+                completed.append(result)
+                if len(completed) == 2:
+                    raise OperationalFailureError("injected second-batch failure")
+                return result
+
+            monkeypatch.setattr(materialization, "materialize_and_verify_batch", fail_second)
+            with pytest.raises(OperationalFailureError, match="second-batch failure"):
+                run_ingestion(store.state_dir)
+
+        workflow_lock.finish(tmp_path, run_started=True)
+        state = store.load()
+        if scenario == "wrapper_startup_failure":
+            assert state["run"]["status"] == "pending"
+            assert [batch["status"] for batch in state["batches"]] == ["planned"]
+        elif scenario == "success":
+            assert state["run"]["status"] == "complete"
+            assert [batch["status"] for batch in state["batches"]] == ["committed"]
+        else:
+            assert state["run"]["status"] == "failed"
+            assert [batch["status"] for batch in state["batches"]] == ["committed", "failed"]
+        assert state["project_lock"]["status"] == ("locked" if scenario == "partial_import" else "released")
+        assert owner(isolated_database, project_id) == (
+            UUID(identity) if scenario == "partial_import" else None
+        )
+        with isolated_database.cursor() as cursor:
+            cursor.execute("SELECT count(*) FROM treenode WHERE project_id=%s", [project_id])
+            assert cursor.fetchone()[0] == (0 if scenario == "wrapper_startup_failure" else 2)
+        decision = derive_finalization(FinalizeConfig(
+            ingestion_id=identity, workspace=tmp_path, workflow_name="project-lock-handoff-test",
+            workflow_uid="test-workflow", workflow_result="Succeeded" if scenario == "success" else "Failed",
+        ))
+        assert decision.payload["outcome"] == {
+            "wrapper_startup_failure": "failed", "success": "succeeded",
+            "partial_import": "operator_attention",
+        }[scenario]
+    finally:
+        if owner(isolated_database, project_id) == UUID(identity):
+            release_project_ingestion(project_id, identity)

@@ -68,11 +68,7 @@ class Cursor:
 
     def execute(self, sql, params=None):
         self.connection.statements.append((sql, params))
-        if "pg_try_advisory_lock" in sql:
-            self.rows = [(self.connection.available,)]
-        elif "pg_advisory_unlock" in sql:
-            self.rows = [(True,)]
-        elif "SELECT id, name FROM class_instance" in sql:
+        if "SELECT id, name FROM class_instance" in sql:
             self.rows = [(identifier, name) for identifier, name in self.connection.annotations
                          if name in params[2]]
         else:
@@ -86,10 +82,9 @@ class Cursor:
 
 
 class Connection:
-    def __init__(self, annotations=(), *, available=True):
+    def __init__(self, annotations=()):
         self.statements = []
         self.annotations = annotations
-        self.available = available
         self.in_atomic_block = False
         self.geometry = deepcopy(STACK_GEOMETRY)
 
@@ -138,17 +133,6 @@ def test_project_selection_is_read_only_and_requires_tracing():
     components["Project"].objects.filter = lambda **_kwargs: SimpleNamespace(exists=lambda: False)
     with pytest.raises(project.ProjectSetupError, match="does not exist"):
         project.existing_project_context(123, components=components)
-
-
-def test_existing_project_lock_is_released_on_failure_and_busy_is_retryable():
-    connection = Connection()
-    with pytest.raises(RuntimeError, match="failed batch"):
-        with database.existing_project_import_lock(123, connection):
-            raise RuntimeError("failed batch")
-    assert "pg_advisory_unlock" in connection.statements[-1][0]
-    with pytest.raises(OperationalFailureError, match="Another skeleton import"):
-        with database.existing_project_import_lock(123, Connection(available=False)):
-            forbidden()
 
 
 def test_append_uses_bulk_materialization_in_one_atomic_batch(monkeypatch):

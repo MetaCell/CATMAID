@@ -71,30 +71,32 @@ Migration `0127_project_active_skeleton_ingestion` adds the nullable UUID field
 history table/view. Deploy that migration and the matching NeuroGlass middleware
 before importing. This does not alter users' project permissions.
 
-The single-pod workflow acquires the durable project flag before downloading,
+The single-pod workflow acquires the durable project lock before downloading,
 then retains it through preflight, planning, loading, maintenance, cache updates
 and verification. At the start of `run`, it verifies the same ingestion UUID
-still owns the flag, without releasing and reacquiring it. The standalone
-local-ZIP CLI acquires its flag at `run`, before batch preparation. Both obtain
-the existing importer advisory lock during loading. NeuroGlass mutation requests use
+still owns the project lock, without releasing and reacquiring it. The standalone
+local-ZIP CLI acquires its project lock at `run`, before batch preparation.
+The workspace writer lock prevents another process from running the same state
+directory. Each ingestion UUID has one fresh workspace and one run attempt.
+NeuroGlass mutation requests use
 `catmaid.ingestion_lock.project_write_guard()` for the whole write response.
 Their shared project-row locks allow concurrent edits and finish before the
-importer's exclusive row lock can set the flag. Lock acquisition uses the run's
+importer's exclusive row lock can establish the project lock. Lock acquisition uses the run's
 configured lock timeout; no database transaction spans the full import.
 
-Once the flag is committed, the NeuroGlass middleware returns HTTP **423** with
+Once the project lock is committed, the NeuroGlass middleware returns HTTP **423** with
 `type: ProjectIngestionLocked` for mutation requests on that project. Read
 requests, including POST-based reads, remain available. Other projects are
 unaffected. This integration covers NeuroGlass access-token/task-association
 requests, not native CATMAID clients or arbitrary database/background writers.
 There is no viewer polling or automatic layer-visibility change.
 
-The flag stays set across batch commits, database maintenance, existing-cache
+The project lock remains active across batch commits, database maintenance, existing-cache
 updates and final verification. Verified completion clears only the matching
 owner. A confirmed download/preflight/planning failure also clears it. Run
 startup failure with every batch still planned clears it too.
-A prepared/failed/committed batch or process loss leaves it set; it has no
-expiry and a new attempt cannot acquire or clear another owner's flag.
+A prepared/failed/committed batch or process loss leaves the project lock active; it has no
+expiry and a new attempt cannot acquire or clear another owner's project lock.
 
 After a confirmed wrapper startup failure, state can legitimately contain
 `run.status: pending` and `project_lock.status: released`, with every batch still
@@ -104,7 +106,7 @@ it does not resume the previous attempt. Unreleased or inconsistent state still
 requires inspection.
 
 The workflow closes its parent database connection after early acquisition,
-on success or failure. Closing a connection does not clear the durable flag.
+on success or failure. Closing a connection does not release the durable project lock.
 Preparation needs no idle parent session, and cleanup reconnects if required.
 
 Planning retains one `ingestion_id` in `state/state.json`. It uses the
@@ -125,7 +127,7 @@ The lock lifecycle is part of that same atomic state record:
 ```
 
 `project_lock.status` observes the run handoff through `pending`, `acquiring`,
-`locked` and `released`. In the workflow, the database flag already exists before
+`locked` and `released`. In the workflow, the project lock already exists before
 planning publishes state. Standalone run saves `acquiring` before acquisition.
 `released` is saved only after ownership-checked release succeeds, including a
 safe workflow failure before run startup. There is no separate
@@ -147,7 +149,7 @@ from catmaid.ingestion_lock import release_project_ingestion
 release_project_ingestion(project_id, ingestion_id)
 ```
 
-The helper refuses a different owner. Do not clear the flag merely to retry a
+The helper refuses a different owner. Do not release the project lock merely to retry a
 failed archive; this is an inspection step, not a recovery command. Migration
 rollback also refuses to remove a live lock. Refresh open viewers after success
 to reload cached CATMAID data.
