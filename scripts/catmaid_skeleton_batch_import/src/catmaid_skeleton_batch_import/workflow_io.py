@@ -1090,6 +1090,19 @@ def derive_finalization(config: FinalizeConfig) -> FinalizationDecision:
     except WorkspaceStateError:
         importer_result = None  # Diagnostic output; valid execution state remains authoritative.
 
+    try:
+        project_lock = _load_optional_json(
+            state_directory / "project-ingestion-lock.json", "project ingestion lock receipt"
+        )
+        if project_lock is not None:
+            if (project_lock.get("schema_version") != 1
+                    or project_lock.get("status") not in {"acquiring", "locked", "released"}
+                    or type(project_lock.get("project_id")) is not int):
+                raise WorkspaceStateError("Invalid project ingestion lock receipt")
+            _validate_ingestion_id(project_lock.get("owner"))
+    except (WorkspaceStateError, WorkerError) as exc:
+        return _invalid_workspace_decision(config, exc, state_directory=state_directory, state=state)
+
     if state is not None:
         _partial_state_payload(payload, state_directory, state)
         run_status = state["run"]["status"]
@@ -1106,6 +1119,9 @@ def derive_finalization(config: FinalizeConfig) -> FinalizationDecision:
                 )
             try:
                 success = _success_payload(config, state_directory, state, download_result)
+                if (project_lock is None or project_lock["status"] != "released"
+                        or project_lock["project_id"] != success["project_id"]):
+                    raise WorkspaceStateError("Project ingestion lock release was not confirmed")
             except WorkspaceStateError as exc:
                 return _invalid_workspace_decision(config, exc, state_directory=state_directory, state=state)
             return FinalizationDecision(payload=success)
@@ -1157,6 +1173,8 @@ def derive_finalization(config: FinalizeConfig) -> FinalizationDecision:
         category, message = "workflow_failed", (
             f"Workflow {config.workflow_result or 'did not complete'} without a completed importer run"
         )
+    if project_lock is not None and project_lock["status"] != "released":
+        outcome = "operator_attention"
     payload["outcome"] = outcome
     payload["error"] = {
         "category": _sanitize_category(category, "workflow_failed"),

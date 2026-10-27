@@ -181,6 +181,8 @@ def test_append_uses_bulk_materialization_in_one_atomic_batch(monkeypatch):
 
 
 def configure_run(monkeypatch, connection):
+    from catmaid_skeleton_batch_import import project_lock
+    monkeypatch.setattr(project_lock, "project_ingestion_lock", lambda *_args, **_kwargs: nullcontext())
     monkeypatch.delenv("DJANGO_SETTINGS_MODULE", raising=False)
     monkeypatch.setitem(sys.modules, "django.conf", SimpleNamespace(
         settings=SimpleNamespace(NODE_LIST_MAXIMUM_COUNT=None)))

@@ -6,12 +6,11 @@ inputs, plans whole-skeleton batches, loads them atomically, rebuilds existing
 grid caches once and retains verification and audit files. Project, stack and
 grid provisioning are prerequisites handled outside ingestion.
 
-Before running an import, make the managed layer **inactive in Neuroglass** and keep it inactive until all data and
-cache verification succeeds. Layer activation is an operator action; this script
-does not call Neuroglass or change CATMAID permissions. The CATMAID web service
-can remain running, but no other client, administrator or background job may edit
-the target project's morphology, stack geometry or cache configuration during the import.
-Deactivating one viewer's layer alone does not block other writers.
+The importer acquires a durable project ingestion lock before batch loading.
+Matching NeuroGlass middleware rejects edits on that project through cache
+updates and verification while reads remain available. No viewer polling or
+permission rewriting is involved. Native CATMAID clients and arbitrary database
+writers are outside this integration's contract and must not edit the target.
 
 ## Optional single-pod workflow
 
@@ -57,9 +56,57 @@ All source/audit files remain until explicit cleanup. Workflow finalization only
 classifies the result; it has no source-deletion decision or cleanup hook.
 Retention belongs to the calling system or operator. Node maps are not sent
 through the terminal output. In MNP, only the processing pod mounts the retained
-RWO claim, workflows sharing it are serialized, and the managed layer stays
-listed but inactive in the client until a safe result. This client behavior
-does not block direct CATMAID writers.
+RWO claim and workflows sharing it are serialized. The project-level lock blocks
+NeuroGlass mutations while the layer keeps its normal visibility.
+
+## Project-level ingestion lock
+
+Migration `0127_project_active_skeleton_ingestion` adds the nullable UUID field
+`Project.active_skeleton_ingestion` to both the live project and its CATMAID
+history table/view. Deploy that migration and the matching NeuroGlass middleware
+before importing. This does not alter users' project permissions.
+
+Download, preflight and planning do not lock edits. At the start of `run`, before
+batch preparation, the importer obtains its existing importer advisory lock,
+then acquires the durable project flag. NeuroGlass mutation requests use
+`catmaid.ingestion_lock.project_write_guard()` for the whole write response.
+Their shared project-row locks allow concurrent edits and finish before the
+importer's exclusive row lock can set the flag. Lock acquisition uses the run's
+configured lock timeout; no database transaction spans the full import.
+
+Once the flag is committed, the NeuroGlass middleware returns HTTP **423** with
+`type: ProjectIngestionLocked` for mutation requests on that project. Read
+requests, including POST-based reads, remain available. Other projects are
+unaffected. This integration covers NeuroGlass access-token/task-association
+requests, not native CATMAID clients or arbitrary database/background writers.
+There is no viewer polling or automatic layer-visibility change.
+
+The flag stays set across batch commits, database maintenance, existing-cache
+updates and final verification. Verified completion clears only the matching
+owner. A confirmed failure while all batches remain planned also clears it.
+A prepared/failed/committed batch or process loss leaves it set; it has no
+expiry and a new attempt cannot acquire or clear another owner's flag.
+
+`state/project-ingestion-lock.json` records the project, owner UUID and
+`acquiring`, `locked` or `released` observation. An uncertain acquisition/release
+or an unreleased receipt requires operator attention, even before batch loading;
+successful workflow evidence requires a released receipt. Earlier committed
+batches are not rolled back and automatic retry/resume is still unsupported.
+
+For manual resolution, first confirm the importer has stopped and reconcile the
+retained state/assigned IDs against the database. Resolve any partial import
+before unlocking. Through CATMAID's normal Django shell, use the project ID and
+owner from the retained receipt:
+
+```python
+from catmaid.ingestion_lock import release_project_ingestion
+release_project_ingestion(project_id, owner_uuid)
+```
+
+The helper refuses a different owner. Do not clear the flag merely to retry a
+failed archive; this is an inspection step, not a recovery command. Migration
+rollback also refuses to remove a live lock. Refresh open viewers after success
+to reload cached CATMAID data.
 
 ## File format contract
 
@@ -547,8 +594,10 @@ are performed.
 
 Apply CATMAID migration `0126_fix_single_node_selective_summary` through the
 normal deployment migration process before running this importer. It fixes
-selective summary rebuilding for single-node skeletons. Deployment is responsible
-for applying migrations; the importer does not inspect migration history.
+selective summary rebuilding for single-node skeletons. Also apply migration
+`0127_project_active_skeleton_ingestion` for the durable project lock and matching
+history schema. Deployment is responsible for applying migrations; the importer
+does not inspect migration history.
 
 `CATMAID_PROJECTS_DIRECTORY` defaults to `/home/django/projects`, and
 `CATMAID_INGESTION_MEDIA_ROOT` defaults to
@@ -597,9 +646,10 @@ Planning publishes `state.json` once, after the plan, batch snapshots and the
 associated-stack snapshot have been written and verified. Failed initialization
 publishes no executable state.
 
-Existing permissions and visibility remain unchanged. Keep
-the managed layer inactive until final success. After failure, inspect the
-database and retained evidence before manually choosing cleanup or a new import.
+Existing permissions and visibility remain unchanged. The project ingestion lock
+blocks NeuroGlass writes during loading and final verification. After failure,
+inspect the database and retained evidence before resolving a retained lock or
+choosing cleanup or a new import.
 
 ## State and progress
 
@@ -751,18 +801,15 @@ The feature is unpublished and supports only the current plan/state format.
 
 The importer saves per-batch manifests and node maps in its local state directory.
 It has no NeuroGlass dependency, network callback or mapping-table migration.
-MNP mounts a dedicated retained RWX volume into its finite processing and exit
-reporting pods. Maps remain files on that volume; NeuroGlass stores only the
-compact terminal result, not node mapping rows. Future microtask creation is
-deferred. The exit reporter reads the retained evidence and publishes bounded
-errors/results through Kafka; maps never travel through that callback.
+MNP mounts a dedicated retained RWO volume only into its finite processing pod.
+The separate exit reporter reads a compact Argo output and publishes it through
+Kafka without mounting that volume. Maps remain files; NeuroGlass stores only
+the terminal result. A separate read-only microtask workflow is future work.
 
 MNP and the standalone importer perform one attempt. Retained files support
-inspection and review-queue mapping; they are not automatic recovery inputs.
-Processing-pod loss or an importer failure leaves the layer inactive and requires
-operator inspection before another import is started. MNP's terminal-state reader
-still needs alignment with the importer's failed status before deploying the
-updated pair together.
+inspection and review-queue mapping, not automatic recovery. Process loss or
+partial import leaves the project lock set until verified operator resolution.
+
 
 
 ## Measured cache progress

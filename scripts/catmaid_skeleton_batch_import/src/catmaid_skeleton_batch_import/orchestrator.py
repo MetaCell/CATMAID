@@ -637,7 +637,7 @@ def run_ingestion(state_dir: Path) -> dict[str, object]:
         try:
             with ExitStack() as resources:
                 result = _execute_ingestion(store, resources)
-            store.finish_run()
+                store.finish_run()
             return result
         except BaseException as exc:
             try:
@@ -683,13 +683,18 @@ def _execute_ingestion(store: StateStore, resources: ExitStack) -> dict[str, obj
     resources.enter_context(
         existing_project_import_lock(request.target_project_id, connection)
     )
+    from .project_lock import project_ingestion_lock
+    resources.enter_context(project_ingestion_lock(
+        store, request.target_project_id, connection,
+        lock_timeout_ms=timeouts["lock_timeout_ms"],
+    ))
     geometry = _append_geometry(request, connection)
     _check_saved_geometry(store, store.load(), geometry)
     project = _ensure_existing_project(store, request.target_project_id, metrics)
     _check_existing_fragment_conflicts(plan, project, connection)
     from .cache_rebuild import GridCacheRebuild
     grid_cache = GridCacheRebuild(project.project_id, connection, **timeouts)
-    _progress("Batch import: keep the Neuroglass managed layer inactive until verification succeeds")
+    _progress("Batch import: NeuroGlass project edits are locked through final verification")
 
     with BatchSnapshotReader(store.state_dir, plan) as snapshots:
         for batch in plan.batches:

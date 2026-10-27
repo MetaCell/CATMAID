@@ -32,3 +32,8 @@ class ImmutableStateError(ImporterError):
 class VerificationError(ImporterError):
     exit_code = 6
     category = "verification_failed"
+
+
+class ProjectIngestionLockError(OperationalFailureError):
+    """Lock acquisition or release needs inspection before another attempt."""
+    category = "project_ingestion_lock"

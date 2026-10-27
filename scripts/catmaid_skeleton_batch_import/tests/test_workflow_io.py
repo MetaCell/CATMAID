@@ -140,6 +140,9 @@ class SkeletonIngestionWorkerTestCase(TestCase):
         }
 
     def write_completed_append_state(self) -> dict[str, object]:
+        _write_json(self.workspace / worker.STATE_DIRECTORY / "project-ingestion-lock.json", {
+            "schema_version": 1, "project_id": 41, "owner": INGESTION_ID, "status": "released",
+        })
         _write_json(
             self.workspace / worker.REQUEST_FILENAME,
             {"schema_version": 1, "source": {"archive_path": str(self.workspace / "source.zip"), "coordinate_unit": "um"}, "target": {"project_id": 41}},
@@ -650,6 +653,37 @@ class DownloadWorkerTests(SkeletonIngestionWorkerTestCase):
 
 class FinalizationPayloadTests(SkeletonIngestionWorkerTestCase):
     """Current single-attempt state and real wrapper markers decide finalization."""
+
+    def test_success_requires_confirmed_project_lock_release(self):
+        for status in ("acquiring", "locked", None):
+            with self.subTest(status=status):
+                self.write_completed_append_state()
+                receipt = self.workspace / worker.STATE_DIRECTORY / "project-ingestion-lock.json"
+                if status is None:
+                    receipt.unlink()
+                else:
+                    _write_json(receipt, {"schema_version": 1, "project_id": 41,
+                                          "owner": INGESTION_ID, "status": status})
+                result = _finalization_payload(self.workspace, "test-workflow", "test-uid", "Succeeded")
+                self.assertEqual(result["outcome"], "operator_attention")
+
+    def test_preloading_failure_with_unreleased_project_lock_is_not_retryable(self):
+        state = self.write_completed_append_state()
+        state["status"] = "failed"
+        state["run"] = {"status": "failed", "reason": "Interrupted before batch loading"}
+        for phase in state["phases"].values():
+            phase["status"] = "pending"
+        for batch in state["batches"]:
+            batch["status"] = "planned"
+        _write_json(self.workspace / worker.STATE_DIRECTORY / worker.IMPORTER_STATE_FILENAME, state)
+        receipt = self.workspace / worker.STATE_DIRECTORY / "project-ingestion-lock.json"
+        for status, outcome in (("acquiring", "operator_attention"), ("locked", "operator_attention"),
+                                ("released", "failed")):
+            with self.subTest(status=status):
+                _write_json(receipt, {"schema_version": 1, "project_id": 41,
+                                      "owner": INGESTION_ID, "status": status})
+                self.assertEqual(_finalization_payload(self.workspace, "wf", "uid", "Failed")["outcome"], outcome)
+
 
     def save(self, state):
         _write_json(self.workspace / "state/state.json", state)
