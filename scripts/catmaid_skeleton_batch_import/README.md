@@ -316,7 +316,8 @@ Existing skeletons, names, provenance, connectors, permissions, visibility,
 stacks and cache definitions are preserved. Existing out-of-bounds or negative
 coordinates are retained. Each incoming SWC creates a fresh neuron and skeleton;
 the importer does not merge it into existing morphology. A provenance collision
-is rejected before loading. Successful imports finish with `status: "complete"`.
+is rejected before loading. Successful imports finish with `run.status: "complete"`
+and `project_lock.status: "released"`.
 
 ### How source units are determined
 
@@ -708,9 +709,42 @@ replaces JSON so readers see complete records. The run marker
 moves once from pending to running and then complete or failed; an interrupted
 running attempt cannot be resumed.
 
-The importer defines status enums in `statuses.py` for database records,
-project locks, operations, overall ingestion progress and metrics. JSON files retain the
-same plain string values, such as `committed`, `running` and `failed`.
+The importer uses three status enums in `statuses.py`. JSON stores their plain
+string values:
+
+| Tracking | Values | Meaning |
+| --- | --- | --- |
+| Each batch (`BatchStatus`) | `planned`, `prepared`, `committed`, `failed` | Whether that atomic batch was started and its commit confirmed. A failed/prepared batch can have an uncertain COMMIT outcome. |
+| Run, final phases and metrics (`OperationStatus`) | `pending`, `running`, `complete`, `failed` | Lifecycle of the run, each final phase, or diagnostic collection. |
+| Project lock (`ProjectLockStatus`) | `pending`, `acquiring`, `locked`, `released` | The run's confirmed observations of project-lock ownership. |
+
+`selected_project_id` is `null` until the existing target's tracing context
+has been validated and recorded, then contains that project ID. It cannot be
+changed. There is no separate project-selection status or saved overall status.
+Progress readers use batch and phase checkpoints directly, so a failed run can
+still report its committed prefix and retained project lock.
+
+For example, after a failure in the second of three batches, the state contains:
+
+```json
+{
+  "selected_project_id": 123,
+  "run": {"status": "failed"},
+  "project_lock": {"project_id": 123, "status": "locked"},
+  "batches": [
+    {"index": 1, "status": "committed"},
+    {"index": 2, "status": "failed"},
+    {"index": 3, "status": "planned"}
+  ]
+}
+```
+
+This is an excerpt; the state also retains the plan, artifacts and final phases.
+CLI command results use `ok`, `command` and result metadata without another
+overall `status` field. Workflow terminal outcomes remain `succeeded`,
+`failed` and `operator_attention`. Success still requires a completed run,
+committed batches, completed final phases, verified artifacts and confirmed
+project-lock release.
 
 Database maintenance runs after every batch has committed and before cache rebuilding.
 It executes PostgreSQL `ANALYZE` on `class_instance`,
@@ -722,7 +756,7 @@ recorded in the audit state and runs once per import.
 
 | File in the state directory | Purpose |
 | --- | --- |
-| `state.json` | Ingestion UUID, project-lock lifecycle, run outcome and confirmed phase/batch statuses. |
+| `state.json` | Ingestion UUID, selected project ID, project-lock lifecycle, run outcome and confirmed phase/batch statuses. |
 | `metrics.json` | Planned/completed batch, skeleton and node counts; operation durations, per-operation row counts and the run's effective settings. |
 | `result.json` | Outcome of the most recent CLI command; failures contain a bounded summary and optional diagnostic-file reference. |
 | `error-details.json` | Full diagnostics of the latest failed CLI command, including all invalid SWC members; never sent through the terminal callback. |

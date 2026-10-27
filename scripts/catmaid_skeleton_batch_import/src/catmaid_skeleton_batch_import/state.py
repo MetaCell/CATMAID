@@ -21,7 +21,7 @@ from .errors import (
     ImmutableStateError,
     InvalidInputError,
 )
-from .statuses import DatabaseStatus, ImportStatus, OperationStatus, ProjectLockStatus
+from .statuses import BatchStatus, OperationStatus, ProjectLockStatus
 from .util import (
     atomic_write_json,
     canonical_json_bytes,
@@ -246,16 +246,12 @@ class StateStore:
                 "project_id": request_value["target"]["project_id"],
                 "status": ProjectLockStatus.PENDING,
             },
-            "status": ImportStatus.PLANNED,
             **immutable,
-            "project": {
-                "status": DatabaseStatus.PLANNED,
-                "project_id": None,
-            },
+            "selected_project_id": None,
             "batches": [
                 {
                     **copy.deepcopy(batch),
-                    "status": DatabaseStatus.PLANNED,
+                    "status": BatchStatus.PLANNED,
                     "artifacts": copy.deepcopy((batch_artifacts or {}).get(batch["index"], {})),
                 }
                 for batch in batch_plan
@@ -373,53 +369,48 @@ class StateStore:
             raise ImmutableStateError(f"Unknown artifact: {label}")
         return self._verify_artifact_value(label, target[name])
 
-
     def select_existing_project(self, project_id: int) -> dict[str, Any]:
-        """Checkpoint a read-only project selection, without a COMMIT window."""
+        """Record successful validation of the existing target project."""
         request = load_json(self.request_path)
         if request.get("target", {}).get("project_id") != project_id:
             raise ImmutableStateError("Existing project does not match the planned target")
 
         def mutate(state: dict[str, Any]) -> None:
-            project = state["project"]
-            if project["status"] != DatabaseStatus.PLANNED:
+            if state["selected_project_id"] is not None:
                 raise ImmutableStateError("Cannot replace an already selected target project")
-            self._set_immutable_id(project, "project_id", project_id)
-            project["mode"] = "existing"
-            project["status"] = DatabaseStatus.COMMITTED
-            self._derive_status(state)
+            state["selected_project_id"] = project_id
 
         return self._mutate(mutate)
 
     def transition_batch(
         self,
         batch_index: int,
-        status: DatabaseStatus,
+        status: BatchStatus,
         *,
         reason: str | None = None,
     ) -> dict[str, Any]:
         try:
-            status = DatabaseStatus(status)
+            status = BatchStatus(status)
         except (ValueError, TypeError) as exc:
             raise InvalidInputError(f"Unknown batch state: {status}") from exc
 
         def mutate(state: dict[str, Any]) -> None:
             batch = self._find_batch(state, batch_index)
             current = batch["status"]
-            self._validate_database_transition(
+            self._validate_batch_transition(
                 f"batch {batch_index}",
                 current,
                 status,
             )
-            if status == DatabaseStatus.PREPARED:
-                if state["project"]["status"] != DatabaseStatus.COMMITTED:
+            if status == BatchStatus.PREPARED:
+                if state["selected_project_id"] is None:
                     raise ImmutableStateError(
                         "Cannot prepare a batch before target selection is recorded"
                     )
                 for prior in state["batches"]:
                     if prior["index"] == batch_index:
                         break
-                    if prior["status"] != DatabaseStatus.COMMITTED:
+                    if prior["status"] != BatchStatus.COMMITTED:
                         raise ImmutableStateError(
                             f"Cannot prepare batch {batch_index} before batch "
                             f"{prior['index']} is committed"
@@ -427,17 +418,16 @@ class StateStore:
             batch["status"] = status
             if reason is not None:
                 batch["reason"] = str(reason)
-            elif status in (DatabaseStatus.PREPARED, DatabaseStatus.COMMITTED):
+            elif status in (BatchStatus.PREPARED, BatchStatus.COMMITTED):
                 batch.pop("reason", None)
-            self._derive_status(state)
 
         return self._mutate(mutate)
 
     def mark_batch_prepared(self, batch_index: int) -> dict[str, Any]:
-        return self.transition_batch(batch_index, DatabaseStatus.PREPARED)
+        return self.transition_batch(batch_index, BatchStatus.PREPARED)
 
     def mark_batch_committed(self, batch_index: int) -> dict[str, Any]:
-        return self.transition_batch(batch_index, DatabaseStatus.COMMITTED)
+        return self.transition_batch(batch_index, BatchStatus.COMMITTED)
 
     def transition_phase(
         self, phase: str, status: OperationStatus, *, reason: str | None = None
@@ -467,7 +457,6 @@ class StateStore:
                 phase_state["reason"] = str(reason)
             elif status in (OperationStatus.RUNNING, OperationStatus.COMPLETE):
                 phase_state.pop("reason", None)
-            self._derive_status(state)
 
         return self._mutate(mutate)
 
@@ -506,7 +495,6 @@ class StateStore:
             if supplied_id is not None and supplied_id != state["ingestion_id"]:
                 raise ImmutableStateError("Ingestion UUID does not match the planned state")
             state["run"] = {"status": OperationStatus.RUNNING}
-            state["status"] = ImportStatus.IN_PROGRESS
         return self._mutate(mutate)
 
     def finish_run(self) -> dict[str, Any]:
@@ -517,7 +505,6 @@ class StateStore:
             if state["phases"]["verification"]["status"] != OperationStatus.COMPLETE:
                 raise ImmutableStateError("Import completion requires final verification")
             state["run"] = {"status": OperationStatus.COMPLETE}
-            self._derive_status(state)
         return self._mutate(mutate)
 
     def fail_run(self, reason: str) -> dict[str, Any]:
@@ -526,10 +513,9 @@ class StateStore:
         if state["run"]["status"] != OperationStatus.RUNNING:
             return state
         state["run"] = {"status": OperationStatus.FAILED, "reason": reason}
-        state["status"] = ImportStatus.FAILED
         for item in state["batches"]:
-            if item["status"] == DatabaseStatus.PREPARED:
-                item["status"] = DatabaseStatus.FAILED
+            if item["status"] == BatchStatus.PREPARED:
+                item["status"] = BatchStatus.FAILED
                 item["reason"] = reason
         for item in state["phases"].values():
             if item["status"] == OperationStatus.RUNNING:
@@ -697,23 +683,13 @@ class StateStore:
                 return batch
         raise InvalidInputError(f"Unknown batch index: {wanted}")
 
-    def _set_immutable_id(
-        self, target: dict[str, Any], key: str, value: int | None
-    ) -> None:
-        if value is None:
-            return
-        value = _non_negative_int(value, key)
-        existing = target.get(key)
-        if existing is not None and existing != value:
-            raise ImmutableStateError(f"Cannot change reserved {key}")
-        target[key] = value
 
-    def _validate_database_transition(
-        self, label: str, current: DatabaseStatus | str, requested: DatabaseStatus
+    def _validate_batch_transition(
+        self, label: str, current: BatchStatus | str, requested: BatchStatus
     ) -> None:
         allowed = {
-            DatabaseStatus.PLANNED: {DatabaseStatus.PREPARED},
-            DatabaseStatus.PREPARED: {DatabaseStatus.COMMITTED},
+            BatchStatus.PLANNED: {BatchStatus.PREPARED},
+            BatchStatus.PREPARED: {BatchStatus.COMMITTED},
         }
         if requested not in allowed.get(current, set()):
             raise ImmutableStateError(f"Invalid {label} transition: {current} -> {requested}")
@@ -722,7 +698,7 @@ class StateStore:
         self, state: Mapping[str, Any], phase: str
     ) -> None:
         if phase == "database_maintenance":
-            if any(batch["status"] != DatabaseStatus.COMMITTED for batch in state["batches"]):
+            if any(batch["status"] != BatchStatus.COMMITTED for batch in state["batches"]):
                 raise ImmutableStateError(
                     "Database maintenance cannot start before every batch commits"
                 )
@@ -736,24 +712,3 @@ class StateStore:
                 raise ImmutableStateError(
                     "Verification cannot start before cache generation completes"
                 )
-
-    def _derive_status(self, state: dict[str, Any]) -> None:
-        if state["run"]["status"] == OperationStatus.FAILED:
-            state["status"] = ImportStatus.FAILED
-            return
-        project_status = state["project"]["status"]
-        if project_status != DatabaseStatus.COMMITTED:
-            state["status"] = ImportStatus.PLANNED
-            return
-        if any(batch["status"] != DatabaseStatus.COMMITTED for batch in state["batches"]):
-            state["status"] = ImportStatus.DATABASE_IN_PROGRESS
-            return
-        state["status"] = ImportStatus.DATABASE_COMPLETE
-        if state["phases"]["database_maintenance"]["status"] != OperationStatus.COMPLETE:
-            return
-        state["status"] = ImportStatus.MAINTENANCE_COMPLETE
-        if state["phases"]["cache"]["status"] != OperationStatus.COMPLETE:
-            return
-        state["status"] = ImportStatus.CACHE_COMPLETE
-        if state["phases"]["verification"]["status"] == OperationStatus.COMPLETE:
-            state["status"] = ImportStatus.COMPLETE

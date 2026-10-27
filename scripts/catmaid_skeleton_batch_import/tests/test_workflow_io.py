@@ -160,7 +160,6 @@ class SkeletonIngestionWorkerTestCase(TestCase):
         )
         state: dict[str, object] = {
             "schema_version": worker.SCHEMA_VERSION,
-            "status": "complete",
             "ingestion_id": INGESTION_ID,
             "project_lock": {"project_id": 41, "status": "released"},
             "archive": {"sha256": "a" * 64, "size_bytes": 27},
@@ -169,11 +168,7 @@ class SkeletonIngestionWorkerTestCase(TestCase):
                 "skeleton_count": 7,
                 "node_count": 101,
             },
-            "project": {
-                "status": "committed",
-                "mode": "existing",
-                "project_id": 41,
-            },
+            "selected_project_id": 41,
             "batches": [
                 {"status": "committed"},
                 {"status": "committed"},
@@ -197,10 +192,9 @@ class SkeletonIngestionWorkerTestCase(TestCase):
 
     def write_incomplete_append_state(self, statuses, *, project_id=41):
         state = self.write_completed_append_state()
-        state["status"] = "failed"
         state["run"] = {"status": "failed", "reason": "Source fragment already exists"}
         state["batches"] = [{"status": status} for status in statuses]
-        state["project"].update(project_id=project_id)
+        state["selected_project_id"] = project_id
         state["project_lock"] = {
             "project_id": project_id,
             "status": "locked" if any(status != "planned" for status in statuses) else "released",
@@ -229,7 +223,6 @@ class SkeletonIngestionWorkerTestCase(TestCase):
     def write_planned_state(self) -> dict[str, object]:
         state: dict[str, object] = {
             "schema_version": worker.SCHEMA_VERSION,
-            "status": "planned",
             "ingestion_id": INGESTION_ID,
             "project_lock": {"project_id": 41, "status": "pending"},
             "archive": {"sha256": "a" * 64, "size_bytes": 27},
@@ -238,11 +231,7 @@ class SkeletonIngestionWorkerTestCase(TestCase):
                 "skeleton_count": 1,
                 "node_count": 10,
             },
-            "project": {
-                "status": "planned",
-                "project_id": None,
-                "stack_id": None,
-            },
+            "selected_project_id": None,
             "batches": [{"status": "planned"}],
             "phases": {
                 "database_maintenance": {"status": "pending"},
@@ -660,6 +649,29 @@ class DownloadWorkerTests(SkeletonIngestionWorkerTestCase):
 class FinalizationPayloadTests(SkeletonIngestionWorkerTestCase):
     """Current single-attempt state and real wrapper markers decide finalization."""
 
+    def test_success_uses_nested_checkpoints_without_overall_or_project_status(self):
+        state = self.write_completed_append_state()
+        self.assertNotIn("status", state)
+        self.assertNotIn("project", state)
+        self.assertEqual(state["selected_project_id"], 41)
+        self.assertEqual(self.decision("Succeeded").payload["outcome"], "succeeded")
+
+    def test_completed_work_does_not_replace_run_completion(self):
+        for run_status in ("pending", "running", "failed"):
+            with self.subTest(run_status=run_status):
+                state = self.write_completed_append_state()
+                state["run"]["status"] = run_status
+                self.save(state)
+                self.assertEqual(self.decision("Succeeded").payload["outcome"], "operator_attention")
+
+    def test_completed_run_requires_a_valid_selected_project(self):
+        for selected_project_id in (None, True, "41", 0, 42):
+            with self.subTest(selected_project_id=selected_project_id):
+                state = self.write_completed_append_state()
+                state["selected_project_id"] = selected_project_id
+                self.save(state)
+                self.assert_attention("invalid_workspace_state")
+
     def test_success_requires_confirmed_project_lock_release(self):
         for status in ("pending", "acquiring", "locked", None):
             with self.subTest(status=status):
@@ -674,7 +686,6 @@ class FinalizationPayloadTests(SkeletonIngestionWorkerTestCase):
 
     def test_preloading_failure_with_unreleased_project_lock_is_not_retryable(self):
         state = self.write_completed_append_state()
-        state["status"] = "failed"
         state["run"] = {"status": "failed", "reason": "Interrupted before batch loading"}
         for phase in state["phases"].values():
             phase["status"] = "pending"
@@ -933,7 +944,6 @@ class FinalizationPayloadTests(SkeletonIngestionWorkerTestCase):
         for index, name in enumerate(worker._REQUIRED_PHASES):
             with self.subTest(phase=name):
                 state = self.write_completed_append_state()
-                state["status"] = "failed"
                 state["run"] = {"status": "failed", "reason": name + " interrupted"}
                 state["phases"] = {
                     phase: {"status": "complete" if i < index else "failed" if i == index else "pending"}
@@ -954,7 +964,6 @@ class FinalizationPayloadTests(SkeletonIngestionWorkerTestCase):
 
     def test_interrupted_run_with_prepared_batch_remains_blocked(self):
         state = self.write_incomplete_append_state(["prepared", "planned"])
-        state["status"] = "database_in_progress"
         state["run"] = {"status": "running"}
         self.save(state)
         (self.workspace / "state/result.json").unlink()
@@ -976,13 +985,13 @@ class FinalizationPayloadTests(SkeletonIngestionWorkerTestCase):
             with self.subTest(case=case):
                 state = self.write_incomplete_append_state(["planned", "planned"])
                 if case == "run":
-                    state["run"]["status"] = "running"
+                    state["run"]["status"] = "unknown"
                 elif case == "batch":
                     state["batches"] = [{"status": "planned"}, {"status": "committed"}]
                 elif case == "phase":
                     state["phases"]["cache"]["status"] = "complete"
                 else:
-                    state["project"]["status"] = "prepared"
+                    state["selected_project_id"] = -1
                 self.save(state)
                 self.assert_attention("invalid_workspace_state")
 

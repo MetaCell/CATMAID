@@ -25,7 +25,7 @@ from botocore.config import Config as BotocoreConfig
 from botocore.exceptions import BotoCoreError, ClientError
 
 from . import archive_sources
-from .statuses import ProjectLockStatus
+from .statuses import BatchStatus, OperationStatus, ProjectLockStatus
 from .archive_sources import (
     PublicS3Object,
     SignedArchiveSource,
@@ -83,13 +83,8 @@ _RETRYABLE_S3_ERROR_CODES = {
     "503",
     "504",
 }
-_PROJECT_STATUSES = {"planned", "committed"}
-_BATCH_STATUSES = {"planned", "prepared", "committed", "failed"}
-_PHASE_STATUSES = {"pending", "running", "complete", "failed"}
-_IMPORTER_STATUSES = {
-    "planned", "in_progress", "database_in_progress", "database_complete",
-    "maintenance_complete", "cache_complete", "complete", "failed",
-}
+_BATCH_STATUSES = set(BatchStatus)
+_PHASE_STATUSES = set(OperationStatus)
 _REQUIRED_PHASES = ("database_maintenance", "cache", "verification")
 
 
@@ -827,17 +822,18 @@ def _validate_state_directory(workspace: Path, state_directory: Path) -> None:
 
 
 def _validate_incomplete_state(state: Mapping[str, Any]) -> None:
-    """Validate current checkpoints, including a failed run's retained progress."""
-    status = _checkpoint_status(state, _IMPORTER_STATUSES, "overall")
+    """Validate run, target, batch, phase, and lock checkpoints."""
     run_status = _checkpoint_status(state.get("run"), _PHASE_STATUSES, "run")
-    project = state.get("project")
-    project_status = _checkpoint_status(project, _PROJECT_STATUSES, "project")
     project_lock = state.get("project_lock")
     lock_status = _checkpoint_status(project_lock, set(ProjectLockStatus), "project lock")
     if type(project_lock.get("project_id")) is not int or project_lock["project_id"] <= 0:
         raise WorkspaceStateError("Importer project lock has an invalid project_id")
-    if project_status == "committed" and project_lock["project_id"] != project.get("project_id"):
-        raise WorkspaceStateError("Importer project lock and selected project disagree")
+    selected_project_id = state.get("selected_project_id")
+    if selected_project_id is not None:
+        if type(selected_project_id) is not int or selected_project_id <= 0:
+            raise WorkspaceStateError("Selected importer project is invalid")
+        if project_lock["project_id"] != selected_project_id:
+            raise WorkspaceStateError("Importer project lock and selected project disagree")
     batches = state.get("batches")
     if not isinstance(batches, list) or not batches:
         raise WorkspaceStateError("Importer state has invalid batch checkpoints")
@@ -861,17 +857,6 @@ def _validate_incomplete_state(state: Mapping[str, Any]) -> None:
         raise WorkspaceStateError("Importer plan and batch checkpoints disagree")
     if _validated_archive(state.get("archive")) is None:
         raise WorkspaceStateError("Importer state has invalid archive metadata")
-    if (project.get("mode") not in (None, "existing")
-            or project.get("stack_id") is not None):
-        raise WorkspaceStateError("Importer state is not an existing-project append")
-    if project_status == "committed" and (
-        project.get("mode") != "existing"
-        or type(project.get("project_id")) is not int
-        or project["project_id"] <= 0
-    ):
-        raise WorkspaceStateError("Selected importer project is invalid")
-    if project_status == "planned" and project.get("project_id") is not None:
-        raise WorkspaceStateError("Unselected importer project already has an ID")
 
     # One committed prefix, at most one active/failed batch, then planned batches.
     tail = False
@@ -881,10 +866,9 @@ def _validate_incomplete_state(state: Mapping[str, Any]) -> None:
         if value != "committed":
             tail = True
     loaded = all(value == "committed" for value in batch_statuses)
-    if project_status != "committed":
-        if any(value != "planned" for value in batch_statuses):
-            raise WorkspaceStateError("Importer batches advanced before target selection")
-    if project_status != "committed" or not loaded:
+    if selected_project_id is None and any(value != "planned" for value in batch_statuses):
+        raise WorkspaceStateError("Importer batches advanced before target selection")
+    if not loaded:
         if any(value != "pending" for value in phase_statuses):
             raise WorkspaceStateError("Importer phases advanced before every batch committed")
     else:
@@ -895,36 +879,17 @@ def _validate_incomplete_state(state: Mapping[str, Any]) -> None:
             if value != "complete":
                 unfinished = True
 
-    if (status == "failed") != (run_status == "failed"):
-        raise WorkspaceStateError("Importer failure status disagrees with its run")
     if run_status == "pending":
-        # A confirmed wrapper startup failure can release the workflow's flag
-        # before the importer ever changes run from pending. No batch/phase may
-        # have advanced, and acquiring/locked still require inspection.
-        if (status != "planned" or project_status != "planned"
+        # Safe wrapper startup cleanup can release the workflow's project lock
+        # before run begins. No selection, batch, or final phase may have advanced.
+        if (selected_project_id is not None
                 or lock_status not in {ProjectLockStatus.PENDING, ProjectLockStatus.RELEASED}
                 or any(value != "planned" for value in batch_statuses)):
             raise WorkspaceStateError("Importer checkpoints advanced before its run")
-        return
-    if run_status == "failed":
-        return  # A normal failure retains the last batch/phase checkpoints.
-    if run_status == "complete" and (
-        status != "complete" or not loaded
-        or any(value != "complete" for value in phase_statuses)
+    elif run_status == "complete" and (
+        not loaded or any(value != "complete" for value in phase_statuses)
     ):
         raise WorkspaceStateError("Completed importer run has incomplete checkpoints")
-    if project_status != "committed":
-        expected = "in_progress"
-    elif not loaded:
-        expected = "database_in_progress"
-    else:
-        expected = "database_complete"
-        if phase_statuses[0] == "complete":
-            expected = "maintenance_complete"
-            if phase_statuses[1] == "complete":
-                expected = "complete" if phase_statuses[2] == "complete" else "cache_complete"
-    if status != expected:
-        raise WorkspaceStateError("Importer state status disagrees with its checkpoints")
 
 
 def _partial_state_payload(
@@ -946,8 +911,7 @@ def _partial_state_payload(
             value = plan.get(source_name)
             if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                 payload[payload_name] = value
-    project = state.get("project")
-    if not isinstance(project, Mapping) or project.get("status") != "committed":
+    if state.get("selected_project_id") is None:
         return
     try:
         context, _ = _registered_json_artifact(
@@ -967,15 +931,14 @@ def _success_payload(
     download_result: Mapping[str, Any] | None,
 ) -> dict[str, object]:
     run = state.get("run")
-    if (state.get("status") != "complete" or not isinstance(run, Mapping)
-            or run.get("status") != "complete"):
+    if not isinstance(run, Mapping) or run.get("status") != "complete":
         raise WorkspaceStateError("Importer success requires a completed run")
-    project = state.get("project")
+    selected_project_id = state.get("selected_project_id")
     batches = state.get("batches")
     plan = state.get("plan")
     phases = state.get("phases")
-    if not isinstance(project, Mapping) or project.get("status") != "committed":
-        raise WorkspaceStateError("Completed importer state has no committed project")
+    if type(selected_project_id) is not int or selected_project_id <= 0:
+        raise WorkspaceStateError("Completed importer state has no selected project")
     if not isinstance(plan, Mapping):
         raise WorkspaceStateError("Completed importer state has no immutable plan")
     planned_batch_count = plan.get("batch_count")
@@ -1005,22 +968,18 @@ def _success_payload(
 
     context, _ = _registered_json_artifact(state_directory, state, "project_context")
     _verification, _ = _registered_json_artifact(state_directory, state, "verification")
-    if (
-        state.get("status") != "complete"
-        or context.get("existing_project") is not True
-        or project.get("mode") != "existing"
-    ):
+    if context.get("existing_project") is not True:
         raise WorkspaceStateError(
             "Importer result must be a completed existing-project append"
         )
     project_id = context.get("project_id")
     if type(project_id) is not int or project_id <= 0:
         raise WorkspaceStateError("Importer project context has invalid project_id")
-    if project.get("project_id") != project_id:
+    if selected_project_id != project_id:
         raise WorkspaceStateError(
             "Importer state and project context disagree on project_id"
         )
-    if context.get("stack_id") is not None or project.get("stack_id") is not None:
+    if context.get("stack_id") is not None:
         raise WorkspaceStateError("Append state unexpectedly contains a new stack")
     request = _load_json_object(config.workspace / REQUEST_FILENAME, "append request")
     target = request.get("target")
@@ -1113,7 +1072,7 @@ def derive_finalization(config: FinalizeConfig) -> FinalizationDecision:
                 config, WorkspaceStateError("Wrapper says no child launched but importer run advanced"),
                 state_directory=state_directory, state=state,
             )
-        if state["status"] == "complete" and run_status == "complete":
+        if run_status == "complete":
             if wrapper:
                 return _invalid_workspace_decision(
                     config, WorkspaceStateError("Completed importer run conflicts with wrapper failure"),

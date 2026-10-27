@@ -42,7 +42,7 @@ from .metrics import MetricsStore
 from .planner import ImportPlan, plan_archive, read_plan, write_plan
 from .batch_snapshot import BatchSnapshotReader, BatchSnapshotWriter
 from .state import ArchiveMetadata, StateStore
-from .statuses import DatabaseStatus, MetricsStatus, OperationStatus
+from .statuses import BatchStatus, OperationStatus
 from .stack_bounds import geometry_bounds, read_project_stack_geometry
 from .util import atomic_write_json, load_json, sha256_file
 
@@ -89,7 +89,6 @@ def _plan_result(store: StateStore, state: Mapping[str, Any]) -> dict[str, objec
     return _success_result(
         "plan",
         store.state_dir,
-        status=state["status"],
         archive_sha256=state["archive"]["sha256"],
         plan_sha256=plan["digest"],
         batches=plan["batch_count"],
@@ -439,7 +438,7 @@ def _record_completed_progress(
     """Make committed filesystem state authoritative for progress metrics."""
 
     committed = [
-        batch for batch in state["batches"] if batch["status"] == DatabaseStatus.COMMITTED
+        batch for batch in state["batches"] if batch["status"] == BatchStatus.COMMITTED
     ]
     return metrics.update_progress(
         completed_batches=len(committed),
@@ -644,7 +643,7 @@ def run_ingestion(state_dir: Path) -> dict[str, object]:
             store.fail_run(str(exc) or "Interrupted")
             metrics = MetricsStore(store.state_dir)
             if metrics.path.exists():
-                metrics.set_status(MetricsStatus.FAILED)
+                metrics.set_status(OperationStatus.FAILED)
         except Exception as reporting_error:
             _progress(f"Could not persist failure status: {reporting_error}")
         if isinstance(exc, ImporterError):
@@ -677,7 +676,7 @@ def _execute_ingestion(store: StateStore, resources: ExitStack) -> dict[str, obj
         planned_skeletons=plan.member_count,
     )
     metrics.record_operational_settings(**timeouts)
-    metrics.set_status(MetricsStatus.IN_PROGRESS)
+    metrics.set_status(OperationStatus.RUNNING)
     connection, _preflight = _database_context(store, state)
     from .project_lock import project_ingestion_lock
     resources.enter_context(project_ingestion_lock(
@@ -789,11 +788,10 @@ def _execute_ingestion(store: StateStore, resources: ExitStack) -> dict[str, obj
     )
 
     state = store.load()
-    metrics.set_status(MetricsStatus.COMPLETE)
+    metrics.set_status(OperationStatus.COMPLETE)
     result = _success_result(
         "run",
         store.state_dir,
-        status=state["status"],
         project_id=project.project_id,
         existing_project=True,
         batches=plan.batch_count,

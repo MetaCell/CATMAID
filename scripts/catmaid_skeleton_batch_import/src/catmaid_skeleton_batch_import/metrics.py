@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 
 from . import __version__
 from .errors import ImmutableStateError, InvalidInputError
-from .statuses import MetricsStatus, OperationStatus
+from .statuses import OperationStatus
 from .util import atomic_write_json, load_json
 
 
@@ -165,7 +165,7 @@ class MetricsStore:
 
         metrics = {
             "schema_version": SCHEMA_VERSION,
-            "status": MetricsStatus.PENDING,
+            "status": OperationStatus.PENDING,
             "counts": expected,
             "phases": [],
             "runs": [],
@@ -182,9 +182,9 @@ class MetricsStore:
             raise ImmutableStateError("Unsupported or malformed metrics schema")
         return value
 
-    def set_status(self, status: MetricsStatus) -> dict[str, Any]:
+    def set_status(self, status: OperationStatus) -> dict[str, Any]:
         try:
-            status = MetricsStatus(status)
+            status = OperationStatus(status)
         except (ValueError, TypeError) as exc:
             raise InvalidInputError(f"Unknown metrics status: {status}") from exc
         metrics = self.load()
@@ -250,8 +250,8 @@ class MetricsStore:
                 raise ImmutableStateError(f"Row count {name} cannot decrease")
             metrics["counts"]["rows"][name] = value
 
-        if metrics["status"] == MetricsStatus.PENDING:
-            metrics["status"] = MetricsStatus.IN_PROGRESS
+        if metrics["status"] == OperationStatus.PENDING:
+            metrics["status"] = OperationStatus.RUNNING
         atomic_write_json(self.path, metrics)
         return copy.deepcopy(metrics)
 
@@ -294,9 +294,9 @@ class MetricsStore:
             record = _completed_phase_record(metrics, **phase)
             metrics["phases"].append(record)
             records.append(record)
-        if metrics["status"] == MetricsStatus.PENDING:
-            metrics["status"] = MetricsStatus.IN_PROGRESS
+        if metrics["status"] == OperationStatus.PENDING:
+            metrics["status"] = OperationStatus.RUNNING
         if any(record["status"] == OperationStatus.FAILED for record in records):
-            metrics["status"] = MetricsStatus.FAILED
+            metrics["status"] = OperationStatus.FAILED
         atomic_write_json(self.path, metrics)
         return copy.deepcopy(records)

@@ -151,7 +151,7 @@ def test_negative_append_coordinates_are_planned_loaded_verified_and_cached(
     preflight_ingestion(path, state_dir)
     assert plan_ingestion(path, state_dir)["nodes"] == 2
     result = run_ingestion(state_dir)
-    assert result["status"] == "complete"
+    assert result["ok"] is True
     assert result["project_id"] == project_id
     with isolated_database.cursor() as cursor:
         cursor.execute("""
@@ -223,21 +223,21 @@ def test_single_node_import_is_atomic_and_cached(
         with pytest.raises(OperationalFailureError, match="singleton summary"):
             run_ingestion(state_dir)
         state = StateStore(state_dir).load()
-        assert state["status"] == "failed"
+        assert state["run"]["status"] == "failed"
         assert [batch["status"] for batch in state["batches"]] == ["committed", "failed"]
         with isolated_database.cursor() as cursor:
             cursor.execute("SELECT count(*) FROM class_instance WHERE project_id=%s AND name=%s",
-                           [state["project"]["project_id"], "source-fragment:point"])
+                           [state["selected_project_id"], "source-fragment:point"])
             assert cursor.fetchone()[0] == 0
         with pytest.raises(InvalidInputError, match="terminal"):
             run_ingestion(state_dir)
         return
     result = run_ingestion(state_dir)
     state = StateStore(state_dir).load()
-    project_id = state["project"]["project_id"]
+    project_id = state["selected_project_id"]
     maps_before = [batch["artifacts"]["node_map"] for batch in state["batches"]]
     assert [item["count"] for item in maps_before] == [2, 1]
-    assert result["status"] == "complete"
+    assert result["ok"] is True
     assert result["skeletons"] == 2
     assert result["nodes"] == 3
     point_row = next(row for row in read_manifest(Path(result["manifest"]))
@@ -335,7 +335,7 @@ def test_known_rollback_preserves_prior_batch_and_is_terminal(
     with pytest.raises(InvalidInputError, match="terminal"):
         run_ingestion(state_dir)
     assert calls == 2
-    assert StateStore(state_dir).load()["status"] == "failed"
+    assert StateStore(state_dir).load()["run"]["status"] == "failed"
     with isolated_database.cursor() as cursor:
         ids = [int(row["treenode_id"]) for row in saved_rows[0]]
         cursor.execute("SELECT id, parent_id FROM treenode WHERE id=ANY(%s::bigint[]) ORDER BY id", [ids])
@@ -425,7 +425,7 @@ def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_c
     (tmp_path / "append" / "input.zip").unlink()
     result = run_ingestion(append_state)
     after = snapshot()
-    assert result["status"] == "complete"
+    assert result["ok"] is True
     assert result["project_id"] == pid
     assert result.get("stack_id") is None
     assert after[:3] == before[:3]
@@ -477,7 +477,7 @@ def test_append_to_populated_project_preserves_old_data_stacks_permissions_and_c
                        [pid, "source-fragment:new-fragment"])
         assert cursor.fetchone()[0] == 0
     reimported = run_ingestion(request(tmp_path / "reimport", "new-fragment", pid))
-    assert reimported["status"] == "complete"
+    assert reimported["ok"] is True
     new_row = read_manifest(Path(reimported["manifest"]))[0]
     assert new_row["fragment_id"] == imported["fragment_id"]
     assert new_row["skeleton_id"] != imported["skeleton_id"]
@@ -515,7 +515,7 @@ def test_micrometre_rounding_regression_completes_import_and_final_cache_verific
     monkeypatch.setattr(GridCacheRebuild, "verify", verify)
     result = run_ingestion(state_dir)
 
-    assert result["status"] == "complete"
+    assert result["ok"] is True
     assert verification_phases == ["running"]
     manifest = read_manifest(Path(result["manifest"]))[0]
     with isolated_database.cursor() as cursor:

@@ -11,6 +11,8 @@ import subprocess
 import sys
 import threading
 
+from .statuses import BatchStatus
+
 CATMAID_WRAPPER = "/home/scripts/docker/run_catmaid_skeleton_import.py"
 
 
@@ -19,7 +21,7 @@ STAGE_COUNT = 5
 PROGRESS_ANNOTATION = "neuroglass.metacell.us/ingestion-progress"
 PROGRESS_VERSION = "stages-v1"
 MAX_STATE_BYTES = 4 * 1024 * 1024
-BATCH_STATUSES = {"planned", "prepared", "committed", "failed"}
+BATCH_STATUSES = set(BatchStatus)
 
 
 class WorkflowInterrupted(SystemExit):

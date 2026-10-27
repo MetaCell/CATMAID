@@ -37,7 +37,7 @@ def test_progress_counts_are_attributable_and_monotonic(tmp_path: Path) -> None:
         completed_skeletons=1,
         row_counts={"treenode": 5, "class_instance": 2},
     )
-    assert metrics["status"] == "in_progress"
+    assert metrics["status"] == "running"
     assert metrics["counts"] == {
         "batches": {"planned": 2, "completed": 1},
         "nodes": {"planned": 12, "completed": 5},
@@ -72,7 +72,7 @@ def test_failed_phase_keeps_failure_details(tmp_path: Path) -> None:
     store = MetricsStore(tmp_path)
     store.initialize()
     record = store.record_phase(
-        "project.create", duration_seconds=0.5, status="failed",
+        "project.select", duration_seconds=0.5, status="failed",
         error="database unavailable",
     )
     metrics = store.load()
@@ -189,7 +189,7 @@ def test_buffered_phases_use_one_write_and_keep_sequence_and_status(
     assert [record["name"] for record in records] == ["copy", "edges", "validation"]
     assert records[0]["node_count"] == 8
     assert records[0]["row_counts"] == {"treenode_rows": 8}
-    assert saved["status"] == ("failed" if middle_status == "failed" else "in_progress")
+    assert saved["status"] == ("failed" if middle_status == "failed" else "running")
     if middle_status == "failed":
         assert records[1]["error"] == "edge failure"
 

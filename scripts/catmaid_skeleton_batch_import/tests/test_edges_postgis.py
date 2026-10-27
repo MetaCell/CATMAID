@@ -303,7 +303,7 @@ def test_phase_failure_rolls_back_second_batch_and_is_terminal(local_database, t
         run_ingestion(state_dir)
     assert edge_rows(local_database, first_ids) == first
     assert len(edge_rows(local_database, second_ids)) == 0
-    assert StateStore(state_dir).load()["status"] == "failed"
+    assert StateStore(state_dir).load()["run"]["status"] == "failed"
     assert_no_temp(local_database)
 
 

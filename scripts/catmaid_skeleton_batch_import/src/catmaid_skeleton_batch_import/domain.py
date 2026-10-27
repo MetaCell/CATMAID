@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .statuses import DatabaseStatus
+from .statuses import BatchStatus
 
 
 @dataclass(frozen=True)
@@ -116,5 +116,5 @@ class PlannedBatch:
             "last_member": self.members[-1].member_path,
             "skeleton_count": self.skeleton_count,
             "node_count": self.node_count,
-            "status": DatabaseStatus.PLANNED,
+            "status": BatchStatus.PLANNED,
         }

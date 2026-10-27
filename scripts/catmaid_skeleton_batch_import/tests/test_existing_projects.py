@@ -277,7 +277,7 @@ def test_changed_append_geometry_or_database_is_rejected_before_reserving_ids(tm
         orchestrator.run_ingestion(state_dir)
     state = StateStore(state_dir).load()
     assert state["batches"][0]["status"] == "planned"
-    assert state["status"] == "failed"
+    assert state["run"]["status"] == "failed"
 
 
 def test_missing_stack_snapshot_fails_before_loading_or_reserving_ids(tmp_path, monkeypatch):
@@ -327,7 +327,7 @@ def test_geometry_change_during_import_prevents_completion(tmp_path, monkeypatch
         orchestrator.run_ingestion(state_dir)
     state = StateStore(state_dir).load()
     assert state["batches"][0]["status"] == "committed"
-    assert state["status"] != "complete"
+    assert state["run"]["status"] != "complete"
 
 
 def test_complete_append_is_scoped_and_preserves_target_configuration(tmp_path, monkeypatch):
@@ -351,7 +351,7 @@ def test_complete_append_is_scoped_and_preserves_target_configuration(tmp_path, 
         orchestrator.run_ingestion(state_dir)
     assert first["project_id"] == 123
     assert first.get("stack_id") is None
-    assert first["status"] == "complete"
+    assert first["ok"] is True
     assert first["existing_project"] is True
     assert batches == [1]
     assert len(exact_checks) == 1
@@ -404,7 +404,7 @@ def test_cache_or_verification_failure_is_terminal(tmp_path, monkeypatch, phase)
     with pytest.raises(OperationalFailureError, match="injected failure"):
         orchestrator.run_ingestion(state_dir)
     state = StateStore(state_dir).load()
-    assert state["status"] == "failed"
+    assert state["run"]["status"] == "failed"
     assert state["batches"][0]["status"] == "committed"
     assert state["phases"][phase]["status"] == "failed"
     before = list(events)
@@ -439,7 +439,7 @@ def test_cache_is_rebuilt_once_after_all_batches(tmp_path, monkeypatch):
         events.append("verify_cache")
         return original_verify(self, receipt)
     monkeypatch.setattr(cache_rebuild.GridCacheRebuild, "verify", verify)
-    assert orchestrator.run_ingestion(state_dir)["status"] == "complete"
+    assert orchestrator.run_ingestion(state_dir)["ok"] is True
     assert events == ["commit_1", "commit_2", "cache", "verify_cache"]
     with pytest.raises(InvalidInputError, match="terminal"):
         orchestrator.run_ingestion(state_dir)
@@ -459,7 +459,7 @@ def test_cache_observation_starts_before_coverage_planning(tmp_path, monkeypatch
         assert StateStore(state_dir).load()["phases"]["cache"]["status"] == "running"
         return original(cache)
     monkeypatch.setattr(cache_rebuild.GridCacheRebuild, "plan", plan)
-    assert orchestrator.run_ingestion(state_dir)["status"] == "complete"
+    assert orchestrator.run_ingestion(state_dir)["ok"] is True
     assert observations == [{"schema_version": 1, "completed": 0, "total": 0}]
 
 def test_planning_failure_does_not_publish_partial_state(tmp_path, monkeypatch):
@@ -497,10 +497,10 @@ def test_run_uses_saved_batches_and_only_runtime_timeouts(tmp_path, monkeypatch)
 
     monkeypatch.setattr(orchestrator, "execute_batch_transaction", commit)
     monkeypatch.setattr(loader, "verify_exact_treenodes", lambda *_args: None)
-    assert orchestrator.run_ingestion(state_dir)["status"] == "complete"
+    assert orchestrator.run_ingestion(state_dir)["ok"] is True
     assert observed == [(1, 123, 123, 456)]
     state = StateStore(state_dir).load()
-    assert state["project"]["mode"] == "existing"
+    assert state["selected_project_id"] == 123
     context = json.loads((state_dir / state["artifacts"]["project_context"]["path"]).read_text())
     assert context["existing_project"] is True
     assert context["project_id"] == 123

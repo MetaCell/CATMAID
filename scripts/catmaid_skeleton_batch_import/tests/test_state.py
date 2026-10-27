@@ -45,7 +45,7 @@ def make_store(tmp_path: Path, *, batch_count: int = 2) -> tuple[StateStore, dic
     return store, arguments
 
 
-def commit_project(store: StateStore) -> None:
+def select_project(store: StateStore) -> None:
     store.select_existing_project(101)
 
 
@@ -56,7 +56,11 @@ def commit_batch(store: StateStore, index: int) -> None:
 
 def test_state_files_are_canonical_and_planning_is_single_use(tmp_path: Path) -> None:
     store, arguments = make_store(tmp_path)
-    assert store.load()["schema_version"] == SCHEMA_VERSION == 1
+    state = store.load()
+    assert state["schema_version"] == SCHEMA_VERSION == 1
+    assert "status" not in state
+    assert "project" not in state
+    assert state["selected_project_id"] is None
     assert store.load()["plan"]["planner_version"] == 1
     for path in (store.request_path, store.archive_path, store.state_path):
         assert path.read_bytes() == canonical_json_bytes(json.loads(path.read_bytes()))
@@ -159,14 +163,14 @@ def test_persisted_artifact_descriptor_is_accepted_by_artifact_reader(
 def test_project_batch_and_phase_lifecycle(tmp_path: Path) -> None:
     store, _ = make_store(tmp_path)
     store.begin_run()
-    commit_project(store)
+    select_project(store)
     commit_batch(store, 1)
-    assert store.load()["status"] == "database_in_progress"
+    assert store.load()["run"]["status"] == "running"
     commit_batch(store, 2)
     for phase in ("database_maintenance", "cache", "verification"):
         store.mark_phase_running(phase)
         store.mark_phase_complete(phase)
-    assert store.finish_run()["status"] == "complete"
+    assert store.finish_run()["run"]["status"] == "complete"
     with pytest.raises(InvalidInputError, match="terminal"):
         store.begin_run()
 
@@ -176,7 +180,7 @@ def test_whole_batch_order_and_phase_prerequisites_are_enforced(tmp_path: Path) 
 
     with pytest.raises(ImmutableStateError, match="target selection"):
         store.mark_batch_prepared(1)
-    commit_project(store)
+    select_project(store)
     with pytest.raises(ImmutableStateError, match="batch 1"):
         store.mark_batch_prepared(2)
     with pytest.raises(ImmutableStateError, match="every batch"):
@@ -188,19 +192,19 @@ def test_selected_project_cannot_be_replaced(tmp_path: Path) -> None:
     store.select_existing_project(101)
     with pytest.raises(ImmutableStateError, match="planned target"):
         store.select_existing_project(999)
-    assert store.load()["project"]["project_id"] == 101
+    assert store.load()["selected_project_id"] == 101
 
 
 def test_failed_and_interrupted_attempts_cannot_be_resumed(tmp_path):
     store, _ = make_store(tmp_path)
     store.begin_run()
-    commit_project(store)
+    select_project(store)
     commit_batch(store, 1)
     store.mark_batch_prepared(2)
     with pytest.raises(InvalidInputError, match="already been run"):
         store.begin_run()
     state = store.fail_run("first error")
-    assert state["status"] == "failed"
+    assert state["run"]["status"] == "failed"
     assert [item["status"] for item in state["batches"]] == ["committed", "failed"]
     with pytest.raises(InvalidInputError, match="terminal"):
         store.begin_run()
@@ -280,3 +284,27 @@ except InvalidInputError as error:
     assert b"This workspace has already been run" in result.stderr
     assert not marker.exists()
     assert store.state_path.read_bytes() == before
+
+
+def test_failed_batch_retains_selection_committed_prefix_and_lock(tmp_path):
+    from catmaid_skeleton_batch_import.statuses import ProjectLockStatus
+
+    store, _ = make_store(tmp_path, batch_count=3)
+    store.begin_run()
+    store.transition_project_lock(ProjectLockStatus.ACQUIRING)
+    store.transition_project_lock(ProjectLockStatus.LOCKED)
+    select_project(store)
+    commit_batch(store, 1)
+    store.mark_batch_prepared(2)
+
+    state = store.fail_run("Connection lost during COMMIT")
+
+    assert "status" not in state
+    assert "project" not in state
+    assert state["selected_project_id"] == 101
+    assert state["run"]["status"] == "failed"
+    assert state["project_lock"]["status"] == "locked"
+    assert [batch["status"] for batch in state["batches"]] == [
+        "committed", "failed", "planned",
+    ]
+    assert all(phase["status"] == "pending" for phase in state["phases"].values())

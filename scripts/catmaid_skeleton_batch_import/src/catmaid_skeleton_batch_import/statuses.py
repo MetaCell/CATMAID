@@ -8,8 +8,8 @@ class _Status(str, Enum):
         return self.value
 
 
-class DatabaseStatus(_Status):
-    """Project and batch database progress."""
+class BatchStatus(_Status):
+    """One atomic batch's database progress."""
     PLANNED = "planned"
     PREPARED = "prepared"
     COMMITTED = "committed"
@@ -17,7 +17,7 @@ class DatabaseStatus(_Status):
 
 
 class OperationStatus(_Status):
-    """The run and each post-loading phase share this lifecycle."""
+    """The run, post-loading phases, and metrics share this lifecycle."""
     PENDING = "pending"
     RUNNING = "running"
     COMPLETE = "complete"
@@ -29,22 +29,3 @@ class ProjectLockStatus(_Status):
     ACQUIRING = "acquiring"
     LOCKED = "locked"
     RELEASED = "released"
-
-
-class ImportStatus(_Status):
-    """Overall ingestion progress exposed in state and command results."""
-    PLANNED = "planned"
-    IN_PROGRESS = "in_progress"
-    DATABASE_IN_PROGRESS = "database_in_progress"
-    DATABASE_COMPLETE = "database_complete"
-    MAINTENANCE_COMPLETE = "maintenance_complete"
-    CACHE_COMPLETE = "cache_complete"
-    COMPLETE = "complete"
-    FAILED = "failed"
-
-
-class MetricsStatus(_Status):
-    PENDING = "pending"
-    IN_PROGRESS = "in_progress"
-    COMPLETE = "complete"
-    FAILED = "failed"
