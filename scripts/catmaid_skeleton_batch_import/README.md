@@ -713,9 +713,10 @@ to stderr.
 
 ## Tests
 
-Run the dependency-free suite with:
+Run the standalone suite, including the optional workflow tests, with:
 
 ```bash
+python -m pip install './scripts/catmaid_skeleton_batch_import[workflow]'
 python -m pytest -q scripts/catmaid_skeleton_batch_import/tests
 ```
 
@@ -735,7 +736,7 @@ ordinary CATMAID models, then test append behavior, exact geometry, summary
 parity, cache preservation, rollback and terminal failures. The importer itself
 never provisions those targets. Use only a disposable, migrated CATMAID/PostGIS
 database; the tests leave their targets for inspection. Name that database and
-pin its PostgreSQL cluster identity explicitly before enabling either database test module:
+pin its PostgreSQL cluster identity explicitly before enabling the database tests:
 
 ```bash
 CATMAID_BATCH_IMPORT_E2E=1 \
@@ -746,13 +747,24 @@ CATMAID_BATCH_IMPORT_TEST_DB_SYSTEM_IDENTIFIER='<disposable cluster identifier>'
 DJANGO_SETTINGS_MODULE=mysite.settings \
 python -m pytest -q \
   scripts/catmaid_skeleton_batch_import/tests/test_e2e_postgis.py \
-  scripts/catmaid_skeleton_batch_import/tests/test_edges_postgis.py
+  scripts/catmaid_skeleton_batch_import/tests/test_edges_postgis.py \
+  scripts/catmaid_skeleton_batch_import/tests/test_project_lock_postgis.py \
+  scripts/catmaid_skeleton_batch_import/tests/test_project_lock_migration_postgis.py
 ```
 
 The configured Django connection must match the named host and database. Obtain
 the cluster identifier from that disposable database with
 `SELECT system_identifier::text FROM pg_control_system()`; no production target
 is a suitable substitute. These checks run before the tests create any projects.
+
+The project-lock tests use separate PostgreSQL sessions and observe actual lock
+waits to check concurrent edits, acquisition races, connection loss, ownership
+and timeouts. Apply migration `0127` before running them.
+The migration tests exercise forward/reverse schema changes, history tracking
+and refusal to reverse an active lock. They create and drop temporary clones of
+the guarded database rather than downgrading its shared schema. The configured
+database role therefore needs `CREATEDB` and access to the `postgres`
+maintenance database; no other sessions may use the template while it is cloned.
 
 ## Edge materialization
 

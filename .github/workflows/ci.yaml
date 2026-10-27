@@ -47,7 +47,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: |
           pip install "$(grep -E '^pytest==' django/requirements-test.txt)"
-          pip install --no-deps ./scripts/catmaid_skeleton_batch_import
+          pip install "./scripts/catmaid_skeleton_batch_import[workflow]"
         name: Install importer and test tools
       - run: python -m pytest -q scripts/catmaid_skeleton_batch_import/tests
         name: Run standalone importer and runtime wrapper tests
