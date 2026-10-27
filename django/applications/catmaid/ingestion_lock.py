@@ -35,6 +35,15 @@ def acquire_project_ingestion(project_id, owner, *, using="default", lock_timeou
     return owner
 
 
+def require_project_ingestion(project_id, owner, *, using="default"):
+    """Check the workflow-to-run handoff without releasing or reacquiring it."""
+    with connections[using].cursor() as cursor:
+        cursor.execute("SELECT active_skeleton_ingestion FROM project WHERE id = %s", [project_id])
+        row = cursor.fetchone()
+    if row is None or row[0] is None or UUID(str(row[0])) != UUID(str(owner)):
+        raise ProjectIngestionLocked(f"Project {project_id} is not locked by this ingestion")
+
+
 def release_project_ingestion(project_id, owner, *, using="default"):
     # Compare ownership atomically; never clear another attempt's lock.
     with transaction.atomic(using=using):

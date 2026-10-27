@@ -6,7 +6,8 @@ inputs, plans whole-skeleton batches, loads them atomically, rebuilds existing
 grid caches once and retains verification and audit files. Project, stack and
 grid provisioning are prerequisites handled outside ingestion.
 
-The importer acquires a durable project ingestion lock before batch loading.
+The single-pod workflow acquires a durable project ingestion lock before
+downloading. The standalone local-ZIP CLI acquires it before batch loading.
 Matching NeuroGlass middleware rejects edits on that project through cache
 updates and verification while reads remain available. No viewer polling or
 permission rewriting is involved. Native CATMAID clients and arbitrary database
@@ -70,9 +71,12 @@ Migration `0127_project_active_skeleton_ingestion` adds the nullable UUID field
 history table/view. Deploy that migration and the matching NeuroGlass middleware
 before importing. This does not alter users' project permissions.
 
-Download, preflight and planning do not lock edits. At the start of `run`, before
-batch preparation, the importer obtains its existing importer advisory lock,
-then acquires the durable project flag. NeuroGlass mutation requests use
+The single-pod workflow acquires the durable project flag before downloading,
+then retains it through preflight, planning, loading, maintenance, cache updates
+and verification. At the start of `run`, it verifies the same ingestion UUID
+still owns the flag, without releasing and reacquiring it. The standalone
+local-ZIP CLI acquires its flag at `run`, before batch preparation. Both obtain
+the existing importer advisory lock during loading. NeuroGlass mutation requests use
 `catmaid.ingestion_lock.project_write_guard()` for the whole write response.
 Their shared project-row locks allow concurrent edits and finish before the
 importer's exclusive row lock can set the flag. Lock acquisition uses the run's
@@ -87,7 +91,8 @@ There is no viewer polling or automatic layer-visibility change.
 
 The flag stays set across batch commits, database maintenance, existing-cache
 updates and final verification. Verified completion clears only the matching
-owner. A confirmed failure while all batches remain planned also clears it.
+owner. A confirmed download/preflight/planning failure also clears it. Run
+startup failure with every batch still planned clears it too.
 A prepared/failed/committed batch or process loss leaves it set; it has no
 expiry and a new attempt cannot acquire or clear another owner's flag.
 
@@ -108,9 +113,11 @@ The lock lifecycle is part of that same atomic state record:
 }
 ```
 
-`project_lock.status` moves through `pending`, `acquiring`, `locked` and
-`released`. The importer saves `acquiring` before the database call and
-`released` only after ownership-checked release succeeds. There is no separate
+`project_lock.status` observes the run handoff through `pending`, `acquiring`,
+`locked` and `released`. In the workflow, the database flag already exists before
+planning publishes state. Standalone run saves `acquiring` before acquisition.
+`released` is saved only after ownership-checked release succeeds, including a
+safe workflow failure before run startup. There is no separate
 lock-owner UUID or lock receipt file. An uncertain acquisition/release or an
 `acquiring`/`locked` state requires operator attention, even before batch
 loading. Successful workflow evidence requires a completed run and a released
@@ -120,7 +127,9 @@ are not rolled back and automatic retry/resume is still unsupported.
 For manual resolution, first confirm the importer has stopped and reconcile the
 retained state/assigned IDs against the database. Resolve any partial import
 before unlocking. Through CATMAID's normal Django shell, use
-`project_lock.project_id` and `ingestion_id` from the retained `state.json`:
+`project_lock.project_id` and `ingestion_id` from the retained `state.json`. If
+planning never published state, use the workflow's pinned project and ingestion
+UUID and compare it with `Project.active_skeleton_ingestion`:
 
 ```python
 from catmaid.ingestion_lock import release_project_ingestion
@@ -671,7 +680,8 @@ associated-stack snapshot have been written and verified. Failed initialization
 publishes no executable state.
 
 Existing permissions and visibility remain unchanged. The project ingestion lock
-blocks NeuroGlass writes during loading and final verification. After failure,
+blocks NeuroGlass writes throughout workflow processing, including download and
+planning, through final verification. After failure,
 inspect the database and retained evidence before resolving a retained lock or
 choosing cleanup or a new import.
 

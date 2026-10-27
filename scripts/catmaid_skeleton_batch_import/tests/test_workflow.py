@@ -13,6 +13,12 @@ from uuid import uuid4
 from catmaid_skeleton_batch_import import workflow, workflow_io as io
 
 
+@pytest.fixture(autouse=True)
+def project_lock():
+    with patch.object(workflow, "WorkflowProjectLock") as lock:
+        yield lock.return_value
+
+
 def environment(tmp_path):
     ident = str(uuid4())
     return {
@@ -20,6 +26,7 @@ def environment(tmp_path):
         "SKELETON_INGESTION_WORKSPACE": str(tmp_path / ident),
         "SKELETON_INGESTION_WORKFLOW_NAME": "test-workflow",
         "SKELETON_INGESTION_WORKFLOW_UID": "test-uid",
+        "SKELETON_INGESTION_TARGET_PROJECT_ID": "81",
     }
 
 
@@ -109,6 +116,8 @@ from catmaid_skeleton_batch_import import workflow, workflow_progress
 
 workflow_progress.CATMAID_WRAPPER = sys.argv[1]
 workflow.io.execute = lambda *_args, **_kwargs: 0
+from unittest.mock import Mock
+workflow.WorkflowProjectLock = lambda *_args: Mock()
 original_run = workflow_progress.run
 
 def run(action):
@@ -133,3 +142,31 @@ raise SystemExit(workflow.execute())
     result = json.loads((workspace / workflow.TERMINAL_FILENAME).read_text())
     assert result["terminal"] is True
     assert result["result"]["outcome"] == "failed"
+
+
+def test_download_and_all_stages_start_after_acquiring_the_lock(tmp_path, project_lock):
+    env = environment(tmp_path)
+    events = []
+    project_lock.acquire.side_effect = lambda: events.append("lock")
+    project_lock.finish.side_effect = lambda *_a, **_kw: events.append("finish")
+    with patch.object(io, "execute", side_effect=lambda *_a, **_kw: events.append("download") or 0), \
+         patch.object(workflow.progress, "run", side_effect=lambda action: events.append(action) or 0), \
+         patch.object(io, "derive_finalization", return_value=decision("succeeded")):
+        assert workflow.execute(env) == 0
+    assert events == ["lock", "download", "preflight", "plan", "run", "finish"]
+
+
+@pytest.mark.parametrize("failure", ["acquire", "finish"])
+def test_lock_uncertainty_cannot_be_reported_as_a_retryable_preparation_failure(tmp_path, project_lock, failure):
+    env = environment(tmp_path)
+    if failure == "acquire":
+        project_lock.acquire.side_effect = RuntimeError("lock connection lost")
+    project_lock.finish.side_effect = RuntimeError("lock ownership uncertain")
+    with patch.object(io, "execute", return_value=2) as download, \
+         patch.object(io, "derive_finalization", return_value=decision("failed")):
+        assert workflow.execute(env) != 0
+    if failure == "acquire":
+        download.assert_not_called()
+    record = json.loads((Path(env["SKELETON_INGESTION_WORKSPACE"]) / workflow.TERMINAL_FILENAME).read_text())
+    assert record["result"]["outcome"] == "operator_attention"
+    assert record["result"]["error"]["category"] == "project_ingestion_lock"

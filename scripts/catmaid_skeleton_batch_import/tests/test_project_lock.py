@@ -34,9 +34,11 @@ def store(tmp_path, monkeypatch):
 
 
 def helpers(monkeypatch):
+    monkeypatch.delenv("SKELETON_INGESTION_WORKFLOW_NAME", raising=False)
     acquire, release = Mock(), Mock()
     monkeypatch.setitem(sys.modules, "catmaid.ingestion_lock", SimpleNamespace(
-        acquire_project_ingestion=acquire, release_project_ingestion=release))
+        acquire_project_ingestion=acquire, release_project_ingestion=release,
+        require_project_ingestion=Mock()))
     return acquire, release
 
 
@@ -141,3 +143,90 @@ def test_saved_lock_target_must_match_the_requested_project(store, monkeypatch):
     acquire.assert_not_called()
     release.assert_not_called()
     assert store.load()["project_lock"]["status"] == "pending"
+
+
+def workflow_lock(store, monkeypatch):
+    from catmaid_skeleton_batch_import.project_lock import WorkflowProjectLock
+    from catmaid_skeleton_batch_import import database
+
+    acquire, release = helpers(monkeypatch)
+    monkeypatch.setattr(database, "bootstrap_django", lambda: SimpleNamespace(alias="default"))
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setenv("DJANGO_SETTINGS_MODULE", "test-settings")
+    lock = WorkflowProjectLock({"SKELETON_INGESTION_ID": INGESTION_ID,
+                                "SKELETON_INGESTION_TARGET_PROJECT_ID": "17"})
+    lock.acquire()
+    return lock, acquire, release
+
+
+def test_workflow_releases_a_confirmed_download_failure_before_state_exists(store, monkeypatch, tmp_path):
+    lock, acquire, release = workflow_lock(store, monkeypatch)
+    lock.finish(tmp_path / "no-plan", run_started=False)
+    assert lock.status == "released"
+    release.assert_called_once_with(17, INGESTION_ID)
+
+
+def test_workflow_hands_ownership_to_run_without_an_unlocked_gap(store, monkeypatch):
+    lock, acquire, release = workflow_lock(store, monkeypatch)
+    monkeypatch.setenv("SKELETON_INGESTION_WORKFLOW_NAME", "workflow-test")
+    require = sys.modules["catmaid.ingestion_lock"].require_project_ingestion
+    with project_ingestion_lock(store, 17, SimpleNamespace(alias="default"), lock_timeout_ms=100):
+        assert lock.status == "locked"
+        require.assert_called_once_with(17, INGESTION_ID, using="default")
+        release.assert_not_called()
+    lock.finish(store.state_dir.parent, run_started=True)
+    assert lock.status == "released"
+    assert acquire.call_count == 1
+    assert release.call_count == 1  # Run released; outer workflow does not repeat it.
+
+
+@pytest.mark.parametrize("status", ["pending", "acquiring", "locked"])
+def test_workflow_releases_when_run_fails_before_any_batch_preparation(store, monkeypatch, status):
+    lock, acquire, release = workflow_lock(store, monkeypatch)
+    if status != "pending":
+        store.transition_project_lock(ProjectLockStatus.ACQUIRING)
+    if status == "locked":
+        store.transition_project_lock(ProjectLockStatus.LOCKED)
+    store.fail_run("wrapper or startup failure")
+    lock.finish(store.state_dir.parent, run_started=True)
+    assert store.load()["project_lock"]["status"] == "released"
+    release.assert_called_once_with(17, INGESTION_ID)
+
+
+@pytest.mark.parametrize("status", ["prepared", "committed", "failed"])
+def test_workflow_keeps_partial_or_uncertain_loading_locked(store, monkeypatch, status):
+    lock, acquire, release = workflow_lock(store, monkeypatch)
+    store.transition_project_lock(ProjectLockStatus.ACQUIRING)
+    store.transition_project_lock(ProjectLockStatus.LOCKED)
+    store.select_existing_project(17)
+    store.mark_batch_prepared(1)
+    if status == "committed":
+        store.mark_batch_committed(1)
+    elif status == "failed":
+        store.fail_run("commit outcome unknown")
+    lock.finish(store.state_dir.parent, run_started=True)
+    release.assert_not_called()
+    assert lock.status == "locked"
+
+
+def test_workflow_cannot_unlock_if_run_state_was_lost(store, monkeypatch, tmp_path):
+    lock, acquire, release = workflow_lock(store, monkeypatch)
+    with pytest.raises(ProjectIngestionLockError, match="state is missing"):
+        lock.finish(tmp_path / "missing", run_started=True)
+    release.assert_not_called()
+
+
+def test_workflow_cannot_unlock_another_ingestion_state(store, monkeypatch):
+    lock, acquire, release = workflow_lock(store, monkeypatch)
+    lock.owner = "11111111-2222-4333-8444-555555555556"
+    with pytest.raises(ProjectIngestionLockError, match="does not match"):
+        lock.finish(store.state_dir.parent, run_started=False)
+    release.assert_not_called()
+
+
+def test_workflow_does_not_assume_rollback_after_uncertain_acquisition(store, monkeypatch):
+    lock, acquire, release = workflow_lock(store, monkeypatch)
+    lock.status = ProjectLockStatus.ACQUIRING
+    with pytest.raises(ProjectIngestionLockError, match="not confirmed"):
+        lock.finish(store.state_dir.parent, run_started=False)
+    release.assert_not_called()

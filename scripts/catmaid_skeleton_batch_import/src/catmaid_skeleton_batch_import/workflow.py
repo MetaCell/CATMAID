@@ -10,6 +10,7 @@ import os
 import sys
 
 from . import workflow_io as io, workflow_progress as progress
+from .project_lock import WorkflowProjectLock
 
 TERMINAL_FILENAME = "terminal-result.json"
 
@@ -20,7 +21,9 @@ def execute(environ=None):
     workspace = None
     code = 1
     claimed = False
-    stage = "download"
+    stage = "project_lock"
+    project_lock = None
+    lock_error = None
     try:
         ingestion_id = io._validate_ingestion_id(io._required_env(environment, "SKELETON_INGESTION_ID"))
         workspace = io._workspace_from_environment(environment, ingestion_id, create=True)
@@ -28,6 +31,9 @@ def execute(environ=None):
             raise io.ImmutableWorkspaceError("This workflow workspace is single-use")
         (workspace / "workflow-started").touch(exist_ok=False)
         claimed = True
+        project_lock = WorkflowProjectLock(environment)
+        project_lock.acquire()
+        stage = "download"
         code = io.execute(["download"], environ=environment)
         if code == 0:
             progress.write_native_progress(*progress.stage_units(1))
@@ -49,6 +55,11 @@ def execute(environ=None):
     finally:
         if workspace is not None and claimed:
             try:
+                if project_lock is not None:
+                    try:
+                        project_lock.finish(workspace, run_started=stage == "run")
+                    except Exception as exc:
+                        lock_error = io._sanitize_message(exc, "Project ingestion lock release was not confirmed")
                 decision = io.derive_finalization(io.FinalizeConfig(
                     ingestion_id=environment["SKELETON_INGESTION_ID"],
                     workspace=workspace,
@@ -58,7 +69,11 @@ def execute(environ=None):
                 ))
                 # This process owns a fresh workspace and has not invoked run.
                 # Read-only preflight and offline planning cannot write morphology.
-                if code != 0 and stage != "run":
+                if lock_error is not None:
+                    decision.payload.update(outcome="operator_attention", error={
+                        "category": "project_ingestion_lock", "message": lock_error,
+                    })
+                elif code != 0 and stage != "run":
                     decision.payload["outcome"] = "failed"
                     if decision.payload.get("error", {}).get("category") == "workspace_evidence_missing":
                         decision.payload["error"] = {

@@ -561,8 +561,8 @@ class StateStore:
             state = self.load()
             current = state["project_lock"]["status"]
             allowed = {
-                ProjectLockStatus.PENDING: {ProjectLockStatus.ACQUIRING},
-                ProjectLockStatus.ACQUIRING: {ProjectLockStatus.LOCKED},
+                ProjectLockStatus.PENDING: {ProjectLockStatus.ACQUIRING, ProjectLockStatus.RELEASED},
+                ProjectLockStatus.ACQUIRING: {ProjectLockStatus.LOCKED, ProjectLockStatus.RELEASED},
                 ProjectLockStatus.LOCKED: {ProjectLockStatus.RELEASED},
             }
             if status not in allowed.get(current, set()):
