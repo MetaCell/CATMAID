@@ -9,11 +9,87 @@ grid provisioning are prerequisites handled outside ingestion.
 The single-pod workflow acquires a durable project ingestion lock before
 downloading. The standalone local-ZIP CLI acquires it before batch loading.
 Matching NeuroGlass middleware rejects edits on that project through cache
-updates and verification while reads remain available. No viewer polling or
-permission rewriting is involved. Native CATMAID clients and arbitrary database
-writers are outside this integration's contract and must not edit the target.
+updates and verification while reads remain available. Enforcing the lock
+requires no viewer polling or permission rewriting. Native CATMAID clients and
+arbitrary database writers are outside this integration's contract and must not
+edit the target.
 
 ## Single-pod ingestion workflow
+
+### Application workflow use case
+
+Use the complete workflow when an application accepts a remote SWC archive and
+schedules ingestion into an already provisioned CATMAID project. For example,
+MNP can accept an import request for a study's managed skeleton layer, record its
+ingestion UUID and target project, then submit one Argo processing pod.
+
+The pod runs `python -m catmaid_skeleton_batch_import.workflow` with the
+source location, declared units, target, database settings and a fresh durable
+workspace. CATMAID owns project-lock acquisition, download, preparation,
+loading and final verification within that job. MNP owns authorization, workflow
+submission and the durable application outcome.
+
+```mermaid
+flowchart TD
+    Submit["MNP submits one Argo processing pod"] --> Workflow["workflow.py"]
+    Workflow --> Runner["workflow_runner.py"]
+    Runner --> CLI["Container wrapper and importer CLI"]
+    CLI --> Importer["orchestrator.py"]
+    Importer --> State["State and cache counters"]
+    State --> Runner
+    Runner --> Argo["Native Argo progress"]
+    Argo --> API["MNP ingestion status API"]
+```
+
+The modules operate at different levels:
+
+| Module | Responsibility |
+| --- | --- |
+| `workflow.py` | Acquire the project lock before download, sequence the commands and publish a terminal result. |
+| `workflow_runner.py` | Supervise each preparation/import subprocess, retain logs, forward cancellation and publish live progress. |
+| `orchestrator.py` | Execute the importer commands: capture target metadata, plan batches, load rows, rebuild caches and verify data. |
+| `workflow_io.py` | Download archives and interpret retained execution evidence for terminal reporting. |
+| `archive_sources.py` | Validate storage locations and decrypt signed download credentials. |
+
+The runner remains in CATMAID alongside the local CLI and checkpoint formats.
+MNP launches the public workflow entry point; it does not import these runner
+helpers. If the ZIP is already local and the caller manages the command
+sequence, use the standalone `preflight`, `plan` and `run` interface
+below instead.
+
+During execution, an API client can poll MNP's authorized ingestion-status GET.
+MNP reads native Argo observations and decodes the current stage and counters;
+it does not need the ingestion volume mounted into the backend. For example:
+
+```json
+{
+  "status": "running",
+  "progress": {
+    "phase": "cache",
+    "stage": 4,
+    "total_stages": 5,
+    "completed": 400,
+    "total": 1000,
+    "unit": "cells",
+    "percent": 40
+  }
+}
+```
+
+This reports 40% of cache rebuilding, not 40% of total ingestion time. Argo
+collection and MNP's ten-second observation cache can delay updates. A dedicated
+frontend progress widget is not required to use this API.
+
+Progress and completion follow separate paths. CATMAID writes
+`terminal-result.json`; MNP exposes it as an Argo output parameter for its
+exit notifier, then accepts the result through its Kafka consumer. Only that
+accepted result establishes `succeeded`, `failed` or
+`operator_attention`. A progress counter reaching its total does not prove
+successful completion. See [State and progress](#state-and-progress) for the
+retained checkpoints and [Single-use failure contract](#single-use-failure-contract)
+for partial imports.
+
+### Launch and configuration
 
 For an orchestrated ingestion, install the workflow extras and run one finite
 processing command:
@@ -43,13 +119,9 @@ A running stage receives the signal and is reaped before exit; cancellation
 does not start another stage even if the child exits successfully. Terminal
 evidence is retained when it can be written during shutdown.
 
-`workflow_io.py` owns downloading and retained-evidence decisions;
-`archive_sources.py` validates/decrypts storage URLs.
-`workflow_runner.py` launches command subprocesses, retains logs, forwards
-cancellation and bridges state/cache observations into the optional
-`ARGO_PROGRESS_FILE` five-stage ratio.
-These helpers moved from MNP; the core local-ZIP CLI below remains unchanged.
-The package never calls NeuroGlass or Kafka.
+The runner bridges state/cache observations into the optional
+`ARGO_PROGRESS_FILE` five-stage ratio. The package never calls NeuroGlass
+or Kafka; MNP owns the API and terminal-notification integration.
 
 Before exit it writes a bounded schema-1 `terminal-result.json` containing
 the workflow identity and verified outcome/counts or a useful error. Missing or
@@ -91,7 +163,7 @@ Once the project lock is committed, the NeuroGlass middleware returns HTTP **423
 requests, including POST-based reads, remain available. Other projects are
 unaffected. This integration covers NeuroGlass access-token/task-association
 requests, not native CATMAID clients or arbitrary database/background writers.
-There is no viewer polling or automatic layer-visibility change.
+Lock enforcement requires no viewer polling or automatic layer-visibility change.
 
 The project lock remains active across batch commits, database maintenance, existing-cache
 updates and final verification. Verified completion clears only the matching
