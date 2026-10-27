@@ -150,7 +150,7 @@ def workflow_lock(store, monkeypatch):
     from catmaid_skeleton_batch_import import database
 
     acquire, release = helpers(monkeypatch)
-    monkeypatch.setattr(database, "bootstrap_django", lambda: SimpleNamespace(alias="default"))
+    monkeypatch.setattr(database, "bootstrap_django", Mock(return_value=SimpleNamespace(alias="default", close=Mock())))
     monkeypatch.setattr(sys, "path", list(sys.path))
     monkeypatch.setenv("DJANGO_SETTINGS_MODULE", "test-settings")
     lock = WorkflowProjectLock({"SKELETON_INGESTION_ID": INGESTION_ID,
@@ -230,3 +230,35 @@ def test_workflow_does_not_assume_rollback_after_uncertain_acquisition(store, mo
     with pytest.raises(ProjectIngestionLockError, match="not confirmed"):
         lock.finish(store.state_dir.parent, run_started=False)
     release.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", [None, "acquire", "settings"])
+def test_early_acquisition_closes_the_parent_connection_on_success_and_failure(monkeypatch, failure):
+    from catmaid_skeleton_batch_import.project_lock import WorkflowProjectLock
+    from catmaid_skeleton_batch_import import config, database
+
+    acquire, release = helpers(monkeypatch)
+    events = []
+    connection = SimpleNamespace(alias="default", close=Mock(side_effect=lambda: events.append("close")))
+    monkeypatch.setattr(database, "bootstrap_django", lambda: connection)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setenv("DJANGO_SETTINGS_MODULE", "test-settings")
+    lock = WorkflowProjectLock({"SKELETON_INGESTION_ID": INGESTION_ID,
+                                "SKELETON_INGESTION_TARGET_PROJECT_ID": "17"})
+    def acquire_flag(*args, **kwargs):
+        events.append("acquire")
+        if failure == "acquire":
+            raise RuntimeError("acquisition disconnected")
+    acquire.side_effect = acquire_flag
+    if failure == "settings":
+        monkeypatch.setattr(config, "load_operational_settings", Mock(side_effect=RuntimeError("invalid timeout")))
+    if failure:
+        with pytest.raises(RuntimeError):
+            lock.acquire()
+        assert lock.status == ("acquiring" if failure == "acquire" else "pending")
+    else:
+        lock.acquire()
+        assert lock.status == "locked"
+    assert events == (["close"] if failure == "settings" else ["acquire", "close"])
+    connection.close.assert_called_once_with()
+    release.assert_not_called()  # Closing cannot clear a durable flag or infer rollback.

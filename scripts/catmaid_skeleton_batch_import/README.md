@@ -96,6 +96,17 @@ startup failure with every batch still planned clears it too.
 A prepared/failed/committed batch or process loss leaves it set; it has no
 expiry and a new attempt cannot acquire or clear another owner's flag.
 
+After a confirmed wrapper startup failure, state can legitimately contain
+`run.status: pending` and `project_lock.status: released`, with every batch still
+planned and every final phase pending. This records safe cleanup, not loading
+progress. Finalization reports `failed`, allowing a fresh request/workspace;
+it does not resume the previous attempt. Unreleased or inconsistent state still
+requires inspection.
+
+The workflow closes its parent database connection after early acquisition,
+on success or failure. Closing a connection does not clear the durable flag.
+Preparation needs no idle parent session, and cleanup reconnects if required.
+
 Planning retains one `ingestion_id` in `state/state.json`. It uses the
 `SKELETON_INGESTION_ID` supplied by MNP, or generates a UUID once for a standalone
 import. The same UUID owns `Project.active_skeleton_ingestion` throughout the

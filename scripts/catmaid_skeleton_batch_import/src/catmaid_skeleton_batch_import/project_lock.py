@@ -84,15 +84,20 @@ class WorkflowProjectLock:
         sys.path.insert(0, str(projects))
         os.environ["DJANGO_SETTINGS_MODULE"] = "mysite.ingestion_settings"
         connection = bootstrap_django()
-        from catmaid.ingestion_lock import acquire_project_ingestion
+        try:
+            from catmaid.ingestion_lock import acquire_project_ingestion
 
-        timeouts = load_operational_settings()
-        self.status = ProjectLockStatus.ACQUIRING
-        acquire_project_ingestion(
-            self.project_id, self.owner, using=connection.alias,
-            lock_timeout_ms=timeouts["lock_timeout_ms"],
-        )
-        self.status = ProjectLockStatus.LOCKED
+            timeouts = load_operational_settings()
+            self.status = ProjectLockStatus.ACQUIRING
+            acquire_project_ingestion(
+                self.project_id, self.owner, using=connection.alias,
+                lock_timeout_ms=timeouts["lock_timeout_ms"],
+            )
+            self.status = ProjectLockStatus.LOCKED
+        finally:
+            # Ownership is durable, independent of this connection. Preparation
+            # needs no idle parent session; cleanup reconnects when necessary.
+            connection.close()
 
     def finish(self, workspace, *, run_started):
         from . import workflow_io as io

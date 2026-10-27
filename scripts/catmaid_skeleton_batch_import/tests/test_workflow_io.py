@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import sys
 import tempfile
 from collections.abc import Mapping
 from contextlib import redirect_stderr, redirect_stdout
@@ -821,6 +822,45 @@ class FinalizationPayloadTests(SkeletonIngestionWorkerTestCase):
         self.assertIn("66", decision.payload["error"]["message"])
         self.assertIn("before launching", decision.payload["error"]["message"])
         self.assertTrue((self.workspace / "state/run-wrapper-result.json").exists())
+
+    def test_wrapper_startup_failure_remains_retryable_after_workflow_unlock(self):
+        from catmaid_skeleton_batch_import.project_lock import WorkflowProjectLock
+        from catmaid_skeleton_batch_import.statuses import ProjectLockStatus
+
+        for attempts in (0, 1):
+            with self.subTest(attempts=attempts):
+                self.write_planned_state()
+                self.result("plan", ok=True)
+                self.wrapper(attempts=attempts, code=66)
+                lock = WorkflowProjectLock({"SKELETON_INGESTION_ID": INGESTION_ID,
+                                            "SKELETON_INGESTION_TARGET_PROJECT_ID": "41"})
+                lock.status = ProjectLockStatus.LOCKED
+                release = Mock()
+                with patch.dict(sys.modules, {"catmaid.ingestion_lock": SimpleNamespace(
+                        release_project_ingestion=release)}):
+                    lock.finish(self.workspace, run_started=True)
+                release.assert_called_once_with(41, INGESTION_ID)
+                state = json.loads((self.workspace / "state/state.json").read_text())
+                self.assertEqual(state["run"]["status"], "pending")
+                self.assertEqual(state["project_lock"]["status"], "released")
+                decision = self.decision()
+                self.assertEqual(decision.payload["outcome"], "failed", decision.payload)
+                self.assertEqual(decision.payload["error"]["category"], "operation_failed")
+
+    def test_pending_run_with_unconfirmed_lock_or_advanced_batches_still_requires_inspection(self):
+        for lock_status in ("acquiring", "locked"):
+            with self.subTest(lock_status=lock_status):
+                state = self.write_planned_state()
+                state["project_lock"]["status"] = lock_status
+                self.save(state)
+                self.wrapper(attempts=0)
+                self.assert_attention("invalid_workspace_state")
+        state = self.write_planned_state()
+        state["project_lock"]["status"] = "released"
+        state["batches"][0]["status"] = "prepared"
+        self.save(state)
+        self.wrapper(attempts=0)
+        self.assert_attention("invalid_workspace_state")
 
     def test_wrapper_before_child_without_state_is_confirmed_preloading_failure(self):
         self.result("plan", ok=True)

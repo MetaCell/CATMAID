@@ -898,8 +898,11 @@ def _validate_incomplete_state(state: Mapping[str, Any]) -> None:
     if (status == "failed") != (run_status == "failed"):
         raise WorkspaceStateError("Importer failure status disagrees with its run")
     if run_status == "pending":
+        # A confirmed wrapper startup failure can release the workflow's flag
+        # before the importer ever changes run from pending. No batch/phase may
+        # have advanced, and acquiring/locked still require inspection.
         if (status != "planned" or project_status != "planned"
-                or lock_status != ProjectLockStatus.PENDING
+                or lock_status not in {ProjectLockStatus.PENDING, ProjectLockStatus.RELEASED}
                 or any(value != "planned" for value in batch_statuses)):
             raise WorkspaceStateError("Importer checkpoints advanced before its run")
         return
