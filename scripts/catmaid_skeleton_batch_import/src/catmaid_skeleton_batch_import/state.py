@@ -16,6 +16,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
+from uuid import UUID, uuid4
 
 from . import __version__
 from .domain import ImportSettings, IngestionRequest, PlannedBatch
@@ -24,7 +25,7 @@ from .errors import (
     InvalidInputError,
     OperationalFailureError,
 )
-from .statuses import DatabaseStatus, ImportStatus, OperationStatus
+from .statuses import DatabaseStatus, ImportStatus, OperationStatus, ProjectLockStatus
 from .util import (
     atomic_write_json,
     canonical_json_bytes,
@@ -255,6 +256,17 @@ class StateStore:
     ) -> dict[str, Any]:
         """Publish one complete plan and its artifact references atomically."""
         request_value = self._normalize_request(request)
+        ingestion_id = os.environ.get("SKELETON_INGESTION_ID")
+        if ingestion_id is None:
+            ingestion_id = str(uuid4())
+        else:
+            try:
+                if str(UUID(ingestion_id)) != ingestion_id:
+                    raise ValueError
+            except (ValueError, AttributeError) as exc:
+                raise InvalidInputError(
+                    "SKELETON_INGESTION_ID must be a canonical lowercase UUID"
+                ) from exc
         archive_value = self._normalize_archive(archive)
         archive_identity = ArchiveMetadata.from_dict(archive_value)
         self._verify_source_file(
@@ -307,6 +319,11 @@ class StateStore:
             state = {
                 "schema_version": SCHEMA_VERSION,
                 "importer_version": __version__,
+                "ingestion_id": ingestion_id,
+                "project_lock": {
+                    "project_id": request_value["target"]["project_id"],
+                    "status": ProjectLockStatus.PENDING,
+                },
                 "status": ImportStatus.PLANNED,
                 **immutable,
                 "project": {
@@ -538,12 +555,35 @@ class StateStore:
     def mark_phase_complete(self, phase: str) -> dict[str, Any]:
         return self.transition_phase(phase, OperationStatus.COMPLETE)
 
+    def transition_project_lock(self, status: ProjectLockStatus) -> dict[str, Any]:
+        status = ProjectLockStatus(status)
+        with self._mutation_lock():
+            state = self.load()
+            current = state["project_lock"]["status"]
+            allowed = {
+                ProjectLockStatus.PENDING: {ProjectLockStatus.ACQUIRING},
+                ProjectLockStatus.ACQUIRING: {ProjectLockStatus.LOCKED},
+                ProjectLockStatus.LOCKED: {ProjectLockStatus.RELEASED},
+            }
+            if status not in allowed.get(current, set()):
+                raise ImmutableStateError(f"Invalid project lock transition: {current} -> {status}")
+            # The run is completed while still protected; its final unlock must
+            # be recorded afterward without reopening any batch/phase mutations.
+            if status != ProjectLockStatus.RELEASED:
+                self._assert_mutations_allowed()
+            state["project_lock"]["status"] = status
+            self._persist(state)
+            return copy.deepcopy(state)
+
     def begin_run(self) -> dict[str, Any]:
         """Consume this workspace once, before any CATMAID mutation."""
 
         def mutate(state):
             if state["run"]["status"] != OperationStatus.PENDING:
                 raise InvalidInputError("This workspace has already been run; retries and resume are unsupported")
+            supplied_id = os.environ.get("SKELETON_INGESTION_ID")
+            if supplied_id is not None and supplied_id != state["ingestion_id"]:
+                raise ImmutableStateError("Ingestion UUID does not match the planned state")
             state["run"] = {"status": OperationStatus.RUNNING}
             state["status"] = ImportStatus.IN_PROGRESS
         return self._mutate(mutate)

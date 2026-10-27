@@ -329,3 +329,106 @@ def test_guard_exception_rolls_back_edits_and_releases_its_row_lock(
     assert not Class.objects.filter(project_id=projects[0], class_name="rolled-back-edit").exists()
     token = uuid4()
     assert acquire_project_ingestion(projects[0], token, lock_timeout_ms=100) == token
+
+
+@pytest.mark.parametrize("supplied_identity", [False, True])
+@pytest.mark.parametrize("fail_loading", [False, True])
+def test_importer_uses_retained_ingestion_uuid_and_embedded_lock_state(
+    isolated_database, existing_project_factory, tmp_path, monkeypatch, supplied_identity, fail_loading,
+):
+    import json
+    import zipfile
+    from uuid import UUID
+
+    from catmaid import ingestion_lock
+    from catmaid_skeleton_batch_import import materialization
+    from catmaid_skeleton_batch_import.errors import OperationalFailureError
+    from catmaid_skeleton_batch_import.orchestrator import (
+        plan_ingestion, preflight_ingestion, run_ingestion,
+    )
+    from catmaid_skeleton_batch_import.state import StateStore
+    from catmaid_skeleton_batch_import.workflow_io import FinalizeConfig, derive_finalization
+
+    identity = str(uuid4())
+    if supplied_identity:
+        monkeypatch.setenv("SKELETON_INGESTION_ID", identity)
+    else:
+        monkeypatch.delenv("SKELETON_INGESTION_ID", raising=False)
+    project_id = existing_project_factory()
+    archive = tmp_path / "source.zip"
+    with zipfile.ZipFile(archive, "w") as source:
+        source.writestr("cell.swc", chr(10).join([
+            "1 1 1 1 1 -1 -1", "2 3 2 2 2 1 1", "",
+        ]))
+    request = tmp_path / "request.json"
+    request.write_text(json.dumps({
+        "schema_version": 1,
+        "source": {"archive_path": str(archive), "coordinate_unit": "nm"},
+        "target": {"project_id": project_id},
+    }))
+    store = StateStore(tmp_path / "state")
+    preflight_ingestion(request, store.state_dir)
+    plan_ingestion(request, store.state_dir)
+    state = store.load()
+    if supplied_identity:
+        assert state["ingestion_id"] == identity
+    else:
+        identity = state["ingestion_id"]
+    assert str(UUID(identity)) == identity
+    assert state["project_lock"] == {"project_id": project_id, "status": "pending"}
+
+    acquire = ingestion_lock.acquire_project_ingestion
+    release = ingestion_lock.release_project_ingestion
+    materialize = materialization.materialize_and_verify_batch
+    observed = []
+
+    def acquire_with_state(target, token, **kwargs):
+        assert target == project_id and token == identity
+        assert store.load()["project_lock"]["status"] == "acquiring"
+        result = acquire(target, token, **kwargs)
+        assert owner(isolated_database, project_id) == UUID(identity)
+        observed.append("acquired")
+        return result
+
+    def release_with_state(target, token, **kwargs):
+        assert target == project_id and token == identity
+        assert store.load()["project_lock"]["status"] == "locked"
+        assert store.load()["run"]["status"] == "complete"
+        release(target, token, **kwargs)
+        assert owner(isolated_database, project_id) is None
+        observed.append("released")
+
+    def materialize_with_state(**kwargs):
+        assert store.load()["project_lock"]["status"] == "locked"
+        assert owner(isolated_database, project_id) == UUID(identity)
+        result = materialize(**kwargs)
+        if fail_loading:
+            raise OperationalFailureError("injected loading failure")
+        return result
+
+    monkeypatch.setattr(ingestion_lock, "acquire_project_ingestion", acquire_with_state)
+    monkeypatch.setattr(ingestion_lock, "release_project_ingestion", release_with_state)
+    monkeypatch.setattr(materialization, "materialize_and_verify_batch", materialize_with_state)
+    try:
+        if fail_loading:
+            with pytest.raises(OperationalFailureError, match="injected loading failure"):
+                run_ingestion(store.state_dir)
+        else:
+            run_ingestion(store.state_dir)
+        state = store.load()
+        assert state["ingestion_id"] == identity
+        assert state["project_lock"] == {
+            "project_id": project_id, "status": "locked" if fail_loading else "released",
+        }
+        assert state["run"]["status"] == ("failed" if fail_loading else "complete")
+        assert owner(isolated_database, project_id) == (UUID(identity) if fail_loading else None)
+        assert observed == (["acquired"] if fail_loading else ["acquired", "released"])
+        assert not (store.state_dir / "project-ingestion-lock.json").exists()
+        decision = derive_finalization(FinalizeConfig(
+            ingestion_id=identity, workspace=tmp_path, workflow_name="lock-state-test",
+            workflow_uid="test-workflow", workflow_result="Failed" if fail_loading else "Succeeded",
+        ))
+        assert decision.payload["outcome"] == ("operator_attention" if fail_loading else "succeeded")
+    finally:
+        if owner(isolated_database, project_id) == UUID(identity):
+            release(project_id, identity)

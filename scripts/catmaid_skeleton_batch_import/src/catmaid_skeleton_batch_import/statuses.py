@@ -24,6 +24,13 @@ class OperationStatus(_Status):
     FAILED = "failed"
 
 
+class ProjectLockStatus(_Status):
+    PENDING = "pending"
+    ACQUIRING = "acquiring"
+    LOCKED = "locked"
+    RELEASED = "released"
+
+
 class ImportStatus(_Status):
     """Overall ingestion progress exposed in state and command results."""
     PLANNED = "planned"

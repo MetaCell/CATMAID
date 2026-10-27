@@ -87,20 +87,40 @@ owner. A confirmed failure while all batches remain planned also clears it.
 A prepared/failed/committed batch or process loss leaves it set; it has no
 expiry and a new attempt cannot acquire or clear another owner's flag.
 
-`state/project-ingestion-lock.json` records the project, owner UUID and
-`acquiring`, `locked` or `released` observation. An uncertain acquisition/release
-or an unreleased receipt requires operator attention, even before batch loading;
-successful workflow evidence requires a released receipt. Earlier committed
-batches are not rolled back and automatic retry/resume is still unsupported.
+Planning retains one `ingestion_id` in `state/state.json`. It uses the
+`SKELETON_INGESTION_ID` supplied by MNP, or generates a UUID once for a standalone
+import. The same UUID owns `Project.active_skeleton_ingestion` throughout the
+run. A supplied run-time UUID must match the planned identity.
+
+The lock lifecycle is part of that same atomic state record:
+
+```json
+{
+  "ingestion_id": "11111111-2222-4333-8444-555555555555",
+  "project_lock": {
+    "project_id": 123,
+    "status": "pending"
+  }
+}
+```
+
+`project_lock.status` moves through `pending`, `acquiring`, `locked` and
+`released`. The importer saves `acquiring` before the database call and
+`released` only after ownership-checked release succeeds. There is no separate
+lock-owner UUID or lock receipt file. An uncertain acquisition/release or an
+`acquiring`/`locked` state requires operator attention, even before batch
+loading. Successful workflow evidence requires a completed run and a released
+lock in `state.json` for the matching ingestion. Earlier committed batches
+are not rolled back and automatic retry/resume is still unsupported.
 
 For manual resolution, first confirm the importer has stopped and reconcile the
 retained state/assigned IDs against the database. Resolve any partial import
-before unlocking. Through CATMAID's normal Django shell, use the project ID and
-owner from the retained receipt:
+before unlocking. Through CATMAID's normal Django shell, use
+`project_lock.project_id` and `ingestion_id` from the retained `state.json`:
 
 ```python
 from catmaid.ingestion_lock import release_project_ingestion
-release_project_ingestion(project_id, owner_uuid)
+release_project_ingestion(project_id, ingestion_id)
 ```
 
 The helper refuses a different owner. Do not clear the flag merely to retry a
@@ -661,7 +681,7 @@ moves once from pending to running and then complete or failed; an interrupted
 running attempt cannot be resumed.
 
 The importer defines status enums in `statuses.py` for database records,
-operations, overall ingestion progress and metrics. JSON files retain the
+project locks, operations, overall ingestion progress and metrics. JSON files retain the
 same plain string values, such as `committed`, `running` and `failed`.
 
 Database maintenance runs after every batch has committed and before cache rebuilding.
@@ -674,7 +694,7 @@ recorded in the audit state and runs once per import.
 
 | File in the state directory | Purpose |
 | --- | --- |
-| `state.json` | Run outcome and confirmed phase/batch statuses. |
+| `state.json` | Ingestion UUID, project-lock lifecycle, run outcome and confirmed phase/batch statuses. |
 | `metrics.json` | Planned/completed batch, skeleton and node counts; operation durations, per-operation row counts and the run's effective settings. |
 | `result.json` | Outcome of the most recent CLI command; failures contain a bounded summary and optional diagnostic-file reference. |
 | `error-details.json` | Full diagnostics of the latest failed CLI command, including all invalid SWC members; never sent through the terminal callback. |
@@ -694,8 +714,9 @@ verification is still running.
 There is no client-facing HTTP progress endpoint. A backend can read these files
 from shared storage and expose a status summary to a polling client. Combine the
 state and counts with deployment job/process status to detect a stopped
-importer; the files are not a heartbeat. Reactivate the managed layer only after
-the import's successful final status, not merely when node counts reach 100%.
+importer; the files are not a heartbeat. An import is successful only when its
+run is complete and its project lock is released. Node counts reaching 100%
+do not establish completion.
 
 ## Exit codes
 

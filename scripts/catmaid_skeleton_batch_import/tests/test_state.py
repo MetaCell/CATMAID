@@ -219,3 +219,43 @@ def test_failed_and_interrupted_attempts_cannot_be_resumed(tmp_path):
     assert [item["status"] for item in state["batches"]] == ["committed", "failed"]
     with pytest.raises(InvalidInputError, match="terminal"):
         store.begin_run()
+
+
+def test_standalone_ingestion_uuid_is_generated_once_and_retained(tmp_path, monkeypatch):
+    from uuid import UUID
+
+    monkeypatch.delenv("SKELETON_INGESTION_ID", raising=False)
+    store, _ = make_store(tmp_path)
+    state = store.load()
+    identity = state["ingestion_id"]
+    assert str(UUID(identity)) == identity
+    assert state["project_lock"] == {"project_id": 101, "status": "pending"}
+    reopened = StateStore(store.state_dir)
+    assert reopened.begin_run()["ingestion_id"] == identity
+
+
+def test_supplied_ingestion_uuid_is_retained_when_run_environment_is_absent(tmp_path, monkeypatch):
+    identity = "11111111-2222-4333-8444-555555555555"
+    monkeypatch.setenv("SKELETON_INGESTION_ID", identity)
+    store, _ = make_store(tmp_path)
+    assert store.load()["ingestion_id"] == identity
+    monkeypatch.delenv("SKELETON_INGESTION_ID")
+    assert StateStore(store.state_dir).begin_run()["ingestion_id"] == identity
+
+
+@pytest.mark.parametrize("identity", ["", "not-a-uuid", "11111111-2222-4333-8444-AAAAAAAAAAAA"])
+def test_planning_rejects_invalid_ingestion_uuid_without_publishing_state(tmp_path, monkeypatch, identity):
+    monkeypatch.setenv("SKELETON_INGESTION_ID", identity)
+    with pytest.raises(InvalidInputError, match="canonical lowercase UUID"):
+        make_store(tmp_path)
+    assert not (tmp_path / "state/state.json").exists()
+
+
+def test_run_rejects_a_different_ingestion_uuid_before_acquisition(tmp_path, monkeypatch):
+    store, _ = make_store(tmp_path)
+    monkeypatch.setenv("SKELETON_INGESTION_ID", "11111111-2222-4333-8444-555555555555")
+    with pytest.raises(ImmutableStateError, match="Ingestion UUID"):
+        store.begin_run()
+    state = store.load()
+    assert state["run"]["status"] == "pending"
+    assert state["project_lock"]["status"] == "pending"

@@ -140,9 +140,6 @@ class SkeletonIngestionWorkerTestCase(TestCase):
         }
 
     def write_completed_append_state(self) -> dict[str, object]:
-        _write_json(self.workspace / worker.STATE_DIRECTORY / "project-ingestion-lock.json", {
-            "schema_version": 1, "project_id": 41, "owner": INGESTION_ID, "status": "released",
-        })
         _write_json(
             self.workspace / worker.REQUEST_FILENAME,
             {"schema_version": 1, "source": {"archive_path": str(self.workspace / "source.zip"), "coordinate_unit": "um"}, "target": {"project_id": 41}},
@@ -163,6 +160,8 @@ class SkeletonIngestionWorkerTestCase(TestCase):
         state: dict[str, object] = {
             "schema_version": worker.SCHEMA_VERSION,
             "status": "complete",
+            "ingestion_id": INGESTION_ID,
+            "project_lock": {"project_id": 41, "status": "released"},
             "archive": {"sha256": "a" * 64, "size_bytes": 27},
             "plan": {
                 "batch_count": 2,
@@ -201,6 +200,10 @@ class SkeletonIngestionWorkerTestCase(TestCase):
         state["run"] = {"status": "failed", "reason": "Source fragment already exists"}
         state["batches"] = [{"status": status} for status in statuses]
         state["project"].update(project_id=project_id)
+        state["project_lock"] = {
+            "project_id": project_id,
+            "status": "locked" if any(status != "planned" for status in statuses) else "released",
+        }
         state["phases"] = {
             name: {"status": "pending"} for name in worker._REQUIRED_PHASES
         }
@@ -226,6 +229,8 @@ class SkeletonIngestionWorkerTestCase(TestCase):
         state: dict[str, object] = {
             "schema_version": worker.SCHEMA_VERSION,
             "status": "planned",
+            "ingestion_id": INGESTION_ID,
+            "project_lock": {"project_id": 41, "status": "pending"},
             "archive": {"sha256": "a" * 64, "size_bytes": 27},
             "plan": {
                 "batch_count": 1,
@@ -655,15 +660,14 @@ class FinalizationPayloadTests(SkeletonIngestionWorkerTestCase):
     """Current single-attempt state and real wrapper markers decide finalization."""
 
     def test_success_requires_confirmed_project_lock_release(self):
-        for status in ("acquiring", "locked", None):
+        for status in ("pending", "acquiring", "locked", None):
             with self.subTest(status=status):
-                self.write_completed_append_state()
-                receipt = self.workspace / worker.STATE_DIRECTORY / "project-ingestion-lock.json"
+                state = self.write_completed_append_state()
                 if status is None:
-                    receipt.unlink()
+                    state.pop("project_lock")
                 else:
-                    _write_json(receipt, {"schema_version": 1, "project_id": 41,
-                                          "owner": INGESTION_ID, "status": status})
+                    state["project_lock"]["status"] = status
+                self.save(state)
                 result = _finalization_payload(self.workspace, "test-workflow", "test-uid", "Succeeded")
                 self.assertEqual(result["outcome"], "operator_attention")
 
@@ -675,15 +679,30 @@ class FinalizationPayloadTests(SkeletonIngestionWorkerTestCase):
             phase["status"] = "pending"
         for batch in state["batches"]:
             batch["status"] = "planned"
-        _write_json(self.workspace / worker.STATE_DIRECTORY / worker.IMPORTER_STATE_FILENAME, state)
-        receipt = self.workspace / worker.STATE_DIRECTORY / "project-ingestion-lock.json"
-        for status, outcome in (("acquiring", "operator_attention"), ("locked", "operator_attention"),
-                                ("released", "failed")):
+        for status, outcome in (("pending", "failed"), ("acquiring", "operator_attention"),
+                                ("locked", "operator_attention"), ("released", "failed")):
             with self.subTest(status=status):
-                _write_json(receipt, {"schema_version": 1, "project_id": 41,
-                                      "owner": INGESTION_ID, "status": status})
-                self.assertEqual(_finalization_payload(self.workspace, "wf", "uid", "Failed")["outcome"], outcome)
+                state["project_lock"]["status"] = status
+                self.save(state)
+                self.assertEqual(_finalization_payload(
+                    self.workspace, "wf", "uid", "Failed")["outcome"], outcome)
 
+    def test_state_ingestion_uuid_must_match_the_workflow(self):
+        for identity in (None, "11111111-2222-4333-8444-555555555555", "invalid"):
+            with self.subTest(ingestion_id=identity):
+                state = self.write_completed_append_state()
+                if identity is None:
+                    state.pop("ingestion_id")
+                else:
+                    state["ingestion_id"] = identity
+                self.save(state)
+                self.assert_attention("invalid_workspace_state")
+
+    def test_lock_target_must_match_the_verified_project(self):
+        state = self.write_completed_append_state()
+        state["project_lock"]["project_id"] = 99
+        self.save(state)
+        self.assert_attention("invalid_workspace_state")
 
     def save(self, state):
         _write_json(self.workspace / "state/state.json", state)

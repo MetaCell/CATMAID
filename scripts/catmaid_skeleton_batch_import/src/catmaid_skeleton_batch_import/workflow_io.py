@@ -25,6 +25,7 @@ from botocore.config import Config as BotocoreConfig
 from botocore.exceptions import BotoCoreError, ClientError
 
 from . import archive_sources
+from .statuses import ProjectLockStatus
 from .archive_sources import (
     PublicS3Object,
     SignedArchiveSource,
@@ -831,6 +832,12 @@ def _validate_incomplete_state(state: Mapping[str, Any]) -> None:
     run_status = _checkpoint_status(state.get("run"), _PHASE_STATUSES, "run")
     project = state.get("project")
     project_status = _checkpoint_status(project, _PROJECT_STATUSES, "project")
+    project_lock = state.get("project_lock")
+    lock_status = _checkpoint_status(project_lock, set(ProjectLockStatus), "project lock")
+    if type(project_lock.get("project_id")) is not int or project_lock["project_id"] <= 0:
+        raise WorkspaceStateError("Importer project lock has an invalid project_id")
+    if project_status == "committed" and project_lock["project_id"] != project.get("project_id"):
+        raise WorkspaceStateError("Importer project lock and selected project disagree")
     batches = state.get("batches")
     if not isinstance(batches, list) or not batches:
         raise WorkspaceStateError("Importer state has invalid batch checkpoints")
@@ -892,6 +899,7 @@ def _validate_incomplete_state(state: Mapping[str, Any]) -> None:
         raise WorkspaceStateError("Importer failure status disagrees with its run")
     if run_status == "pending":
         if (status != "planned" or project_status != "planned"
+                or lock_status != ProjectLockStatus.PENDING
                 or any(value != "planned" for value in batch_statuses)):
             raise WorkspaceStateError("Importer checkpoints advanced before its run")
         return
@@ -1073,6 +1081,8 @@ def derive_finalization(config: FinalizeConfig) -> FinalizationDecision:
         )
         wrapper = _wrapper_result(state_directory / WRAPPER_RESULT_FILENAME)
         if state is not None:
+            if state.get("ingestion_id") != config.ingestion_id:
+                raise WorkspaceStateError("Importer state belongs to a different ingestion")
             _validate_incomplete_state(state)
     except WorkspaceStateError as exc:
         return _invalid_workspace_decision(config, exc)
@@ -1090,18 +1100,7 @@ def derive_finalization(config: FinalizeConfig) -> FinalizationDecision:
     except WorkspaceStateError:
         importer_result = None  # Diagnostic output; valid execution state remains authoritative.
 
-    try:
-        project_lock = _load_optional_json(
-            state_directory / "project-ingestion-lock.json", "project ingestion lock receipt"
-        )
-        if project_lock is not None:
-            if (project_lock.get("schema_version") != 1
-                    or project_lock.get("status") not in {"acquiring", "locked", "released"}
-                    or type(project_lock.get("project_id")) is not int):
-                raise WorkspaceStateError("Invalid project ingestion lock receipt")
-            _validate_ingestion_id(project_lock.get("owner"))
-    except (WorkspaceStateError, WorkerError) as exc:
-        return _invalid_workspace_decision(config, exc, state_directory=state_directory, state=state)
+    project_lock = state["project_lock"] if state is not None else None
 
     if state is not None:
         _partial_state_payload(payload, state_directory, state)
@@ -1119,8 +1118,7 @@ def derive_finalization(config: FinalizeConfig) -> FinalizationDecision:
                 )
             try:
                 success = _success_payload(config, state_directory, state, download_result)
-                if (project_lock is None or project_lock["status"] != "released"
-                        or project_lock["project_id"] != success["project_id"]):
+                if project_lock["status"] != ProjectLockStatus.RELEASED:
                     raise WorkspaceStateError("Project ingestion lock release was not confirmed")
             except WorkspaceStateError as exc:
                 return _invalid_workspace_decision(config, exc, state_directory=state_directory, state=state)
@@ -1173,7 +1171,9 @@ def derive_finalization(config: FinalizeConfig) -> FinalizationDecision:
         category, message = "workflow_failed", (
             f"Workflow {config.workflow_result or 'did not complete'} without a completed importer run"
         )
-    if project_lock is not None and project_lock["status"] != "released":
+    if project_lock is not None and project_lock["status"] in {
+        ProjectLockStatus.ACQUIRING, ProjectLockStatus.LOCKED,
+    }:
         outcome = "operator_attention"
     payload["outcome"] = outcome
     payload["error"] = {
