@@ -101,17 +101,17 @@ def _plan_result(store: StateStore, state: Mapping[str, Any]) -> dict[str, objec
 def preflight_ingestion(request_path: Path, state_dir: Path) -> dict[str, object]:
     """Capture append metadata before planning, without modifying CATMAID."""
     store = StateStore(state_dir)
-    with store.lock():
-        if store.state_path.exists():
-            raise InvalidInputError("Preflight must run before planning in a new state directory")
-        request = load_request(request_path)
-        geometry = _append_geometry(request)
-        atomic_write_json(store.state_dir / STACK_GEOMETRY_FILENAME, geometry)
-        return _write_result(store.state_dir, _success_result(
-            "preflight", store.state_dir, required=True,
-            project_id=request.target_project_id,
-            stack_count=len(geometry["stacks"]),
-        ))
+    store.state_dir.mkdir(parents=True, exist_ok=True)
+    if store.state_path.exists():
+        raise InvalidInputError("Preflight must run before planning in a new state directory")
+    request = load_request(request_path)
+    geometry = _append_geometry(request)
+    atomic_write_json(store.state_dir / STACK_GEOMETRY_FILENAME, geometry)
+    return _write_result(store.state_dir, _success_result(
+        "preflight", store.state_dir, required=True,
+        project_id=request.target_project_id,
+        stack_count=len(geometry["stacks"]),
+    ))
 
 
 def _planning_geometry(request: IngestionRequest, store: StateStore) -> dict[str, Any]:
@@ -139,49 +139,49 @@ def _planning_geometry(request: IngestionRequest, store: StateStore) -> dict[str
 
 def plan_ingestion(request_path: Path, state_dir: Path) -> dict[str, object]:
     store = StateStore(state_dir)
-    with store.lock():
-        if store.state_path.exists() or (store.state_dir / PLAN_FILENAME).exists():
-            raise InvalidInputError("This workspace already contains a planning attempt; use a new state directory")
-        request = load_request(request_path)
-        settings = load_settings()
-        geometry = _planning_geometry(request, store)
-        bounds = geometry_bounds(geometry)
-        _progress(f"Scanning and validating local archive {request.archive_path}")
-        started = time.monotonic()
-        with tempfile.TemporaryDirectory(prefix=".batch-snapshot-", dir=store.state_dir) as staging:
-            writer = BatchSnapshotWriter(Path(staging), settings.max_nodes_per_batch)
-            try:
-                scan = scan_archive(request, settings, bounds_nm=bounds, on_member=writer.add)
-            finally:
-                writer.close()
-            plan = replace(plan_archive(scan, settings), batch_snapshots=tuple(writer.descriptors))
-            for descriptor in plan.batch_snapshots:
-                os.replace(Path(staging) / descriptor["path"], store.state_dir / descriptor["path"])
-        plan_digest = write_plan(store.state_dir / PLAN_FILENAME, plan)
-        artifacts = {"plan": artifact_descriptor(
-            store.state_dir, store.state_dir / PLAN_FILENAME, count=plan.member_count)}
-        batch_artifacts = {
-            batch.index: {"batch_snapshot": artifact_descriptor(
-                store.state_dir, store.state_dir / descriptor["path"], count=batch.node_count)}
-            for batch, descriptor in zip(plan.batches, plan.batch_snapshots)
-        }
-        artifacts["stack_geometry"] = artifact_descriptor(
-            store.state_dir, store.state_dir / STACK_GEOMETRY_FILENAME, count=len(geometry["stacks"]))
-        metrics = MetricsStore(store.state_dir)
-        metrics.initialize(planned_batches=plan.batch_count, planned_nodes=plan.total_nodes,
-                           planned_skeletons=plan.member_count)
-        metrics.record_phase("archive_scan_and_planning", duration_seconds=time.monotonic() - started,
-                             node_count=plan.total_nodes, row_counts={
-                                 "archive_bytes": scan.archive_bytes, "swc_members": plan.member_count,
-                                 "planned_batches": plan.batch_count})
-        # Publishing state is the final planning step: it references all required files.
-        state = store.initialize_plan(
-            request, _archive_metadata(scan), settings.plan_dict(), plan.batches,
-            plan_digest=plan_digest, planner_version=plan.schema_version,
-            artifacts=artifacts, batch_artifacts=batch_artifacts,
-        )
-        _progress(f"Planned {plan.member_count} skeletons and {plan.total_nodes} nodes in {plan.batch_count} batches")
-        return _write_result(store.state_dir, _plan_result(store, state))
+    store.state_dir.mkdir(parents=True, exist_ok=True)
+    if store.state_path.exists() or (store.state_dir / PLAN_FILENAME).exists():
+        raise InvalidInputError("This workspace already contains a planning attempt; use a new state directory")
+    request = load_request(request_path)
+    settings = load_settings()
+    geometry = _planning_geometry(request, store)
+    bounds = geometry_bounds(geometry)
+    _progress(f"Scanning and validating local archive {request.archive_path}")
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix=".batch-snapshot-", dir=store.state_dir) as staging:
+        writer = BatchSnapshotWriter(Path(staging), settings.max_nodes_per_batch)
+        try:
+            scan = scan_archive(request, settings, bounds_nm=bounds, on_member=writer.add)
+        finally:
+            writer.close()
+        plan = replace(plan_archive(scan, settings), batch_snapshots=tuple(writer.descriptors))
+        for descriptor in plan.batch_snapshots:
+            os.replace(Path(staging) / descriptor["path"], store.state_dir / descriptor["path"])
+    plan_digest = write_plan(store.state_dir / PLAN_FILENAME, plan)
+    artifacts = {"plan": artifact_descriptor(
+        store.state_dir, store.state_dir / PLAN_FILENAME, count=plan.member_count)}
+    batch_artifacts = {
+        batch.index: {"batch_snapshot": artifact_descriptor(
+            store.state_dir, store.state_dir / descriptor["path"], count=batch.node_count)}
+        for batch, descriptor in zip(plan.batches, plan.batch_snapshots)
+    }
+    artifacts["stack_geometry"] = artifact_descriptor(
+        store.state_dir, store.state_dir / STACK_GEOMETRY_FILENAME, count=len(geometry["stacks"]))
+    metrics = MetricsStore(store.state_dir)
+    metrics.initialize(planned_batches=plan.batch_count, planned_nodes=plan.total_nodes,
+                       planned_skeletons=plan.member_count)
+    metrics.record_phase("archive_scan_and_planning", duration_seconds=time.monotonic() - started,
+                         node_count=plan.total_nodes, row_counts={
+                             "archive_bytes": scan.archive_bytes, "swc_members": plan.member_count,
+                             "planned_batches": plan.batch_count})
+    # Publishing state is the final planning step: it references all required files.
+    state = store.initialize_plan(
+        request, _archive_metadata(scan), settings.plan_dict(), plan.batches,
+        plan_digest=plan_digest, planner_version=plan.schema_version,
+        artifacts=artifacts, batch_artifacts=batch_artifacts,
+    )
+    _progress(f"Planned {plan.member_count} skeletons and {plan.total_nodes} nodes in {plan.batch_count} batches")
+    return _write_result(store.state_dir, _plan_result(store, state))
 
 
 def _artifact_path(
@@ -632,27 +632,27 @@ def _verify_database_by_batch(
 def run_ingestion(state_dir: Path) -> dict[str, object]:
     """Execute this workspace once and surface the first failure immediately."""
     store = StateStore(state_dir)
-    with store.lock():
-        store.begin_run()
+    store.state_dir.mkdir(parents=True, exist_ok=True)
+    store.begin_run()
+    try:
+        with ExitStack() as resources:
+            result = _execute_ingestion(store, resources)
+            store.finish_run()
+        return result
+    except BaseException as exc:
         try:
-            with ExitStack() as resources:
-                result = _execute_ingestion(store, resources)
-                store.finish_run()
-            return result
-        except BaseException as exc:
-            try:
-                store.fail_run(str(exc) or "Interrupted")
-                metrics = MetricsStore(store.state_dir)
-                if metrics.path.exists():
-                    metrics.set_status(MetricsStatus.FAILED)
-            except Exception as reporting_error:
-                _progress(f"Could not persist failure status: {reporting_error}")
-            if isinstance(exc, ImporterError):
-                raise
-            classified = _classified_runtime_error(exc, context="ingestion")
-            if classified is not None:
-                raise classified from exc
+            store.fail_run(str(exc) or "Interrupted")
+            metrics = MetricsStore(store.state_dir)
+            if metrics.path.exists():
+                metrics.set_status(MetricsStatus.FAILED)
+        except Exception as reporting_error:
+            _progress(f"Could not persist failure status: {reporting_error}")
+        if isinstance(exc, ImporterError):
             raise
+        classified = _classified_runtime_error(exc, context="ingestion")
+        if classified is not None:
+            raise classified from exc
+        raise
 
 
 def _execute_ingestion(store: StateStore, resources: ExitStack) -> dict[str, object]:

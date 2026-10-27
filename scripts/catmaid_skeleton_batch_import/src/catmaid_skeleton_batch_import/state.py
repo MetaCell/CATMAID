@@ -6,16 +6,13 @@ resumed; committed batches remain available for diagnosis.
 
 from __future__ import annotations
 
-import contextlib
 import copy
-import errno
-import fcntl
 import json
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from uuid import UUID, uuid4
 
 from . import __version__
@@ -23,7 +20,6 @@ from .domain import ImportSettings, IngestionRequest, PlannedBatch
 from .errors import (
     ImmutableStateError,
     InvalidInputError,
-    OperationalFailureError,
 )
 from .statuses import DatabaseStatus, ImportStatus, OperationStatus, ProjectLockStatus
 from .util import (
@@ -40,7 +36,6 @@ METADATA_SCHEMA_VERSION = 1
 REQUEST_FILENAME = "request.json"
 ARCHIVE_FILENAME = "archive.json"
 STATE_FILENAME = "state.json"
-LOCK_FILENAME = ".state.lock"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PHASE_ORDER = ("database_maintenance", "cache", "verification")
@@ -161,86 +156,14 @@ class ArtifactMetadata:
         )
 
 
-class StateDirectoryLock:
-    """An advisory POSIX writer lock retained for the context lifetime."""
-
-    def __init__(self, state_dir: Path, *, blocking: bool = False):
-        self.state_dir = state_dir.resolve()
-        self.blocking = blocking
-        self._descriptor: int | None = None
-
-    def __enter__(self) -> "StateDirectoryLock":
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(
-            self.state_dir / LOCK_FILENAME,
-            os.O_RDWR | os.O_CREAT,
-            0o600,
-        )
-        operation = fcntl.LOCK_EX
-        if not self.blocking:
-            operation |= fcntl.LOCK_NB
-        try:
-            fcntl.flock(descriptor, operation)
-        except OSError as exc:
-            os.close(descriptor)
-            if exc.errno in (errno.EACCES, errno.EAGAIN):
-                raise OperationalFailureError(
-                    f"State directory is already locked: {self.state_dir}",
-                    details={"state_dir": str(self.state_dir)},
-                ) from exc
-            raise
-        self._descriptor = descriptor
-        return self
-
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        if self._descriptor is None:
-            return
-        try:
-            fcntl.flock(self._descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(self._descriptor)
-            self._descriptor = None
-
-
 class StateStore:
-    """Own canonical request, archive, progress, and artifact metadata files."""
+    """Own atomically written metadata for one sequential ingestion workflow."""
 
     def __init__(self, state_dir: Path):
         self.state_dir = state_dir.resolve()
         self.request_path = self.state_dir / REQUEST_FILENAME
         self.archive_path = self.state_dir / ARCHIVE_FILENAME
         self.state_path = self.state_dir / STATE_FILENAME
-        self._lock_depth = 0
-        self._lock: StateDirectoryLock | None = None
-
-    @contextlib.contextmanager
-    def lock(self, *, blocking: bool = False) -> Iterator["StateStore"]:
-        """Hold the single-writer lock, re-entrantly for this store instance."""
-        if self._lock_depth:
-            self._lock_depth += 1
-            try:
-                yield self
-            finally:
-                self._lock_depth -= 1
-            return
-
-        lock = StateDirectoryLock(self.state_dir, blocking=blocking)
-        with lock:
-            self._lock = lock
-            self._lock_depth = 1
-            try:
-                yield self
-            finally:
-                self._lock_depth = 0
-                self._lock = None
-
-    @contextlib.contextmanager
-    def _mutation_lock(self) -> Iterator[None]:
-        if self._lock_depth:
-            yield
-        else:
-            with self.lock():
-                yield
 
     def initialize_plan(
         self,
@@ -303,54 +226,53 @@ class StateStore:
             "plan": plan_value,
         }
 
-        with self._mutation_lock():
-            if self.state_path.exists():
-                raise InvalidInputError("This workspace already has a plan; use a new state directory")
+        if self.state_path.exists():
+            raise InvalidInputError("This workspace already has a plan; use a new state directory")
 
-            self._install_initial_metadata(
-                self.request_path, request_value, request_digest, "normalized request"
-            )
-            self._install_initial_metadata(
-                self.archive_path,
-                archive_value,
-                archive_metadata_digest,
-                "archive metadata",
-            )
-            state = {
-                "schema_version": SCHEMA_VERSION,
-                "importer_version": __version__,
-                "ingestion_id": ingestion_id,
-                "project_lock": {
-                    "project_id": request_value["target"]["project_id"],
-                    "status": ProjectLockStatus.PENDING,
-                },
-                "status": ImportStatus.PLANNED,
-                **immutable,
-                "project": {
+        self._install_initial_metadata(
+            self.request_path, request_value, request_digest, "normalized request"
+        )
+        self._install_initial_metadata(
+            self.archive_path,
+            archive_value,
+            archive_metadata_digest,
+            "archive metadata",
+        )
+        state = {
+            "schema_version": SCHEMA_VERSION,
+            "importer_version": __version__,
+            "ingestion_id": ingestion_id,
+            "project_lock": {
+                "project_id": request_value["target"]["project_id"],
+                "status": ProjectLockStatus.PENDING,
+            },
+            "status": ImportStatus.PLANNED,
+            **immutable,
+            "project": {
+                "status": DatabaseStatus.PLANNED,
+                "project_id": None,
+            },
+            "batches": [
+                {
+                    **copy.deepcopy(batch),
                     "status": DatabaseStatus.PLANNED,
-                    "project_id": None,
-                },
-                "batches": [
-                    {
-                        **copy.deepcopy(batch),
-                        "status": DatabaseStatus.PLANNED,
-                        "artifacts": copy.deepcopy((batch_artifacts or {}).get(batch["index"], {})),
-                    }
-                    for batch in batch_plan
-                ],
-                "phases": {
-                    phase: {"status": OperationStatus.PENDING} for phase in _PHASE_ORDER
-                },
-                "artifacts": copy.deepcopy(dict(artifacts or {})),
-                "run": {"status": OperationStatus.PENDING},
-            }
-            for name, artifact in state["artifacts"].items():
+                    "artifacts": copy.deepcopy((batch_artifacts or {}).get(batch["index"], {})),
+                }
+                for batch in batch_plan
+            ],
+            "phases": {
+                phase: {"status": OperationStatus.PENDING} for phase in _PHASE_ORDER
+            },
+            "artifacts": copy.deepcopy(dict(artifacts or {})),
+            "run": {"status": OperationStatus.PENDING},
+        }
+        for name, artifact in state["artifacts"].items():
+            self._verify_artifact_value(name, artifact)
+        for batch in state["batches"]:
+            for name, artifact in batch["artifacts"].items():
                 self._verify_artifact_value(name, artifact)
-            for batch in state["batches"]:
-                for name, artifact in batch["artifacts"].items():
-                    self._verify_artifact_value(name, artifact)
-            self._persist(state)
-            return copy.deepcopy(state)
+        self._persist(state)
+        return copy.deepcopy(state)
 
     def _persist(self, state):
         atomic_write_json(self.state_path, state)
@@ -557,23 +479,22 @@ class StateStore:
 
     def transition_project_lock(self, status: ProjectLockStatus) -> dict[str, Any]:
         status = ProjectLockStatus(status)
-        with self._mutation_lock():
-            state = self.load()
-            current = state["project_lock"]["status"]
-            allowed = {
-                ProjectLockStatus.PENDING: {ProjectLockStatus.ACQUIRING, ProjectLockStatus.RELEASED},
-                ProjectLockStatus.ACQUIRING: {ProjectLockStatus.LOCKED, ProjectLockStatus.RELEASED},
-                ProjectLockStatus.LOCKED: {ProjectLockStatus.RELEASED},
-            }
-            if status not in allowed.get(current, set()):
-                raise ImmutableStateError(f"Invalid project lock transition: {current} -> {status}")
-            # The run is completed while still protected; its final unlock must
-            # be recorded afterward without reopening any batch/phase mutations.
-            if status != ProjectLockStatus.RELEASED:
-                self._assert_mutations_allowed()
-            state["project_lock"]["status"] = status
-            self._persist(state)
-            return copy.deepcopy(state)
+        state = self.load()
+        current = state["project_lock"]["status"]
+        allowed = {
+            ProjectLockStatus.PENDING: {ProjectLockStatus.ACQUIRING, ProjectLockStatus.RELEASED},
+            ProjectLockStatus.ACQUIRING: {ProjectLockStatus.LOCKED, ProjectLockStatus.RELEASED},
+            ProjectLockStatus.LOCKED: {ProjectLockStatus.RELEASED},
+        }
+        if status not in allowed.get(current, set()):
+            raise ImmutableStateError(f"Invalid project lock transition: {current} -> {status}")
+        # The run is completed while still protected; its final unlock must
+        # be recorded afterward without reopening any batch/phase mutations.
+        if status != ProjectLockStatus.RELEASED:
+            self._assert_mutations_allowed()
+        state["project_lock"]["status"] = status
+        self._persist(state)
+        return copy.deepcopy(state)
 
     def begin_run(self) -> dict[str, Any]:
         """Consume this workspace once, before any CATMAID mutation."""
@@ -601,30 +522,28 @@ class StateStore:
 
     def fail_run(self, reason: str) -> dict[str, Any]:
         """Retain confirmed progress and expose the first failed attempt."""
-        with self._mutation_lock():
-            state = self.load()
-            if state["run"]["status"] != OperationStatus.RUNNING:
-                return state
-            state["run"] = {"status": OperationStatus.FAILED, "reason": reason}
-            state["status"] = ImportStatus.FAILED
-            for item in state["batches"]:
-                if item["status"] == DatabaseStatus.PREPARED:
-                    item["status"] = DatabaseStatus.FAILED
-                    item["reason"] = reason
-            for item in state["phases"].values():
-                if item["status"] == OperationStatus.RUNNING:
-                    item["status"] = OperationStatus.FAILED
-                    item["reason"] = reason
-            self._persist(state)
-            return copy.deepcopy(state)
+        state = self.load()
+        if state["run"]["status"] != OperationStatus.RUNNING:
+            return state
+        state["run"] = {"status": OperationStatus.FAILED, "reason": reason}
+        state["status"] = ImportStatus.FAILED
+        for item in state["batches"]:
+            if item["status"] == DatabaseStatus.PREPARED:
+                item["status"] = DatabaseStatus.FAILED
+                item["reason"] = reason
+        for item in state["phases"].values():
+            if item["status"] == OperationStatus.RUNNING:
+                item["status"] = OperationStatus.FAILED
+                item["reason"] = reason
+        self._persist(state)
+        return copy.deepcopy(state)
 
     def _mutate(self, mutator: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
-        with self._mutation_lock():
-            self._assert_mutations_allowed()
-            state = self.load()
-            mutator(state)
-            self._persist(state)
-            return copy.deepcopy(state)
+        self._assert_mutations_allowed()
+        state = self.load()
+        mutator(state)
+        self._persist(state)
+        return copy.deepcopy(state)
 
     def _assert_mutations_allowed(self) -> None:
         if (

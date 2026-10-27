@@ -76,8 +76,9 @@ then retains it through preflight, planning, loading, maintenance, cache updates
 and verification. At the start of `run`, it verifies the same ingestion UUID
 still owns the project lock, without releasing and reacquiring it. The standalone
 local-ZIP CLI acquires its project lock at `run`, before batch preparation.
-The workspace writer lock prevents another process from running the same state
-directory. Each ingestion UUID has one fresh workspace and one run attempt.
+Each ingestion UUID has one fresh workspace and one run attempt. The workflow
+runs its commands sequentially; concurrent commands against the same state
+directory are unsupported. There is no filesystem workspace lock.
 NeuroGlass mutation requests use
 `catmaid.ingestion_lock.project_write_guard()` for the whole write response.
 Their shared project-row locks allow concurrent edits and finish before the
@@ -702,8 +703,8 @@ choosing cleanup or a new import.
 
 The directory supplied through `--state-dir` contains inputs, saved IDs,
 batch snapshots, maps, manifests and progress for one import. Keep it on durable
-storage for diagnosis and later review-queue mapping. `state.py` uses a writer
-lock and atomically replaces JSON so readers see complete records. The run marker
+storage for diagnosis and later review-queue mapping. `state.py` atomically
+replaces JSON so readers see complete records. The run marker
 moves once from pending to running and then complete or failed; an interrupted
 running attempt cannot be resumed.
 

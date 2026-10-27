@@ -124,8 +124,7 @@ def _completed_phase_record(
 class MetricsStore:
     """Atomically persist low-overhead phase metrics in a state directory.
 
-    The command-wide :mod:`catmaid_skeleton_batch_import.state` lock provides
-    single-writer exclusion.  Atomic replacement still guarantees readers
+    Workflow commands write sequentially. Atomic replacement guarantees readers
     never observe a partially written metrics document.
     """
 

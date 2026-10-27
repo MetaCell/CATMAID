@@ -435,7 +435,7 @@ def test_importer_uses_retained_ingestion_uuid_and_embedded_lock_state(
 
 
 @pytest.mark.parametrize("scenario", ["wrapper_startup_failure", "success", "partial_import"])
-def test_workflow_project_and_workspace_locks_cover_parent_to_run_handoff(
+def test_workflow_project_lock_covers_parent_to_run_handoff(
     isolated_database, existing_project_factory, tmp_path, monkeypatch, scenario,
 ):
     import json
