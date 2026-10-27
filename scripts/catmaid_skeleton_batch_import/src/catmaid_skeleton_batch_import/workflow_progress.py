@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import argparse
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,30 @@ PROGRESS_ANNOTATION = "neuroglass.metacell.us/ingestion-progress"
 PROGRESS_VERSION = "stages-v1"
 MAX_STATE_BYTES = 4 * 1024 * 1024
 BATCH_STATUSES = {"planned", "prepared", "committed", "failed"}
+
+
+class WorkflowInterrupted(SystemExit):
+    def __init__(self, signum):
+        self.signum = signum
+        super().__init__(128 + signum)
+
+
+@contextmanager
+def termination_signals():
+    # Keep cancellation active between stages and return handler ownership to
+    # the caller afterward, including when a stage raises.
+    previous = {}
+
+    def interrupt(signum, _frame):
+        raise WorkflowInterrupted(signum)
+
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous[signum] = signal.signal(signum, interrupt)
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 def stage_units(stage, completed=0, total=0):
@@ -120,6 +145,7 @@ def _report_progress(workspace, filename, stop):
             return
 
 
+@termination_signals()
 def run(action):
     workspace = Path(os.environ["SKELETON_INGESTION_WORKSPACE"])
     logs = workspace / "logs"
@@ -133,41 +159,41 @@ def run(action):
             stderr=subprocess.STDOUT,
         )
 
-        def forward(signum, _frame):
+        def forward(signum):
             if child.poll() is None:
                 try:
                     os.killpg(child.pid, signum)
                 except ProcessLookupError:
                     pass
 
-        signal.signal(signal.SIGTERM, forward)
-        signal.signal(signal.SIGINT, forward)
         stop = threading.Event()
         reporter = None
-        if action == "run" and os.environ.get("ARGO_PROGRESS_FILE"):
-            reporter = threading.Thread(
-                target=_report_progress,
-                args=(workspace, os.environ["ARGO_PROGRESS_FILE"], stop),
-                daemon=True,
-            )
-            reporter.start()
         try:
+            if action == "run" and os.environ.get("ARGO_PROGRESS_FILE"):
+                reporter = threading.Thread(
+                    target=_report_progress,
+                    args=(workspace, os.environ["ARGO_PROGRESS_FILE"], stop),
+                    daemon=True,
+                )
+                reporter.start()
             while chunk := child.stdout.read1(64 * 1024):
                 output.write(chunk)
                 sys.stdout.buffer.write(chunk)
                 sys.stdout.buffer.flush()
             code = child.wait()
-        except BaseException:
-            forward(signal.SIGTERM, None)
+        except BaseException as exc:
+            # Cancellation is terminal even when a child handles it by exiting
+            # zero. Reap the whole stage before propagating the signal exit code.
+            forward(exc.signum if isinstance(exc, WorkflowInterrupted) else signal.SIGTERM)
             try:
                 child.wait(timeout=15)
             except subprocess.TimeoutExpired:
-                forward(signal.SIGKILL, None)
+                forward(signal.SIGKILL)
                 child.wait()
             raise
         finally:
             stop.set()
-            if reporter is not None:
+            if reporter is not None and reporter.is_alive():
                 reporter.join(timeout=2)
             child.stdout.close()
     return 128 - code if code < 0 else code

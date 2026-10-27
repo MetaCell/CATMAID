@@ -37,6 +37,10 @@ The command owns download → preflight → plan → run in order. Run includes
 maintenance, updating existing caches and verification. It uses the same
 single-attempt importer, source validation, three-attempt transfer budget and
 retained-state checks. It refuses a nonempty workspace.
+`SIGTERM` or `SIGINT` cancels the whole sequence, including between stages.
+A running stage receives the signal and is reaped before exit; cancellation
+does not start another stage even if the child exits successfully. Terminal
+evidence is retained when it can be written during shutdown.
 
 `workflow_io.py` owns downloading and retained-evidence decisions;
 `archive_sources.py` validates/decrypts storage URLs.

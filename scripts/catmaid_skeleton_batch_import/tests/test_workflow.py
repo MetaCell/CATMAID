@@ -1,5 +1,10 @@
 import json
 import os
+import signal
+import subprocess
+import sys
+
+import pytest
 from pathlib import Path
 from unittest.mock import patch
 from types import SimpleNamespace
@@ -81,3 +86,50 @@ def test_preflight_readiness_failure_is_confirmed_before_loading(tmp_path):
         assert workflow.execute(env) == 3
     record = json.loads((Path(env["SKELETON_INGESTION_WORKSPACE"]) / workflow.TERMINAL_FILENAME).read_text())
     assert record["result"]["outcome"] == "failed"
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
+@pytest.mark.parametrize("after_stage", ["preflight", "plan"])
+def test_signal_between_stages_stops_before_loading(tmp_path, signum, after_stage):
+    env = environment(tmp_path)
+    stage = tmp_path / "stage.py"
+    stage.write_text(
+        "import os, sys; from pathlib import Path; "
+        "workspace=Path(os.environ['SKELETON_INGESTION_WORKSPACE']); "
+        "output=(workspace/'executed-stages').open('a'); "
+        "output.write(sys.argv[1]+chr(10)); output.close(); "
+        "(workspace/'loading-started').touch() if sys.argv[1]=='run' else None"
+    )
+    launcher = tmp_path / "workflow.py"
+    launcher.write_text("""
+import os
+import signal
+import sys
+from catmaid_skeleton_batch_import import workflow, workflow_progress
+
+workflow_progress.CATMAID_WRAPPER = sys.argv[1]
+workflow.io.execute = lambda *_args, **_kwargs: 0
+original_run = workflow_progress.run
+
+def run(action):
+    code = original_run(action)
+    if action == sys.argv[3]:
+        os.kill(os.getpid(), int(sys.argv[2]))
+    return code
+
+workflow_progress.run = run
+raise SystemExit(workflow.execute())
+""")
+    child = subprocess.run(
+        [sys.executable, str(launcher), str(stage), str(signum), after_stage],
+        env={**os.environ, **env}, capture_output=True, timeout=15,
+    )
+    workspace = Path(env["SKELETON_INGESTION_WORKSPACE"])
+    assert child.returncode == 128 + signum, child.stderr.decode()
+    assert not (workspace / "loading-started").exists()
+    assert (workspace / "executed-stages").read_text().splitlines() == (
+        ["preflight"] if after_stage == "preflight" else ["preflight", "plan"]
+    )
+    result = json.loads((workspace / workflow.TERMINAL_FILENAME).read_text())
+    assert result["terminal"] is True
+    assert result["result"]["outcome"] == "failed"

@@ -14,6 +14,7 @@ from . import workflow_io as io, workflow_progress as progress
 TERMINAL_FILENAME = "terminal-result.json"
 
 
+@progress.termination_signals()
 def execute(environ=None):
     environment = os.environ if environ is None else environ
     workspace = None
@@ -34,6 +35,9 @@ def execute(environ=None):
                 code = progress.run(stage)
                 if code != 0:
                     break
+    except progress.WorkflowInterrupted as exc:
+        print(f"Workflow interrupted by signal {exc.signum}", file=sys.stderr)
+        code = exc.code
     except io.WorkerError as exc:
         print(io._sanitize_message(exc, "Workflow failed"), file=sys.stderr)
         code = exc.exit_code

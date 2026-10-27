@@ -10,7 +10,10 @@ import tempfile
 import time
 import json
 from unittest import TestCase
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
+from contextlib import nullcontext
+
+import pytest
 
 from catmaid_skeleton_batch_import import workflow_progress as runner
 
@@ -147,6 +150,25 @@ class RetainedRunnerTests(TestCase):
         self.assertEqual(stdout, b"finished\n")
 
 
+    def test_cancellation_stays_nonzero_when_the_child_exits_successfully(self):
+        source = (
+            "import signal, sys, time; "
+            "signal.signal(signal.SIGTERM, lambda *_args: sys.exit(0)); "
+            "signal.signal(signal.SIGINT, lambda *_args: sys.exit(0)); "
+            "print('running', flush=True); time.sleep(120)"
+        )
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signum=signum):
+                child = self.start(source)
+                ready, _, _ = select.select([child.stdout], [], [], 10)
+                self.assertTrue(ready, "Child did not start")
+                self.assertEqual(child.stdout.readline(), b"running\n")
+                child.send_signal(signum)
+                _, stderr = child.communicate(timeout=20)
+                self.assertEqual(child.returncode, 128 + signum, stderr)
+
+
+
 class NativeProgressWriteTests(TestCase):
     def test_transient_write_failure_retries_unchanged_counters_then_deduplicates(self):
         with tempfile.TemporaryDirectory() as root:
@@ -176,3 +198,32 @@ class NativeProgressWriteTests(TestCase):
             self.assertEqual(native.read_text(), "4/15")
             self.assertEqual(stop.wait.call_count, 3)
             self.assertEqual(json.loads(state_path.read_text())["batches"][1]["status"], "planned")
+
+
+@pytest.mark.parametrize("fail_write", [False, True])
+def test_stage_restores_callers_signal_handlers_on_success_and_error(tmp_path, monkeypatch, fail_write):
+    child = tmp_path / "child.py"
+    child.write_text("print('output', flush=True)")
+    monkeypatch.setenv("SKELETON_INGESTION_WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(runner, "CATMAID_WRAPPER", str(child))
+    previous = {signum: signal.getsignal(signum) for signum in (signal.SIGTERM, signal.SIGINT)}
+
+    def caller_handler(_signum, _frame):
+        pass
+
+    try:
+        for signum in previous:
+            signal.signal(signum, caller_handler)
+        output = MagicMock()
+        output.__enter__.return_value = output
+        output.write.side_effect = OSError("volume full")
+        with patch.object(runner.Path, "open", return_value=output) if fail_write else nullcontext():
+            if fail_write:
+                with pytest.raises(OSError, match="volume full"):
+                    runner.run("plan")
+            else:
+                assert runner.run("plan") == 0
+        assert all(signal.getsignal(signum) is caller_handler for signum in previous)
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
