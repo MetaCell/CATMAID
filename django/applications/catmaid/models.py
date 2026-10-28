@@ -66,6 +66,7 @@ class UserRole(object):
 
 class Project(models.Model):
     id = models.AutoField(primary_key=True)
+    active_skeleton_ingestion = models.UUIDField(null=True, blank=True, editable=False)
     title = models.TextField()
     comment = models.TextField(blank=True, null=True)
     stacks = models.ManyToManyField("Stack",

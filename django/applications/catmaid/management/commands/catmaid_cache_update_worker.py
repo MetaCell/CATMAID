@@ -13,9 +13,10 @@ from django.db import connection
 
 from catmaid.consumers import msg_all
 from catmaid.control.edge import get_intersected_grid_cells
+from catmaid.control.grid_cache import locked_grid_cell
 from catmaid.control.node import (get_configured_node_providers,
         GridCachedNodeProvider, Postgis3dNodeProvider, update_grid_cell)
-from catmaid.models import NodeGridCache, DirtyNodeGridCacheCell
+from catmaid.models import NodeGridCache
 from catmaid.util import str2bool
 from .common import set_log_level
 
@@ -41,7 +42,6 @@ class GridWorker():
         grid_map = dict((g.id, g) for g in grids)
 
         provider = Postgis3dNodeProvider()
-        cursor = connection.cursor()
 
         # Batch of grids to update during one run
         updated_cells = 0
@@ -56,19 +56,20 @@ class GridWorker():
                 'limit': settings.NODE_LIST_MAXIMUM_COUNT,
                 'ordering': g.ordering,
             }
-            if g.n_last_edited_skeletons_limit:
+            if g.n_largest_skeletons_limit:
                 params['n_largest_skeletons_limit'] = int(g.n_largest_skeletons_limit)
             if g.n_last_edited_skeletons_limit:
                 params['n_last_edited_skeletons_limit'] = int(g.n_last_edited_skeletons_limit)
             if g.hidden_last_editor_id:
                 params['hidden_last_editor_id'] = int(g.hidden_last_editor_id)
 
-            updated = update_grid_cell(g.project_id, g.id, w_i, h_i, d_i,
-                    g.cell_width, g.cell_height, g.cell_depth,
-                    params, g.allow_empty, g.n_lod_levels, g.lod_min_bucket_size,
-                    g.lod_strategy, g.has_json_data, g.has_json_text_data,
-                    g.has_msgpack_data, provider=provider, cursor=cursor,
-                    delete_empty=True)
+            with locked_grid_cell(g.id, w_i, h_i, d_i) as (cell_cursor, _receipt):
+                updated = update_grid_cell(g.project_id, g.id, w_i, h_i, d_i,
+                        g.cell_width, g.cell_height, g.cell_depth,
+                        params, g.allow_empty, g.n_lod_levels, g.lod_min_bucket_size,
+                        g.lod_strategy, g.has_json_data, g.has_json_text_data,
+                        g.has_msgpack_data, provider=provider, cursor=cell_cursor,
+                        delete_empty=True)
 
             if updated:
                 updated_cells += 1
@@ -80,10 +81,6 @@ class GridWorker():
                     'y': h_i,
                     'z': d_i,
                 }])
-
-                # TODO: delete in batches
-                DirtyNodeGridCacheCell.objects.filter(grid_id=g.id, x_index=w_i,
-                        y_index=h_i, z_index=d_i).delete()
 
         # Optionally, let users know about updated cells
         if settings.SPATIAL_UPDATE_CLIENT_NOTIFICATIONS:

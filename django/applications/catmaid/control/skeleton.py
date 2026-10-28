@@ -13,10 +13,11 @@ import re
 from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple, Union
 
 from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 from django.http import HttpRequest, HttpResponse, HttpResponseBadRequest, Http404, \
         JsonResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404
-from django.db import connection
+from django.db import connection, OperationalError, transaction
 from django.db.models import Q
 from django.views.decorators.cache import never_cache
 from django.utils.decorators import method_decorator
@@ -27,6 +28,9 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from catmaid.history import add_log_entry
+from catmaid.source_fragments import (
+    SOURCE_FRAGMENT_ANNOTATION_PREFIX, is_source_fragment_annotation_name,
+    reject_reserved_annotation_names)
 from catmaid.control import tracing
 from catmaid.models import (Project, UserRole, Class, ClassInstance, Review,
         ClassInstanceClassInstance, Relation, Sampler, Treenode,
@@ -1278,6 +1282,8 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
 
     If upstream_annotation_map or downstream_annotation_map are not defined,
     this is interpreted as keeping all annotations for the respective skeleton.
+    Imported source-fragment identifiers are always copied to both parts,
+    independently of the requested distribution of ordinary annotations.
     """
     treenode_id = int(request.POST['treenode_id'])
     treenode = Treenode.objects.get(pk=treenode_id)
@@ -1287,33 +1293,10 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     downstream_annotation_map = request.POST.get('downstream_annotation_map')
     cursor = connection.cursor()
 
-    # If no annotation map was specified for either winning and losing
-    # skeleton, get the current annotation data.
-    if not upstream_annotation_map or not downstream_annotation_map:
-        current_annotations = annotations_for_skeleton(project_id, skeleton_id)
-
-    if upstream_annotation_map:
-        upstream_annotation_map = json.loads(upstream_annotation_map)
-    else:
-        upstream_annotation_map = current_annotations
-
-    if downstream_annotation_map:
-        downstream_annotation_map = json.loads(downstream_annotation_map)
-    else:
-        downstream_annotation_map = current_annotations
-
     # Check if the treenode is root!
     if not treenode.parent:
-        raise ValueError('Can\'t split at the root node: it doesn\'t have a parent.')
+        raise ValueError("Can't split at the root node: it doesn't have a parent.")
     treenode_parent = treenode.parent
-
-    # Check if annotations are valid
-    if not check_annotations_on_split(project_id, skeleton_id,
-            frozenset(upstream_annotation_map.keys()),
-            frozenset(downstream_annotation_map.keys())):
-        raise ValueError("Annotation distribution is not valid for splitting. " \
-          "One part has to keep the whole set of annotations!")
-
     skeleton = ClassInstance.objects.select_related('user').get(pk=skeleton_id)
 
     # retrieve neuron of this skeleton
@@ -1323,11 +1306,9 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
 
     # Make sure the user has permissions to edit
     can_edit_class_instance_or_fail(request.user, neuron.id, 'neuron')
-
-    # Extend annotation maps with creation time and edition time of the link to
-    # neuron to make sure these dates won't change during the split.
-    upstream_annotation_map = make_annotation_map(upstream_annotation_map, neuron.id, cursor)
-    downstream_annotation_map = make_annotation_map(downstream_annotation_map, neuron.id, cursor)
+    _lock_source_fragment_neurons(project_id, [neuron.id], cursor)
+    # A committed edit during the wait may have changed edit restrictions.
+    can_edit_class_instance_or_fail(request.user, neuron.id, 'neuron')
 
     # Retrieve the id, parent_id of all nodes in the skeleton. Also
     # pre-emptively lock all treenodes and connectors in the skeleton to prevent
@@ -1341,9 +1322,39 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
         ORDER BY t.id
         FOR NO KEY UPDATE OF t
         ''', (skeleton_id, skeleton_id)) # no need to sanitize
+    # Metadata checks below reuse the cursor; retain the locked graph snapshot.
+    locked_nodes = cursor.fetchall()
+    _check_fragment_source_nodes(project_id, {treenode_id: skeleton_id},
+            {skeleton_id: neuron.id}, cursor)
+
+    # Read metadata after serializing structural edits of the source neuron.
+    if not upstream_annotation_map or not downstream_annotation_map:
+        current_annotations = annotations_for_skeleton(project_id, skeleton_id)
+    upstream_annotation_map = (json.loads(upstream_annotation_map)
+            if upstream_annotation_map else current_annotations)
+    downstream_annotation_map = (json.loads(downstream_annotation_map)
+            if downstream_annotation_map else current_annotations)
+    source_annotations = _source_fragment_annotations(project_id, [neuron.id], cursor)
+    # These annotations record inherited origin, rather than per-node membership.
+    # Both split results therefore retain the complete source set.
+    upstream_annotation_map = _retain_source_fragment_annotations(
+            upstream_annotation_map, source_annotations)
+    downstream_annotation_map = _retain_source_fragment_annotations(
+            downstream_annotation_map, source_annotations)
+
+    if not check_annotations_on_split(project_id, skeleton_id,
+            frozenset(upstream_annotation_map.keys()),
+            frozenset(downstream_annotation_map.keys())):
+        raise ValueError("Annotation distribution is not valid for splitting. "
+                "One part has to keep the whole set of annotations!")
+
+    # Keep original timestamps and copy protected names without expanding tokens.
+    upstream_annotation_map = make_annotation_map(upstream_annotation_map, neuron.id, cursor)
+    downstream_annotation_map = make_annotation_map(downstream_annotation_map, neuron.id, cursor)
+
     # build the networkx graph from it
     graph = nx.DiGraph()
-    for row in cursor.fetchall():
+    for row in locked_nodes:
         graph.add_node( row[0] )
         if row[1]:
             # edge from parent_id to id
@@ -1405,10 +1416,11 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     # Update annotations of existing neuron to have only over set
     if upstream_annotation_map:
         _update_neuron_annotations(project_id, neuron.id,
-                upstream_annotation_map)
+                upstream_annotation_map, allow_reserved=True)
 
     # Update annotations of under skeleton
-    _annotate_entities(project_id, [new_neuron.id], downstream_annotation_map)
+    _annotate_entities(project_id, [new_neuron.id], downstream_annotation_map,
+            allow_reserved=True)
 
     # If samplers reference this skeleton, make sure they are updated as well
     sampler_info = prune_samplers(skeleton_id, graph, treenode_parent, treenode)
@@ -2412,8 +2424,105 @@ def join_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
             'stable_annotation_swap': join_info['stable_annotation_swap'],
         })
 
+    except PermissionError:
+        # Keep reserved-annotation failures as HTTP 403 instead of validation errors.
+        raise
     except Exception as e:
         raise ValueError(response_on_error + ':' + str(e))
+
+
+def _lock_source_fragment_neurons(project_id, neuron_ids, cursor) -> None:
+    """Serialize inheritance even when edits select different nodes of one neuron.
+
+    Read provenance after locking its owner, then recheck captured node ownership.
+    Wait briefly for a conflicting editor; longer contention asks the caller to
+    retry. Limit only this lock acquisition, not the rest of the request.
+    """
+    expected = set(neuron_ids)
+    timeout_ms = settings.SKELETON_EDIT_LOCK_TIMEOUT_MS
+    if (isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int)
+            or not 0 < timeout_ms <= 2147483647):
+        raise ImproperlyConfigured('SKELETON_EDIT_LOCK_TIMEOUT_MS must be a positive integer')
+    try:
+        # A savepoint restores the timeout and releases partial locks if the
+        # query times out. On success the row locks live until request commit.
+        with transaction.atomic(using=cursor.db.alias):
+            cursor.execute("SELECT setting::integer FROM pg_settings WHERE name='lock_timeout'")
+            previous_timeout_ms = cursor.fetchone()[0]
+            # Do not weaken an existing, stricter database timeout.
+            effective_timeout_ms = (min(timeout_ms, previous_timeout_ms)
+                    if previous_timeout_ms else timeout_ms)
+            cursor.execute("SELECT set_config('lock_timeout', %s, true)",
+                    [f'{effective_timeout_ms}ms'])
+            cursor.execute("""
+                SELECT ci.id
+                FROM class_instance ci
+                JOIN class c ON c.id = ci.class_id
+                WHERE ci.project_id = %s AND ci.id = ANY(%s::bigint[])
+                    AND c.class_name = 'neuron'
+                ORDER BY ci.id
+                FOR NO KEY UPDATE OF ci
+            """, (project_id, sorted(expected)))
+            locked = {row[0] for row in cursor.fetchall()}
+            cursor.execute("SELECT set_config('lock_timeout', %s, true)",
+                    [f'{previous_timeout_ms}ms'])
+    except OperationalError as error:
+        if getattr(error.__cause__, 'pgcode', None) == '55P03':
+            raise ValueError('A source neuron is being edited; retry the operation.') from error
+        raise
+    if locked != expected:
+        raise ValueError('A source neuron changed during the operation; retry it.')
+
+
+def _check_fragment_source_nodes(project_id, expected_nodes, expected_neurons, cursor) -> None:
+    """Reject captured node or model-of IDs changed by another structural edit."""
+    cursor.execute("""
+        SELECT id, skeleton_id FROM treenode
+        WHERE project_id = %s AND id = ANY(%s::bigint[])
+    """, (project_id, list(expected_nodes)))
+    if dict(cursor.fetchall()) != expected_nodes:
+        raise ValueError('A source skeleton changed during the operation; retry it.')
+    cursor.execute("""
+        SELECT link.class_instance_a, link.class_instance_b
+        FROM class_instance_class_instance link
+        JOIN relation r ON r.id = link.relation_id
+        JOIN class_instance sk ON sk.id = link.class_instance_a
+        JOIN class c ON c.id = sk.class_id
+        WHERE link.project_id = %s AND sk.project_id = %s
+            AND link.class_instance_a = ANY(%s::bigint[])
+            AND r.relation_name = 'model_of' AND c.class_name = 'skeleton'
+    """, (project_id, project_id, list(expected_neurons)))
+    if sorted(cursor.fetchall()) != sorted(expected_neurons.items()):
+        raise ValueError('A source neuron changed during the operation; retry it.')
+
+
+def _source_fragment_annotations(project_id, neuron_ids, cursor) -> Dict[str, int]:
+    """Read literal protected names; later neurons take annotator precedence."""
+    cursor.execute("""
+        SELECT a.name, link.user_id
+        FROM class_instance_class_instance link
+        JOIN class_instance a ON a.id = link.class_instance_b
+        JOIN class c ON c.id = a.class_id
+        JOIN relation r ON r.id = link.relation_id
+        WHERE link.project_id = %s AND a.project_id = %s
+            AND link.class_instance_a = ANY(%s::bigint[])
+            AND c.class_name = 'annotation' AND r.relation_name = 'annotated_with'
+            AND LEFT(a.name, %s) = %s
+        ORDER BY array_position(%s::bigint[], link.class_instance_a), link.id
+    """, (project_id, project_id, neuron_ids,
+            len(SOURCE_FRAGMENT_ANNOTATION_PREFIX), SOURCE_FRAGMENT_ANNOTATION_PREFIX,
+            neuron_ids))
+    return dict(cursor.fetchall())
+
+
+def _retain_source_fragment_annotations(annotation_map, source_annotations) -> Dict:
+    """Only server-owned source metadata can enter a trusted annotation copy."""
+    reject_reserved_annotation_names(name for name in annotation_map
+            if is_source_fragment_annotation_name(name) and name not in source_annotations)
+    retained = dict(annotation_map)
+    # Restore stored annotators too; a client selection must not rewrite origin.
+    retained.update(source_annotations)
+    return retained
 
 
 def make_annotation_map(annotation_vs_user_id, neuron_id, cursor=None) -> Dict:
@@ -2486,7 +2595,9 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
     is a dictionary, mapping an annotation to an annotator ID. Also, all
     reviews of the skeleton that changes ID are changed to refer to the new
     skeleton ID. If annotation_map is None, the resulting skeleton will have
-    all annotations available on both skeletons combined.
+    all annotations available on both skeletons combined. Imported
+    source-fragment identifiers are always retained as their combined set,
+    even if the caller selects only some ordinary annotations.
 
     If samplers link to one or both ot the input skeletons, a sampler handling
     mode is required. Otherwise, the merge operation is canceled.
@@ -2528,6 +2639,18 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
                 user, to_neuron['neuronid'], 'neuron')
 
         cursor = connection.cursor()
+
+        # Acquire ownership locks before reading metadata that can change while
+        # waiting, including edit restrictions, names and stable-winner labels.
+        _lock_source_fragment_neurons(project_id,
+                [from_neuron['neuronid'], to_neuron['neuronid']], cursor)
+        can_edit_class_instance_or_fail(user, from_neuron['neuronid'], 'neuron')
+        can_edit_class_instance_or_fail(user, to_neuron['neuronid'], 'neuron')
+        current_names = dict(ClassInstance.objects.filter(
+                pk__in=[from_neuron['neuronid'], to_neuron['neuronid']]
+                ).values_list('id', 'name'))
+        from_neuron['neuronname'] = current_names[from_neuron['neuronid']]
+        to_neuron['neuronname'] = current_names[to_neuron['neuronid']]
 
         # Test if either join partner is marked as stable. If this is the case,
         # the neuron marked as stable is enforced to be the winner of the join.
@@ -2600,6 +2723,13 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
             'target_node_id': from_treenode_id,
         })
 
+        _check_fragment_source_nodes(project_id, {
+            from_treenode_id: from_skid,
+            to_treenode_id: to_skid,
+        }, {from_skid: from_neuron['neuronid'], to_skid: to_neuron['neuronid']}, cursor)
+        source_annotations = _source_fragment_annotations(project_id,
+                [to_neuron['neuronid'], from_neuron['neuronid']], cursor)
+
         # Check if annotations are valid, if there is a particular selection
         if annotation_map is None:
             # Get all current annotations of both skeletons and merge them for
@@ -2623,11 +2753,16 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
             merge_into_annotation_map(to_annotation_info, to_skid, annotation_map)
             merge_into_annotation_map(from_annotation_info, from_skid, annotation_map)
         else:
+            annotation_map = _retain_source_fragment_annotations(
+                    annotation_map, source_annotations)
             if not check_annotations_on_join(project_id, user,
                     from_neuron['neuronid'], to_neuron['neuronid'],
                     frozenset(annotation_map.keys())):
                 raise ValueError("Annotation distribution is not valid for joining. " \
                 "Annotations for which you don't have permissions have to be kept!")
+
+        annotation_map = _retain_source_fragment_annotations(
+                annotation_map, source_annotations)
 
         # Find oldest creation_time and edition_time
         winning_map = make_annotation_map(annotation_map, from_neuron['neuronid'])
@@ -2696,7 +2831,7 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
         response_on_error = 'Could not update annotations of neuron ' \
                 'with ID %s' % from_neuron['neuronid']
         _update_neuron_annotations(project_id, from_neuron['neuronid'],
-                winning_map, to_neuron['neuronid'])
+                winning_map, to_neuron['neuronid'], allow_reserved=True)
 
         # Remove the 'losing' neuron if it is empty
         _delete_if_empty(to_neuron['neuronid'])
@@ -2727,6 +2862,9 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
 
         return response
 
+    except PermissionError:
+        # Let the endpoint preserve the permission response for protected metadata.
+        raise
     except Exception as e:
         raise ValueError(response_on_error + ':' + str(e))
 
@@ -3245,6 +3383,9 @@ def _import_skeleton(user, project_id, arborescence, neuron_id=None,
     provided. Returns a dictionary of the neuron and skeleton IDs, and the
     original arborescence with attributes added for treenode IDs.
     """
+    # Native uploads accept user labels; only the batch importer creates source IDs.
+    reject_reserved_annotation_names(annotations or ())
+
     # TODO: There is significant reuse here of code from create_treenode that
     # could be DRYed up.
     relation_map = get_relation_to_id_map(project_id)

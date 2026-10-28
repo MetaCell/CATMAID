@@ -203,6 +203,45 @@ class SkeletonSummaryTableTests(TransactionTestCase, AssertStatusMixin):
 
         return ids, skeleton_id
 
+    def test_selective_refresh_creates_and_updates_single_node_summaries(self):
+        _, singleton = self.create_partition([(1, 2, 3)])
+        _, branched = self.create_partition([(0, 0, 0), (3, 4, 0)])
+        _, untouched = self.create_partition([(9, 8, 7)])
+        selected = [singleton, branched]
+        with connection.cursor() as cursor:
+            def snapshots():
+                cursor.execute("""
+                    SELECT skeleton_id, project_id, original_creation_time,
+                           last_edition_time, last_editor_id, num_nodes, cable_length
+                    FROM catmaid_skeleton_summary
+                    WHERE skeleton_id = ANY(%s::bigint[]) ORDER BY skeleton_id
+                """, [selected])
+                return cursor.fetchall()
+
+            expected = snapshots()
+            cursor.execute("SELECT row_to_json(s) FROM catmaid_skeleton_summary s "
+                    "WHERE skeleton_id=%s", [untouched])
+            unrelated = cursor.fetchone()
+            # Simulate rebuilding missing derived rows after an offline COPY.
+            cursor.execute("DELETE FROM catmaid_skeleton_summary "
+                    "WHERE skeleton_id=ANY(%s::bigint[])", [selected])
+            cursor.execute("SELECT refresh_skeleton_summary_table_selectively(%s::bigint[])",
+                    [selected])
+            self.assertEqual(snapshots(), expected)
+            self.assertEqual(self.get_summary(cursor, singleton), {
+                'skeleton_id': singleton, 'cable_length': 0, 'num_nodes': 1,
+            })
+            self.assertEqual(self.get_summary(cursor, branched)['cable_length'], 5)
+            # Existing summaries also need to be refreshed, not just inserted.
+            cursor.execute("UPDATE catmaid_skeleton_summary SET num_nodes=99, cable_length=99 "
+                    "WHERE skeleton_id=ANY(%s::bigint[])", [selected])
+            cursor.execute("SELECT refresh_skeleton_summary_table_selectively(%s::bigint[])",
+                    [selected])
+            self.assertEqual(snapshots(), expected)
+            cursor.execute("SELECT row_to_json(s) FROM catmaid_skeleton_summary s "
+                    "WHERE skeleton_id=%s", [untouched])
+            self.assertEqual(cursor.fetchone(), unrelated)
+
     def test_branches_and_split(self):
         self.authenticate()
         cursor = connection.cursor()

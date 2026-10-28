@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "source": {
+    "archive_path": "/tmp/catmaid-skeleton-import-e2e.zip",
+    "coordinate_unit": "um"
+  },
+  "target": {
+    "project_id": 123
+  }
+}
