@@ -106,9 +106,12 @@ The orchestrator supplies `SKELETON_INGESTION_ID`, a fresh
 `SKELETON_INGESTION_S3_URI` or an encrypted
 `SKELETON_INGESTION_SOURCE_ENCRYPTED` with its
 `SKELETON_INGESTION_SOURCE_KEY`. Also supply
-`SKELETON_INGESTION_COORDINATE_UNIT`,
 `SKELETON_INGESTION_TARGET_PROJECT_ID` and
 `SKELETON_INGESTION_MAX_ARCHIVE_BYTES`, plus the normal database settings.
+
+The workflow always reads SWC coordinates and known radii in micrometres
+(`um`); it has no coordinate-unit environment parameter. The standalone CLI
+retains its explicit `source.coordinate_unit` support for both `nm` and `um`.
 
 The command owns download → preflight → plan → run in order. Run includes
 maintenance, updating existing caches and verification. It uses the same

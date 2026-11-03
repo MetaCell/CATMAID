@@ -113,7 +113,6 @@ class SkeletonIngestionWorkerTestCase(TestCase):
             workspace=self.workspace,
             source=source,
             max_archive_bytes=max_archive_bytes,
-            coordinate_unit="um",
             target_project_id=41,
         )
 
@@ -122,7 +121,6 @@ class SkeletonIngestionWorkerTestCase(TestCase):
             "SKELETON_INGESTION_ID": INGESTION_ID,
             "SKELETON_INGESTION_WORKSPACE": str(self.workspace),
             "SKELETON_INGESTION_S3_URI": ("s3://public-neurons/archive/skeletons.zip"),
-            "SKELETON_INGESTION_COORDINATE_UNIT": "um",
             "SKELETON_INGESTION_TARGET_PROJECT_ID": "41",
             "SKELETON_INGESTION_MAX_ARCHIVE_BYTES": "1048576",
         }
@@ -313,6 +311,12 @@ class PublicS3ConfigurationTests(SkeletonIngestionWorkerTestCase):
             "The archive limit should be parsed as a positive integer",
         )
 
+    def test_workflow_request_uses_micrometres_without_a_unit_parameter(self) -> None:
+        config = worker.load_download_config(self.download_environment())
+        request = worker._normalized_request(config, self.workspace / "source.zip")
+        self.assertEqual(request["source"]["coordinate_unit"], "um")
+        self.assertEqual(request["target"]["project_id"], 41)
+
     def test_load_download_config_rejects_noncanonical_values(self) -> None:
         invalid_overrides = {
             "uppercase UUID": {
@@ -323,9 +327,6 @@ class PublicS3ConfigurationTests(SkeletonIngestionWorkerTestCase):
             },
             "home-relative workspace": {
                 "SKELETON_INGESTION_WORKSPACE": f"~/{INGESTION_ID}",
-            },
-            "implicit coordinate unit": {
-                "SKELETON_INGESTION_COORDINATE_UNIT": "voxel",
             },
             "missing managed target": {"SKELETON_INGESTION_TARGET_PROJECT_ID": ""},
             "noninteger target": {"SKELETON_INGESTION_TARGET_PROJECT_ID": "1.5"},

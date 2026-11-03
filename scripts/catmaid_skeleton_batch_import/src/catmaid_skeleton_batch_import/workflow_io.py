@@ -39,6 +39,7 @@ except ImportError:  # pragma: no cover - the production image installs boto3
 
 SCHEMA_VERSION = 1
 WORKER_VERSION = "1"
+SWC_COORDINATE_UNIT = "um"
 
 SOURCE_FILENAME = "source.zip"
 PART_FILENAME = "source.zip.part"
@@ -123,7 +124,6 @@ class DownloadConfig:
     workspace: Path
     source: PublicS3Object | SignedArchiveSource
     max_archive_bytes: int
-    coordinate_unit: str
     target_project_id: int
 
 
@@ -227,11 +227,6 @@ def load_download_config(environ: Mapping[str, str]) -> DownloadConfig:
         source = parse_public_s3_uri(
             _required_env(environ, "SKELETON_INGESTION_S3_URI")
         )
-    coordinate_unit = _required_env(environ, "SKELETON_INGESTION_COORDINATE_UNIT")
-    if coordinate_unit not in {"nm", "um"}:
-        raise InvalidWorkerInput(
-            "SKELETON_INGESTION_COORDINATE_UNIT must be 'nm' or 'um'"
-        )
     target_project_id = _positive_int(
         _required_env(environ, "SKELETON_INGESTION_TARGET_PROJECT_ID"),
         "SKELETON_INGESTION_TARGET_PROJECT_ID",
@@ -244,7 +239,6 @@ def load_download_config(environ: Mapping[str, str]) -> DownloadConfig:
             _required_env(environ, "SKELETON_INGESTION_MAX_ARCHIVE_BYTES"),
             "SKELETON_INGESTION_MAX_ARCHIVE_BYTES",
         ),
-        coordinate_unit=coordinate_unit,
         target_project_id=target_project_id,
     )
 
@@ -439,7 +433,7 @@ def _normalized_request(
         "schema_version": SCHEMA_VERSION,
         "source": {
             "archive_path": str(archive_path.resolve()),
-            "coordinate_unit": config.coordinate_unit,
+            "coordinate_unit": SWC_COORDINATE_UNIT,
         },
         "target": {"project_id": config.target_project_id},
     }
