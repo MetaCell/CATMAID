@@ -17,7 +17,7 @@ from catmaid.control.skeleton import _get_neuronname_from_skeletonid
 from catmaid.models import (
     ClassInstance, ClassInstanceClassInstance, Log, Review, TreenodeConnector,
     ReviewerWhitelist, Treenode, User, ClientDatastore, ClientData,
-    TreenodeClassInstance
+    TreenodeClassInstance, Project
 )
 
 from .common import CatmaidApiTestCase, CatmaidApiTransactionTestCase
@@ -88,6 +88,30 @@ class SkeletonsApiTests(CatmaidApiTestCase):
         self.assertAlmostEqual(parsed_response['y'], 3035)
         self.assertAlmostEqual(parsed_response['z'], 0)
 
+
+    def test_compact_skeleton_detail_requires_project_match(self):
+        self.fake_authentication()
+        wrong_project_id = 5
+        skeleton_id = 373
+        assign_perm('can_browse', self.test_user,
+                Project.objects.get(pk=wrong_project_id))
+
+        response = self.client.get(
+            f'/{self.test_project_id}/skeletons/{skeleton_id}/compact-detail')
+        self.assertStatus(response)
+
+        response = self.client.get(
+            f'/{wrong_project_id}/skeletons/{skeleton_id}/compact-detail')
+        self.assertStatus(response, 404)
+        parsed_response = json.loads(response.content.decode('utf-8'))
+        self.assertEqual(f"Skeleton #{skeleton_id} doesn't exist", parsed_response['detail'])
+
+        response = self.client.get(
+            f'/{wrong_project_id}/skeletons/{skeleton_id}/compact-detail',
+            {'with_history': True})
+        self.assertStatus(response, 404)
+        parsed_response = json.loads(response.content.decode('utf-8'))
+        self.assertEqual(f"Skeleton #{skeleton_id} doesn't exist", parsed_response['detail'])
 
     def test_import_skeleton_with_64_bit_ids(self):
         self.fake_authentication()
