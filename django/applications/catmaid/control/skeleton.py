@@ -2741,8 +2741,8 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
         source_annotations = _source_fragment_annotations(project_id,
                 [to_neuron['neuronid'], from_neuron['neuronid']], cursor)
 
-        # Check if annotations are valid, if there is a particular selection
-        if annotation_map is None:
+        explicit_annotations = annotation_map is not None
+        if not explicit_annotations:
             # Get all current annotations of both skeletons and merge them for
             # a complete result set.
             from_annotation_info = get_annotation_info(project_id, (from_skid,),
@@ -2763,17 +2763,14 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
             annotation_map = dict()
             merge_into_annotation_map(to_annotation_info, to_skid, annotation_map)
             merge_into_annotation_map(from_annotation_info, from_skid, annotation_map)
-        else:
-            annotation_map = _retain_source_fragment_annotations(
-                    annotation_map, source_annotations)
-            if not check_annotations_on_join(project_id, user,
-                    from_neuron['neuronid'], to_neuron['neuronid'],
-                    frozenset(annotation_map.keys())):
-                raise ValueError("Annotation distribution is not valid for joining. " \
-                "Annotations for which you don't have permissions have to be kept!")
 
         annotation_map = _retain_source_fragment_annotations(
                 annotation_map, source_annotations)
+        if explicit_annotations and not check_annotations_on_join(project_id, user,
+                from_neuron['neuronid'], to_neuron['neuronid'],
+                frozenset(annotation_map)):
+            raise ValueError("Annotation distribution is not valid for joining. "
+                    "Annotations for which you don't have permissions have to be kept!")
 
         # Find oldest creation_time and edition_time
         winning_map = make_annotation_map(annotation_map, from_neuron['neuronid'])
