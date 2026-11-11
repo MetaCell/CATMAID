@@ -21,6 +21,7 @@ from catmaid.control.skeleton import (
     _get_neuronname_from_skeletonid, _import_skeleton, _join_skeleton,
     _lock_source_fragment_neurons,
 )
+from catmaid.error import ClientError
 from catmaid.models import ClassInstance, ClassInstanceClassInstance, Treenode, User
 from catmaid.source_fragments import SOURCE_FRAGMENT_ANNOTATION_PREFIX
 from catmaid.state import make_nocheck_state
@@ -123,6 +124,50 @@ class SourceFragmentSkeletonTests(SourceFragmentFixtures, CatmaidApiTestCase):
         self.assert_sources(stable_winner.neuron, ['A', 'B'])
         self.assertEqual(ClassInstance.objects.get(pk=stable_winner.neuron).name,
                 stable_winner.name)
+
+    def test_join_policy_observes_stable_swap_and_can_reject_before_edits(self):
+        requested_winner = self.fragment('Requested', ['A'])
+        stable_winner = self.fragment('Stable', ['B'])
+        _annotate_entities(self.test_project_id, [stable_winner.neuron],
+                {'stable': {'user_id': self.test_user_id}})
+
+        class JoinConflict(ClientError):
+            status_code = 409
+            meta = {'code': 'test_join_conflict'}
+
+        def policy(project_id, winning_neuron_id, losing_neuron_id, annotation_map):
+            self.assertTrue(transaction.get_connection().in_atomic_block)
+            self.assertEqual(project_id, self.test_project_id)
+            self.assertEqual(winning_neuron_id, stable_winner.neuron)
+            self.assertEqual(losing_neuron_id, requested_winner.neuron)
+            self.assertIsNone(annotation_map)
+            raise JoinConflict('Rejected by join policy')
+
+        with override_settings(SKELETON_JOIN_ANNOTATION_POLICY=policy):
+            response = self.join(requested_winner, stable_winner, omit_map=True)
+        self.assertStatus(response, 409)
+        self.assertEqual(response.json()['meta'], {'code': 'test_join_conflict'})
+        for fragment in (requested_winner, stable_winner):
+            self.assertTrue(ClassInstance.objects.filter(pk=fragment.skeleton).exists())
+            for index, node_id in enumerate(fragment.nodes):
+                parent = fragment.nodes[index - 1] if index else None
+                self.assertTreenodeHasProperties(node_id, parent, fragment.skeleton)
+
+    def test_join_policy_can_retain_a_surviving_annotation(self):
+        winner = self.fragment('A', ['A'])
+        loser = self.fragment('B', ['B'])
+        _annotate_entities(self.test_project_id, [winner.neuron],
+                {'retained': {'user_id': self.test_user_id}})
+        with patch(
+                __name__ + '.retain_join_annotations',
+                create=True, return_value={'retained': self.test_user_id}) as policy:
+            with override_settings(SKELETON_JOIN_ANNOTATION_POLICY=__name__ + '.retain_join_annotations'):
+                response = self.join(winner, loser)
+        self.assertStatus(response)
+        policy.assert_called_once_with(self.test_project_id, winner.neuron, loser.neuron, {})
+        self.assertEqual(response.json()['result_skeleton_id'], winner.skeleton)
+        self.assertIn('retained', annotations_for_skeleton(self.test_project_id, winner.skeleton))
+        self.assert_sources(winner.neuron, ['A', 'B'])
 
     def test_split_copies_all_identifiers_even_with_empty_downstream_map(self):
         original = self.fragment('Original visible label', ['0001', 'part{n}', 'A,B'])

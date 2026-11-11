@@ -249,6 +249,11 @@ NODE_LIST_MAXIMUM_COUNT = 3500
 # to acquiring those locks; an existing stricter database timeout is preserved.
 SKELETON_EDIT_LOCK_TIMEOUT_MS = 1000
 
+# Optional callable (or dotted path) taking the project, winning neuron ID,
+# losing neuron ID and explicit annotation map (or None). It returns the map
+# to use and may reject the join by raising a ClientError.
+SKELETON_JOIN_ANNOTATION_POLICY = None
+
 # Default importer tile width, tile height and tile source type
 IMPORTER_DEFAULT_DATA_SOURCE = 'filesystem'
 IMPORTER_DEFAULT_TILE_WIDTH = 512

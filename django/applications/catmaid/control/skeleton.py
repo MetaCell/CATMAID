@@ -21,12 +21,14 @@ from django.db import connection, OperationalError, transaction
 from django.db.models import Q
 from django.views.decorators.cache import never_cache
 from django.utils.decorators import method_decorator
+from django.utils.module_loading import import_string
 
 from rest_framework.decorators import api_view
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from catmaid.error import ClientError
 from catmaid.history import add_log_entry
 from catmaid.source_fragments import (
     SOURCE_FRAGMENT_ANNOTATION_PREFIX, is_source_fragment_annotation_name,
@@ -2424,8 +2426,7 @@ def join_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
             'stable_annotation_swap': join_info['stable_annotation_swap'],
         })
 
-    except PermissionError:
-        # Keep reserved-annotation failures as HTTP 403 instead of validation errors.
+    except (PermissionError, ClientError):
         raise
     except Exception as e:
         raise ValueError(response_on_error + ':' + str(e))
@@ -2727,6 +2728,13 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
             from_treenode_id: from_skid,
             to_treenode_id: to_skid,
         }, {from_skid: from_neuron['neuronid'], to_skid: to_neuron['neuronid']}, cursor)
+
+        annotation_policy = getattr(settings, 'SKELETON_JOIN_ANNOTATION_POLICY', None)
+        if annotation_policy is not None:
+            if isinstance(annotation_policy, str):
+                annotation_policy = import_string(annotation_policy)
+            annotation_map = annotation_policy(int(project_id), from_neuron['neuronid'],
+                    to_neuron['neuronid'], annotation_map)
         source_annotations = _source_fragment_annotations(project_id,
                 [to_neuron['neuronid'], from_neuron['neuronid']], cursor)
 
@@ -2862,8 +2870,7 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
 
         return response
 
-    except PermissionError:
-        # Let the endpoint preserve the permission response for protected metadata.
+    except (PermissionError, ClientError):
         raise
     except Exception as e:
         raise ValueError(response_on_error + ':' + str(e))
