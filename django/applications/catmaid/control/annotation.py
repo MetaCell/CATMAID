@@ -810,6 +810,10 @@ class SkeletonAnnotationTargetConflict(ClientError):
     meta = {'code': 'skeleton_annotation_target_stale'}
 
 
+class SkeletonAnnotationTargetNotFound(Http404):
+    meta = SkeletonAnnotationTargetConflict.meta
+
+
 def _skeleton_annotation_targets(project_id, skeleton_ids) -> Dict[int, int]:
     return dict(ClassInstance.objects.filter(
         project_id=project_id,
@@ -1041,7 +1045,9 @@ def annotate_entities(request:HttpRequest, project_id = None) -> JsonResponse:
         try:
             entity_ids += [skeleton_targets[skid] for skid in skeleton_ids]
         except KeyError as error:
-            raise Http404(f"Skeleton {error.args[0]} does not exist in project {project_id}.") from error
+            raise SkeletonAnnotationTargetNotFound(
+                f"Skeleton {error.args[0]} does not exist in project {project_id}."
+            ) from error
 
     # Annotate entities
     annotation_map = {a: { 'user_id': request.user.id } for a in annotations}

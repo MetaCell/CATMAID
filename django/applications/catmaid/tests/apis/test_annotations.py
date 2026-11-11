@@ -56,6 +56,7 @@ class AnnotationsApiTests(CatmaidApiTestCase):
         })
 
         self.assertStatus(response, 404)
+        self.assertEqual(response.json()['meta']['code'], 'skeleton_annotation_target_stale')
         self.assertIn(str(missing_skeleton_id), response.json()['error'])
         annotations = create_annotation_query(self.test_project_id, {'neuron_id': 2365})
         self.assertFalse(annotations.filter(name=name).exists())
