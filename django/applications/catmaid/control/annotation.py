@@ -1002,9 +1002,6 @@ def _annotate_entities_with_name(project_id:Union[int,str], user_id, entity_ids)
 def annotate_entities(request:HttpRequest, project_id = None) -> JsonResponse:
     p = get_object_or_404(Project, pk = project_id)
 
-    # Read keys in a sorted manner
-    sorted_keys = sorted(request.POST.keys())
-
     annotations = get_request_list(request.POST, 'annotations', [])
     meta_annotations = get_request_list(request.POST, 'meta_annotations', [])
     reject_reserved_annotation_names(annotations + meta_annotations)
