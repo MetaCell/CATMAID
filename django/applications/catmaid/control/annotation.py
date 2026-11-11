@@ -807,6 +807,7 @@ def delete_annotation_if_unused(project, annotation, relation) -> Tuple[bool, in
 
 class SkeletonAnnotationTargetConflict(ClientError):
     status_code = 409
+    meta = {'code': 'skeleton_annotation_target_stale'}
 
 
 def _skeleton_annotation_targets(project_id, skeleton_ids) -> Dict[int, int]:
@@ -1028,8 +1029,6 @@ def _annotate_entities_with_name(project_id:Union[int,str], user_id, entity_ids)
 
 @requires_user_role(UserRole.Annotate)
 def annotate_entities(request:HttpRequest, project_id = None) -> JsonResponse:
-    p = get_object_or_404(Project, pk = project_id)
-
     annotations = get_request_list(request.POST, 'annotations', [])
     meta_annotations = get_request_list(request.POST, 'meta_annotations', [])
     reject_reserved_annotation_names(annotations + meta_annotations)
@@ -1038,7 +1037,7 @@ def annotate_entities(request:HttpRequest, project_id = None) -> JsonResponse:
 
     skeleton_targets = {}
     if any(skeleton_ids):
-        skeleton_targets = _skeleton_annotation_targets(p.id, skeleton_ids)
+        skeleton_targets = _skeleton_annotation_targets(project_id, skeleton_ids)
         try:
             entity_ids += [skeleton_targets[skid] for skid in skeleton_ids]
         except KeyError as error:
