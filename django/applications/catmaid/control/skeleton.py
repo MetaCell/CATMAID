@@ -2405,8 +2405,9 @@ def join_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
         from_treenode_id = int(request.POST.get('from_id', None))
         to_treenode_id = int(request.POST.get('to_id', None))
         annotation_set = request.POST.get('annotation_set', None)
-        if annotation_set:
-            annotation_set = json.loads(annotation_set)
+        if annotation_set is not None:
+            # A blank form field is an explicit empty selection.
+            annotation_set = json.loads(annotation_set or '{}')
         sampler_handling = request.POST.get('sampler_handling', None)
         lose_sampler_handling = request.POST.get('lose_sampler_handling', "keep-samplers")
         from_name_reference = get_request_bool(request.POST, 'from_name_reference', False)
