@@ -2406,8 +2406,10 @@ def join_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
         to_treenode_id = int(request.POST.get('to_id', None))
         annotation_set = request.POST.get('annotation_set', None)
         if annotation_set is not None:
-            # A blank form field is an explicit empty selection.
+            # Blank fields and lists of annotation pairs are explicit selections.
             annotation_set = json.loads(annotation_set or '{}')
+            if annotation_set is not None:
+                annotation_set = dict(annotation_set)
         sampler_handling = request.POST.get('sampler_handling', None)
         lose_sampler_handling = request.POST.get('lose_sampler_handling', "keep-samplers")
         from_name_reference = get_request_bool(request.POST, 'from_name_reference', False)
@@ -2427,7 +2429,7 @@ def join_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
             'stable_annotation_swap': join_info['stable_annotation_swap'],
         })
 
-    except (PermissionError, ClientError):
+    except ClientError:
         raise
     except Exception as e:
         raise ValueError(response_on_error + ':' + str(e))
@@ -2871,7 +2873,7 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
 
         return response
 
-    except (PermissionError, ClientError):
+    except ClientError:
         raise
     except Exception as e:
         raise ValueError(response_on_error + ':' + str(e))

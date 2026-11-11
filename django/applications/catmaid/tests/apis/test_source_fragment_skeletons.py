@@ -169,23 +169,30 @@ class SourceFragmentSkeletonTests(SourceFragmentFixtures, CatmaidApiTestCase):
         self.assertIn('retained', annotations_for_skeleton(self.test_project_id, winner.skeleton))
         self.assert_sources(winner.neuron, ['A', 'B'])
 
-    def test_join_policy_receives_empty_map_for_blank_annotation_set(self):
-        winner = self.fragment('A', ['A'])
-        loser = self.fragment('B', ['B'])
+    def test_join_policy_receives_normalized_annotation_selections(self):
+        cases = (
+            ('', {}),
+            ('[]', {}),
+            (json.dumps([['retained', self.test_user_id]]), {'retained': self.test_user_id}),
+        )
+        for annotation_set, expected in cases:
+            with self.subTest(annotation_set=annotation_set):
+                winner = self.fragment('A', ['A'])
+                loser = self.fragment('B', ['B'])
 
-        def policy(project_id, winning_neuron_id, losing_neuron_id, annotation_map):
-            self.assertEqual(annotation_map, {})
-            return annotation_map
+                def policy(project_id, winning_neuron_id, losing_neuron_id, annotation_map):
+                    self.assertEqual(annotation_map, expected)
+                    return annotation_map
 
-        with override_settings(SKELETON_JOIN_ANNOTATION_POLICY=policy):
-            response = self.client.post(f'/{self.test_project_id}/skeleton/join', {
-                'from_id': winner.nodes[0],
-                'to_id': loser.nodes[0],
-                'annotation_set': '',
-            })
+                with override_settings(SKELETON_JOIN_ANNOTATION_POLICY=policy):
+                    response = self.client.post(f'/{self.test_project_id}/skeleton/join', {
+                        'from_id': winner.nodes[0],
+                        'to_id': loser.nodes[0],
+                        'annotation_set': annotation_set,
+                    })
 
-        self.assertStatus(response)
-        self.assertEqual(response.json()['result_skeleton_id'], winner.skeleton)
+                self.assertStatus(response)
+                self.assertEqual(response.json()['result_skeleton_id'], winner.skeleton)
 
     def test_split_copies_all_identifiers_even_with_empty_downstream_map(self):
         original = self.fragment('Original visible label', ['0001', 'part{n}', 'A,B'])
