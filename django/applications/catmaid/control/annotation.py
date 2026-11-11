@@ -6,7 +6,7 @@ import re
 
 from typing import Any, DefaultDict, Dict, FrozenSet, List, Optional, Set, Tuple, Union
 
-from django.http import HttpRequest, HttpResponse, JsonResponse
+from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404
 from django.db import connection
 
@@ -1017,9 +1017,12 @@ def annotate_entities(request:HttpRequest, project_id = None) -> JsonResponse:
                 cici_via_b__relation__relation_name = 'model_of',
                 cici_via_b__class_instance_a__in = skeleton_ids).values_list(
                         'cici_via_b__class_instance_a', 'id'))
-        entity_ids += [skid_to_eid[skid] for skid in skeleton_ids]
+        try:
+            entity_ids += [skid_to_eid[skid] for skid in skeleton_ids]
+        except KeyError as error:
+            raise Http404(f"Skeleton {error.args[0]} does not exist in project {project_id}.") from error
 
-    # Annotate enties
+    # Annotate entities
     annotation_map = {a: { 'user_id': request.user.id } for a in annotations}
     annotation_objs, new_annotations, existing_annotations = _annotate_entities(
             project_id, entity_ids, annotation_map)

@@ -45,6 +45,21 @@ class AnnotationsApiTests(CatmaidApiTestCase):
         self.assertEqual(aq[1].name, 'pattern 10 test-2-annotation')
 
 
+    def test_add_annotations_rejects_missing_skeleton_without_writing(self):
+        self.fake_authentication()
+        name = 'batch-annotation'
+        missing_skeleton_id = 2147483647
+        response = self.client.post(f'/{self.test_project_id}/annotations/add', {
+            'annotations[0]': name,
+            'skeleton_ids[0]': 2364,
+            'skeleton_ids[1]': missing_skeleton_id,
+        })
+
+        self.assertStatus(response, 404)
+        self.assertIn(str(missing_skeleton_id), response.json()['error'])
+        annotations = create_annotation_query(self.test_project_id, {'neuron_id': 2365})
+        self.assertFalse(annotations.filter(name=name).exists())
+
     def test_remove_annotations(self):
         self.fake_authentication()
         skeleton_id = 2364
