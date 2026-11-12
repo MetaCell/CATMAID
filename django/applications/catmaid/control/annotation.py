@@ -13,6 +13,7 @@ from django.db import connection, transaction
 from rest_framework.decorators import api_view
 
 from catmaid.error import ClientError
+from catmaid.locks import NeuronLockTimeout, lock_skeleton_neurons
 from catmaid.models import UserRole, Project, Class, ClassInstance, \
         ClassInstanceClassInstance, Relation, ReviewerWhitelist
 from catmaid.control.authentication import requires_user_role, can_edit_or_fail
@@ -814,6 +815,11 @@ class SkeletonAnnotationTargetNotFound(Http404):
     meta = SkeletonAnnotationTargetConflict.meta
 
 
+class SkeletonAnnotationTargetBusy(ClientError):
+    status_code = 409
+    meta = {'code': 'skeleton_annotation_target_busy'}
+
+
 def _skeleton_annotation_targets(project_id, skeleton_ids) -> Dict[int, int]:
     return dict(ClassInstance.objects.filter(
         project_id=project_id,
@@ -840,12 +846,12 @@ def _annotate_entities(project_id:Union[int,str], entity_ids, annotation_map:Dic
     neurons. The caller must hold a transaction open through the writes.
     """
     if skeleton_targets:
-        # Lock in the same order and mode as a join, then recheck the mappings.
+        try:
+            with connection.cursor() as cursor:
+                lock_skeleton_neurons(project_id, set(skeleton_targets.values()), cursor)
+        except NeuronLockTimeout as error:
+            raise SkeletonAnnotationTargetBusy(str(error)) from error
         # A neuron can survive the removal of one of its skeletons.
-        targets = ClassInstance.objects.filter(
-            project_id=project_id, pk__in=skeleton_targets.values(),
-        ).order_by('pk').select_for_update(no_key=True)
-        list(targets.values_list('pk', flat=True))
         current_targets = _skeleton_annotation_targets(project_id, skeleton_targets)
         for skeleton_id, neuron_id in skeleton_targets.items():
             if current_targets.get(skeleton_id) != neuron_id:
