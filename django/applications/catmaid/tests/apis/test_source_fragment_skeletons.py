@@ -186,6 +186,31 @@ class SourceFragmentSkeletonTests(SourceFragmentFixtures, CatmaidApiTestCase):
         self.assertNotIn(forged_task, annotations)
         self.assert_sources(winner.neuron, ['A', 'B'])
 
+    def test_delete_blocks_the_final_treenode_of_a_task_linked_skeleton(self):
+        fragment = self.fragment('Linked', ['A'])
+        task_annotations, _, _ = _annotate_entities(self.test_project_id,
+                [fragment.neuron], {TASK_LABEL: {'user_id': self.test_user_id}})
+        task_annotation, = task_annotations
+        delete_url = f'/{self.test_project_id}/treenode/delete'
+
+        for node_id in reversed(fragment.nodes[1:]):
+            self.assertStatus(self.client.post(delete_url, {
+                'treenode_id': node_id, 'state': make_nocheck_state(),
+            }))
+
+        root = {'treenode_id': fragment.nodes[0], 'state': make_nocheck_state()}
+        response = self.client.post(delete_url, root)
+        self.assertStatus(response, 409)
+        self.assertEqual(response.json()['meta'], {'code': 'task_skeleton_final_node'})
+        self.assertTreenodeHasProperties(fragment.nodes[0], None, fragment.skeleton)
+        self.assertIn(TASK_LABEL, annotations_for_skeleton(self.test_project_id, fragment.skeleton))
+
+        self.assertStatus(self.client.post(f'/{self.test_project_id}/annotations/remove', {
+            'entity_ids[0]': fragment.neuron, 'annotation_ids[0]': task_annotation.id,
+        }))
+        self.assertStatus(self.client.post(delete_url, root))
+        self.assertFalse(ClassInstance.objects.filter(pk=fragment.skeleton).exists())
+
     def test_join_normalizes_explicit_annotation_selections(self):
         cases = (
             ('', set()),

@@ -7,7 +7,7 @@ import networkx as nx
 import re
 from typing import Any, DefaultDict, Dict, List, Union
 
-from django.db import connection
+from django.db import connection, transaction
 from django.http import HttpRequest, JsonResponse
 from django.shortcuts import get_object_or_404
 
@@ -24,6 +24,7 @@ from catmaid.control.common import (get_relation_to_id_map,
 from catmaid.control.neuron import _delete_if_empty
 from catmaid.control.node import _fetch_location, _fetch_locations
 from catmaid.control.link import create_connector_link
+from catmaid.neuroglass_tasks import TaskSkeletonDeletionConflict, protect_task_annotations_on_delete
 from catmaid.util import Point3D, is_collinear
 
 
@@ -630,6 +631,7 @@ def update_radius(request:HttpRequest, project_id=None, treenode_id=None) -> Jso
 
 
 @requires_user_role(UserRole.Annotate)
+@transaction.atomic
 def delete_treenode(request:HttpRequest, project_id=None) -> JsonResponse:
     """ Deletes a treenode. If the skeleton has a single node, deletes the
     skeleton and its neuron. Returns the parent_id, if any."""
@@ -699,27 +701,22 @@ def delete_treenode(request:HttpRequest, project_id=None) -> JsonResponse:
                 # and other children become independent skeletons
                 raise ValueError("You can't delete the root node when it "
                                 "has children.")
-            # Get the neuron before the skeleton is deleted. It can't be
-            # accessed otherwise anymore.
-            neuron = ClassInstance.objects.get(project_id=project_id,
-                        cici_via_b__relation__relation_name='model_of',
-                        cici_via_b__class_instance_a=treenode.skeleton)
-            # Remove the original skeleton. It is OK to remove it if it only had
-            # one node, even if the skeleton's user does not match or the user
-            # is not superuser. Delete the skeleton, which triggers deleting
-            # the ClassInstanceClassInstance relationship with neuron_id
             response_on_error = 'Could not delete skeleton.'
-            # Extra check for errors, like having two root nodes
-            count = Treenode.objects.filter(skeleton_id=treenode.skeleton_id) \
-                .count()
-            if 1 == count:
-                # deletes as well treenodes that refer to the skeleton
-                ClassInstance.objects.filter(pk=treenode.skeleton_id) \
-                    .delete()
-            else:
-                raise ValueError("Can't delete isolated node: erroneously, " \
-                        "its skeleton contains more than one treenode! " \
+            # Extra check for errors, like having two root nodes.
+            if Treenode.objects.filter(skeleton_id=treenode.skeleton_id).count() != 1:
+                raise ValueError("Can't delete isolated node: erroneously, "
+                        "its skeleton contains more than one treenode! "
                         "Check for multiple root nodes.")
+
+            # Use the same neuron row lock as task annotation writers.
+            neuron = ClassInstance.objects.select_for_update(of=('self',)).get(
+                project_id=project_id,
+                cici_via_b__relation__relation_name='model_of',
+                cici_via_b__class_instance_a_id=treenode.skeleton_id,
+            )
+            protect_task_annotations_on_delete(project_id, neuron.id)
+            # The skeleton deletion also removes its final treenode and model link.
+            ClassInstance.objects.filter(pk=treenode.skeleton_id).delete()
 
             # If the neuron modeled by the skeleton of the treenode is empty,
             # delete it.
@@ -767,6 +764,8 @@ def delete_treenode(request:HttpRequest, project_id=None) -> JsonResponse:
             'success': "Removed treenode successfully."
         })
 
+    except TaskSkeletonDeletionConflict:
+        raise
     except Exception as e:
         raise ValueError(response_on_error + ': ' + str(e))
 

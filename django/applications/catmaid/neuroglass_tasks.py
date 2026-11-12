@@ -1,4 +1,4 @@
-"""NeuroGlass task labels and their protection during skeleton joins."""
+"""NeuroGlass task labels and protection during skeleton joins and deletion."""
 
 import re
 
@@ -25,6 +25,11 @@ MERGE_MESSAGE = (
 class TaskSkeletonMergeConflict(ClientError):
     status_code = 409
     meta = {"code": "task_skeleton_merge_blocked"}
+
+
+class TaskSkeletonDeletionConflict(ClientError):
+    status_code = 409
+    meta = {"code": "task_skeleton_final_node"}
 
 
 def is_task_annotation(annotation_name: str | None) -> bool:
@@ -82,3 +87,15 @@ def protect_task_annotations_on_join(project_id, winning_neuron_id, losing_neuro
     }
     selected.update(task_annotations.get(winning_neuron_id, {}))
     return selected
+
+
+def protect_task_annotations_on_delete(project_id, neuron_id) -> None:
+    """Protect a skeleton being deleted while its neuron is locked."""
+    if not connection.in_atomic_block:
+        raise RuntimeError("Task skeleton deletion protection requires a transaction.")
+
+    if task_annotations_by_neuron(project_id, [neuron_id]):
+        raise TaskSkeletonDeletionConflict(
+            "Skeleton cannot be deleted because it is associated with a task. "
+            "Please link the task to a different skeleton before deleting it."
+        )
