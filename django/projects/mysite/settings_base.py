@@ -245,8 +245,8 @@ ROI_AUTO_CREATE_IMAGE = False
 # result; that will be between 1x and 2x this value.
 NODE_LIST_MAXIMUM_COUNT = 3500
 
-# Maximum wait for neuron locks during joins, splits and skeleton annotations,
-# in milliseconds. An existing stricter database timeout is preserved.
+# Maximum wait for join/split neuron locks, in milliseconds. This applies only
+# to acquiring those locks; an existing stricter database timeout is preserved.
 SKELETON_EDIT_LOCK_TIMEOUT_MS = 1000
 
 # Default importer tile width, tile height and tile source type

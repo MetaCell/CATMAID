@@ -454,60 +454,6 @@ class SourceFragmentTransactionTests(SourceFragmentFixtures, CatmaidApiTransacti
         self.assert_sources(winner.neuron, [])
 
     @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
-    def test_annotation_waits_for_join_and_rejects_removed_skeleton_on_shared_neuron(self):
-        winner = self.fragment('Winner', [])
-        loser = self.fragment('Loser with a sibling skeleton', [])
-        sibling = self.client.post(f'/{self.test_project_id}/treenode/create', {
-            'parent_id': -1,
-            'useneuron': loser.neuron,
-        })
-        self.assertStatus(sibling)
-        sibling_id = sibling.json()['skeleton_id']
-        name = 'concurrent-ordinary-annotation'
-
-        responses = []
-        with self.paused_join(winner, loser) as release:
-            self.complete_after_wait(release, lambda: responses.append(self.client.post(
-                f'/{self.test_project_id}/annotations/add', {
-                    'skeleton_ids[0]': loser.skeleton,
-                    'annotations[0]': name,
-                })))
-
-        response, = responses
-        self.assertStatus(response, 409)
-        self.assertEqual(response.json()['meta']['code'], 'skeleton_annotation_target_stale')
-        self.assertIn(str(loser.skeleton), response.json()['error'])
-        self.assertFalse(ClassInstance.objects.filter(pk=loser.skeleton).exists())
-        self.assertEqual(_get_neuronname_from_skeletonid(self.test_project_id, sibling_id)['neuronid'],
-                loser.neuron)
-        self.assertNotIn(name, annotations_for_skeleton(self.test_project_id, sibling_id))
-
-    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=75)
-    def test_annotation_times_out_during_join_and_can_be_retried(self):
-        free = self.fragment('Free', [])
-        winner = self.fragment('Winner', [])
-        loser = self.fragment('Loser', [])
-        name = 'annotation-after-join'
-        url = f'/{self.test_project_id}/annotations/add'
-        data = {
-            'skeleton_ids[0]': free.skeleton,
-            'skeleton_ids[1]': winner.skeleton,
-            'annotations[0]': name,
-        }
-
-        with self.paused_join(winner, loser):
-            response = self.client.post(url, data)
-            self.assertStatus(response, 409)
-            self.assertEqual(response.json()['meta']['code'], 'skeleton_annotation_target_busy')
-            self.assertIn('retry', response.json()['error'])
-            self.assertFalse(ClassInstance.objects.filter(project_id=self.test_project_id,
-                    class_column__class_name='annotation', name=name).exists())
-
-        self.assertStatus(self.client.post(url, data))
-        for fragment in (free, winner):
-            self.assertIn(name, annotations_for_skeleton(self.test_project_id, fragment.skeleton))
-
-    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
     def test_ordinary_skeletons_also_wait_then_split(self):
         winner = self.fragment('Ordinary A', [])
         loser = self.fragment('Ordinary B', [])

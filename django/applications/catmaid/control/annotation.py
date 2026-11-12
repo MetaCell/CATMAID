@@ -8,12 +8,10 @@ from typing import Any, DefaultDict, Dict, FrozenSet, List, Optional, Set, Tuple
 
 from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404
-from django.db import connection, transaction
+from django.db import connection
 
 from rest_framework.decorators import api_view
 
-from catmaid.error import ClientError
-from catmaid.locks import NeuronLockTimeout, lock_skeleton_neurons
 from catmaid.models import UserRole, Project, Class, ClassInstance, \
         ClassInstanceClassInstance, Relation, ReviewerWhitelist
 from catmaid.control.authentication import requires_user_role, can_edit_or_fail
@@ -806,32 +804,12 @@ def delete_annotation_if_unused(project, annotation, relation) -> Tuple[bool, in
 
         return True, 0
 
-class SkeletonAnnotationTargetConflict(ClientError):
-    status_code = 409
+class SkeletonAnnotationTargetNotFound(Http404):
     meta = {'code': 'skeleton_annotation_target_stale'}
 
 
-class SkeletonAnnotationTargetNotFound(Http404):
-    meta = SkeletonAnnotationTargetConflict.meta
-
-
-class SkeletonAnnotationTargetBusy(ClientError):
-    status_code = 409
-    meta = {'code': 'skeleton_annotation_target_busy'}
-
-
-def _skeleton_annotation_targets(project_id, skeleton_ids) -> Dict[int, int]:
-    return dict(ClassInstance.objects.filter(
-        project_id=project_id,
-        class_column__class_name='neuron',
-        cici_via_b__relation__relation_name='model_of',
-        cici_via_b__class_instance_a__in=skeleton_ids,
-    ).values_list('cici_via_b__class_instance_a', 'id'))
-
-
 def _annotate_entities(project_id:Union[int,str], entity_ids, annotation_map:Dict[str,Any],
-        update_existing=False, allow_reserved=False, *,
-        skeleton_targets:Optional[Dict[int, int]]=None) -> Tuple[Dict,Set,Set]:
+        update_existing=False, allow_reserved=False) -> Tuple[Dict,Set,Set]:
     """ Annotate the entities with the given <entity_ids> with the given
     annotations. These annotations are expected to come as dictionary of
     annotation name versus an object with at least the field 'user_id'
@@ -842,24 +820,7 @@ def _annotate_entities(project_id:Union[int,str], entity_ids, annotation_map:Dic
     will add an incrementing number starting from X for each entity. Reserved
     source-fragment names remain literal. allow_reserved is only for trusted
     structural operations transferring server-derived provenance.
-    skeleton_targets maps requested skeleton IDs to their initially resolved
-    neurons. The caller must hold a transaction open through the writes.
     """
-    if skeleton_targets:
-        try:
-            with connection.cursor() as cursor:
-                lock_skeleton_neurons(project_id, set(skeleton_targets.values()), cursor)
-        except NeuronLockTimeout as error:
-            raise SkeletonAnnotationTargetBusy(str(error)) from error
-        # A neuron can survive the removal of one of its skeletons.
-        current_targets = _skeleton_annotation_targets(project_id, skeleton_targets)
-        for skeleton_id, neuron_id in skeleton_targets.items():
-            if current_targets.get(skeleton_id) != neuron_id:
-                raise SkeletonAnnotationTargetConflict(
-                    f"Skeleton {skeleton_id} changed or was removed before annotation. "
-                    "Refresh the skeleton selection and retry."
-                )
-
     # Annotations can also be targets of meta-annotations. Check both names and
     # target objects so ordinary editing cannot alter the reserved source records.
     if not allow_reserved:
@@ -1042,19 +1003,23 @@ def _annotate_entities_with_name(project_id:Union[int,str], user_id, entity_ids)
     return updated_cis, created_name_links
 
 @requires_user_role(UserRole.Annotate)
-@transaction.atomic
 def annotate_entities(request:HttpRequest, project_id = None) -> JsonResponse:
+    p = get_object_or_404(Project, pk = project_id)
+
     annotations = get_request_list(request.POST, 'annotations', [])
     meta_annotations = get_request_list(request.POST, 'meta_annotations', [])
     reject_reserved_annotation_names(annotations + meta_annotations)
     entity_ids = get_request_list(request.POST, 'entity_ids', [], map_fn=int)
     skeleton_ids = get_request_list(request.POST, 'skeleton_ids', [], map_fn=int)
 
-    skeleton_targets = {}
     if skeleton_ids:
-        skeleton_targets = _skeleton_annotation_targets(project_id, skeleton_ids)
+        skid_to_eid = dict(ClassInstance.objects.filter(project = p,
+                class_column__class_name = 'neuron',
+                cici_via_b__relation__relation_name = 'model_of',
+                cici_via_b__class_instance_a__in = skeleton_ids).values_list(
+                        'cici_via_b__class_instance_a', 'id'))
         try:
-            entity_ids += [skeleton_targets[skid] for skid in skeleton_ids]
+            entity_ids += [skid_to_eid[skid] for skid in skeleton_ids]
         except KeyError as error:
             raise SkeletonAnnotationTargetNotFound(
                 f"Skeleton {error.args[0]} does not exist in project {project_id}."
@@ -1063,7 +1028,7 @@ def annotate_entities(request:HttpRequest, project_id = None) -> JsonResponse:
     # Annotate entities
     annotation_map = {a: { 'user_id': request.user.id } for a in annotations}
     annotation_objs, new_annotations, existing_annotations = _annotate_entities(
-            project_id, entity_ids, annotation_map, skeleton_targets=skeleton_targets)
+            project_id, entity_ids, annotation_map)
     # Annotate annotations
     if meta_annotations:
         annotation_ids = [a.id for a in annotation_objs.keys()]

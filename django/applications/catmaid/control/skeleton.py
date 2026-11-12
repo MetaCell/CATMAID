@@ -17,7 +17,7 @@ from django.core.exceptions import ImproperlyConfigured
 from django.http import HttpRequest, HttpResponse, HttpResponseBadRequest, Http404, \
         JsonResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404
-from django.db import connection
+from django.db import connection, OperationalError, transaction
 from django.db.models import Q
 from django.views.decorators.cache import never_cache
 from django.utils.decorators import method_decorator
@@ -29,7 +29,6 @@ from rest_framework.views import APIView
 
 from catmaid.error import ClientError
 from catmaid.history import add_log_entry
-from catmaid.locks import NeuronLockTimeout, lock_skeleton_neurons
 from catmaid.neuroglass_tasks import protect_task_annotations_on_join
 from catmaid.source_fragments import (
     SOURCE_FRAGMENT_ANNOTATION_PREFIX, is_source_fragment_annotation_name,
@@ -2438,12 +2437,44 @@ def join_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
 
 
 def _lock_source_fragment_neurons(project_id, neuron_ids, cursor) -> None:
-    """Serialize provenance inheritance and reject a missing source neuron."""
+    """Serialize inheritance even when edits select different nodes of one neuron.
+
+    Read provenance after locking its owner, then recheck captured node ownership.
+    Wait briefly for a conflicting editor; longer contention asks the caller to
+    retry. Limit only this lock acquisition, not the rest of the request.
+    """
     expected = set(neuron_ids)
+    timeout_ms = settings.SKELETON_EDIT_LOCK_TIMEOUT_MS
+    if (isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int)
+            or not 0 < timeout_ms <= 2147483647):
+        raise ImproperlyConfigured('SKELETON_EDIT_LOCK_TIMEOUT_MS must be a positive integer')
     try:
-        locked = lock_skeleton_neurons(project_id, expected, cursor)
-    except NeuronLockTimeout as error:
-        raise ValueError(str(error)) from error
+        # A savepoint restores the timeout and releases partial locks if the
+        # query times out. On success the row locks live until request commit.
+        with transaction.atomic(using=cursor.db.alias):
+            cursor.execute("SELECT setting::integer FROM pg_settings WHERE name='lock_timeout'")
+            previous_timeout_ms = cursor.fetchone()[0]
+            # Do not weaken an existing, stricter database timeout.
+            effective_timeout_ms = (min(timeout_ms, previous_timeout_ms)
+                    if previous_timeout_ms else timeout_ms)
+            cursor.execute("SELECT set_config('lock_timeout', %s, true)",
+                    [f'{effective_timeout_ms}ms'])
+            cursor.execute("""
+                SELECT ci.id
+                FROM class_instance ci
+                JOIN class c ON c.id = ci.class_id
+                WHERE ci.project_id = %s AND ci.id = ANY(%s::bigint[])
+                    AND c.class_name = 'neuron'
+                ORDER BY ci.id
+                FOR NO KEY UPDATE OF ci
+            """, (project_id, sorted(expected)))
+            locked = {row[0] for row in cursor.fetchall()}
+            cursor.execute("SELECT set_config('lock_timeout', %s, true)",
+                    [f'{previous_timeout_ms}ms'])
+    except OperationalError as error:
+        if getattr(error.__cause__, 'pgcode', None) == '55P03':
+            raise ValueError('A source neuron is being edited; retry the operation.') from error
+        raise
     if locked != expected:
         raise ValueError('A source neuron changed during the operation; retry it.')
 
