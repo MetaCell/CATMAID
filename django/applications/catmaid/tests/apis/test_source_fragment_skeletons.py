@@ -523,6 +523,36 @@ class SourceFragmentTransactionTests(SourceFragmentFixtures, CatmaidApiTransacti
                         finally:
                             probe.close()
 
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=75)
+    def test_task_annotation_writes_time_out_during_join_and_succeed_on_retry(self):
+        winner = self.fragment('A', [])
+        loser = self.fragment('B', [])
+        annotations, _, _ = _annotate_entities(self.test_project_id, [winner.neuron],
+                {TASK_LABEL: {'user_id': self.test_user_id}})
+        stored_annotation, = annotations
+        new_label = TASK_LABEL[:-1] + 'c'
+        add_url = f'/{self.test_project_id}/annotations/add'
+        remove_url = f'/{self.test_project_id}/annotations/remove'
+        add = {'annotations[0]': new_label, 'skeleton_ids[0]': winner.skeleton}
+        remove = {'annotation_ids[0]': stored_annotation.id, 'entity_ids[0]': winner.neuron}
+
+        with self.paused_join(winner, loser):
+            for url, data in ((add_url, add), (remove_url, remove)):
+                response = self.client.post(url, data)
+                self.assertStatus(response, 409)
+                self.assertEqual(response.json()['meta'], {'code': 'skeleton_annotation_target_busy'})
+                self.assertIn('Please retry', response.json()['error'])
+
+            current = annotations_for_skeleton(self.test_project_id, winner.skeleton)
+            self.assertIn(TASK_LABEL, current)
+            self.assertNotIn(new_label, current)
+
+        self.assertStatus(self.client.post(add_url, add))
+        self.assertStatus(self.client.post(remove_url, remove))
+        current = annotations_for_skeleton(self.test_project_id, winner.skeleton)
+        self.assertIn(new_label, current)
+        self.assertNotIn(TASK_LABEL, current)
+
     def test_successful_lock_restores_database_timeout(self):
         fragment = self.fragment('Uncontended', [])
         with transaction.atomic(), connections['default'].cursor() as cursor:
