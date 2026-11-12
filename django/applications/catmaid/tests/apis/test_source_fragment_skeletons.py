@@ -10,6 +10,8 @@ from unittest.mock import patch
 
 import networkx as nx
 
+from django.apps import apps
+from django.core.exceptions import ImproperlyConfigured
 from django.db import close_old_connections, connections, transaction
 from django.db.models import F
 from django.test import override_settings
@@ -112,6 +114,32 @@ class SourceFragmentSkeletonTests(SourceFragmentFixtures, CatmaidApiTestCase):
                 for entity in response.json()['entities']],
                 [(winner.neuron, 'A', [winner.skeleton])])
 
+    def test_default_join_unions_annotations_with_winner_annotator_precedence(self):
+        winner = self.fragment('Winner', ['A'])
+        loser = self.fragment('Loser', ['B'])
+        other_user_id = User.objects.get(username='test1').id
+        _annotate_entities(self.test_project_id, [winner.neuron], {
+            'shared': {'user_id': self.test_user_id},
+            'winner-only': {'user_id': self.test_user_id},
+        })
+        _annotate_entities(self.test_project_id, [loser.neuron], {
+            'shared': {'user_id': other_user_id},
+            'loser-only': {'user_id': other_user_id},
+        })
+
+        self.assertStatus(self.join(winner, loser, omit_map=True))
+        annotations = dict(ClassInstanceClassInstance.objects.filter(
+            project_id=self.test_project_id, class_instance_a_id=winner.neuron,
+            relation__relation_name='annotated_with',
+        ).values_list('class_instance_b__name', 'user_id'))
+        self.assertEqual(annotations, {
+            'shared': self.test_user_id,
+            'winner-only': self.test_user_id,
+            'loser-only': other_user_id,
+            SOURCE_FRAGMENT_ANNOTATION_PREFIX + 'A': self.test_user_id,
+            SOURCE_FRAGMENT_ANNOTATION_PREFIX + 'B': self.test_user_id,
+        })
+
     def test_stable_partner_is_actual_named_winner(self):
         requested_winner = self.fragment('Requested', ['A'])
         stable_winner = self.fragment('Stable visible label', ['B'])
@@ -168,6 +196,22 @@ class SourceFragmentSkeletonTests(SourceFragmentFixtures, CatmaidApiTestCase):
         self.assertEqual(response.json()['result_skeleton_id'], winner.skeleton)
         self.assertIn('retained', annotations_for_skeleton(self.test_project_id, winner.skeleton))
         self.assert_sources(winner.neuron, ['A', 'B'])
+
+    def test_join_policy_configuration_rejects_invalid_settings(self):
+        winner = self.fragment('Winner', [])
+        loser = self.fragment('Loser', [])
+        invalid_policies = (
+            False,
+            __name__ + '.missing_join_policy',
+            __name__ + '.SOURCE_FRAGMENT_ANNOTATION_PREFIX',
+        )
+        for policy in invalid_policies:
+            with self.subTest(policy=policy), override_settings(SKELETON_JOIN_ANNOTATION_POLICY=policy):
+                with self.assertRaisesRegex(ImproperlyConfigured, 'SKELETON_JOIN_ANNOTATION_POLICY'):
+                    apps.get_app_config('catmaid').validate_configuration()
+                response = self.join(winner, loser)
+                self.assertStatus(response, 500)
+                self.assertEqual(response.json()['type'], 'ImproperlyConfigured')
 
     def test_join_policy_receives_normalized_annotation_selections(self):
         cases = (
@@ -432,6 +476,34 @@ class SourceFragmentTransactionTests(SourceFragmentFixtures, CatmaidApiTransacti
                 second.nodes[0], self.test_project_id, {}))
         self.assertEqual(Treenode.objects.filter(skeleton_id=winner.skeleton).count(), 9)
         self.assert_sources(winner.neuron, [])
+
+    def test_annotation_waits_for_join_and_rejects_removed_skeleton_on_shared_neuron(self):
+        winner = self.fragment('Winner', [])
+        loser = self.fragment('Loser with a sibling skeleton', [])
+        sibling = self.client.post(f'/{self.test_project_id}/treenode/create', {
+            'parent_id': -1,
+            'useneuron': loser.neuron,
+        })
+        self.assertStatus(sibling)
+        sibling_id = sibling.json()['skeleton_id']
+        name = 'concurrent-ordinary-annotation'
+
+        responses = []
+        with self.paused_join(winner, loser) as release:
+            self.complete_after_wait(release, lambda: responses.append(self.client.post(
+                f'/{self.test_project_id}/annotations/add', {
+                    'skeleton_ids[0]': loser.skeleton,
+                    'annotations[0]': name,
+                })))
+
+        response, = responses
+        self.assertStatus(response, 409)
+        self.assertEqual(response.json()['meta']['code'], 'skeleton_annotation_target_stale')
+        self.assertIn(str(loser.skeleton), response.json()['error'])
+        self.assertFalse(ClassInstance.objects.filter(pk=loser.skeleton).exists())
+        self.assertEqual(_get_neuronname_from_skeletonid(self.test_project_id, sibling_id)['neuronid'],
+                loser.neuron)
+        self.assertNotIn(name, annotations_for_skeleton(self.test_project_id, sibling_id))
 
     @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
     def test_ordinary_skeletons_also_wait_then_split(self):

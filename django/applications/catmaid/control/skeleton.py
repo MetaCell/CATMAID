@@ -21,13 +21,13 @@ from django.db import connection, OperationalError, transaction
 from django.db.models import Q
 from django.views.decorators.cache import never_cache
 from django.utils.decorators import method_decorator
-from django.utils.module_loading import import_string
 
 from rest_framework.decorators import api_view
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from catmaid.conf.settings import get_skeleton_join_annotation_policy
 from catmaid.error import ClientError
 from catmaid.history import add_log_entry
 from catmaid.source_fragments import (
@@ -1336,7 +1336,8 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
             if upstream_annotation_map else current_annotations)
     downstream_annotation_map = (json.loads(downstream_annotation_map)
             if downstream_annotation_map else current_annotations)
-    source_annotations = _source_fragment_annotations(project_id, [neuron.id], cursor)
+    source_annotations = _neuron_annotation_map(project_id, [neuron.id], cursor,
+            source_fragments_only=True)
     # These annotations record inherited origin, rather than per-node membership.
     # Both split results therefore retain the complete source set.
     upstream_annotation_map = _retain_source_fragment_annotations(
@@ -2429,7 +2430,7 @@ def join_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
             'stable_annotation_swap': join_info['stable_annotation_swap'],
         })
 
-    except ClientError:
+    except (ClientError, ImproperlyConfigured):
         raise
     except Exception as e:
         raise ValueError(response_on_error + ':' + str(e))
@@ -2500,8 +2501,9 @@ def _check_fragment_source_nodes(project_id, expected_nodes, expected_neurons, c
         raise ValueError('A source neuron changed during the operation; retry it.')
 
 
-def _source_fragment_annotations(project_id, neuron_ids, cursor) -> Dict[str, int]:
-    """Read literal protected names; later neurons take annotator precedence."""
+def _neuron_annotation_map(project_id, neuron_ids, cursor, *,
+        source_fragments_only=False) -> Dict[str, int]:
+    """Read annotations by name, giving later neurons annotator precedence."""
     cursor.execute("""
         SELECT a.name, link.user_id
         FROM class_instance_class_instance link
@@ -2510,11 +2512,13 @@ def _source_fragment_annotations(project_id, neuron_ids, cursor) -> Dict[str, in
         JOIN relation r ON r.id = link.relation_id
         WHERE link.project_id = %s AND a.project_id = %s
             AND link.class_instance_a = ANY(%s::bigint[])
-            AND c.class_name = 'annotation' AND r.relation_name = 'annotated_with'
-            AND LEFT(a.name, %s) = %s
+            AND c.project_id = link.project_id AND c.class_name = 'annotation'
+            AND r.project_id = link.project_id AND r.relation_name = 'annotated_with'
+            AND (NOT %s OR LEFT(a.name, %s) = %s)
         ORDER BY array_position(%s::bigint[], link.class_instance_a), link.id
     """, (project_id, project_id, neuron_ids,
-            len(SOURCE_FRAGMENT_ANNOTATION_PREFIX), SOURCE_FRAGMENT_ANNOTATION_PREFIX,
+            source_fragments_only, len(SOURCE_FRAGMENT_ANNOTATION_PREFIX),
+            SOURCE_FRAGMENT_ANNOTATION_PREFIX,
             neuron_ids))
     return dict(cursor.fetchall())
 
@@ -2612,6 +2616,7 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
     if from_treenode_id is None or to_treenode_id is None:
         raise ValueError('Missing arguments to _join_skeleton')
 
+    annotation_policy = get_skeleton_join_annotation_policy()
     response_on_error = ''
     try:
         from_treenode_id = int(from_treenode_id)
@@ -2732,45 +2737,21 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
             to_treenode_id: to_skid,
         }, {from_skid: from_neuron['neuronid'], to_skid: to_neuron['neuronid']}, cursor)
 
-        annotation_policy = getattr(settings, 'SKELETON_JOIN_ANNOTATION_POLICY', None)
         if annotation_policy is not None:
-            if isinstance(annotation_policy, str):
-                annotation_policy = import_string(annotation_policy)
             annotation_map = annotation_policy(int(project_id), from_neuron['neuronid'],
                     to_neuron['neuronid'], annotation_map)
-        source_annotations = _source_fragment_annotations(project_id,
-                [to_neuron['neuronid'], from_neuron['neuronid']], cursor)
 
-        explicit_annotations = annotation_map is not None
-        if not explicit_annotations:
-            # Get all current annotations of both skeletons and merge them for
-            # a complete result set.
-            from_annotation_info = get_annotation_info(project_id, (from_skid,),
-                    with_annotation_names=True, metaannotations=False, neuronnames=False)
-            to_annotation_info = get_annotation_info(project_id, (to_skid,),
-                    with_annotation_names=True, metaannotations=False, neuronnames=False)
-
-            # Create a new annotation map with the expected structure of
-            # 'annotationname' vs. 'annotator id'.
-            def merge_into_annotation_map(source, skid, target):
-                skeletons = source['skeletons']
-                if skeletons and skid in skeletons:
-                    for a in skeletons[skid]['annotations']:
-                        annotation = source['annotations'][a['id']]
-                        target[annotation] = a['uid']
-            # Merge from after to, so that it overrides entries from the merged
-            # in skeleton.
-            annotation_map = dict()
-            merge_into_annotation_map(to_annotation_info, to_skid, annotation_map)
-            merge_into_annotation_map(from_annotation_info, from_skid, annotation_map)
-
-        annotation_map = _retain_source_fragment_annotations(
-                annotation_map, source_annotations)
-        if explicit_annotations and not check_annotations_on_join(project_id, user,
-                from_neuron['neuronid'], to_neuron['neuronid'],
-                frozenset(annotation_map)):
-            raise ValueError("Annotation distribution is not valid for joining. "
-                    "Annotations for which you don't have permissions have to be kept!")
+        neuron_ids = [to_neuron['neuronid'], from_neuron['neuronid']]
+        if annotation_map is None:
+            annotation_map = _neuron_annotation_map(project_id, neuron_ids, cursor)
+        else:
+            source_annotations = _neuron_annotation_map(project_id, neuron_ids, cursor,
+                    source_fragments_only=True)
+            annotation_map = _retain_source_fragment_annotations(annotation_map, source_annotations)
+            if not check_annotations_on_join(project_id, user,
+                    from_neuron['neuronid'], to_neuron['neuronid'], frozenset(annotation_map)):
+                raise ValueError("Annotation distribution is not valid for joining. "
+                        "Annotations for which you don't have permissions have to be kept!")
 
         # Find oldest creation_time and edition_time
         winning_map = make_annotation_map(annotation_map, from_neuron['neuronid'])
@@ -2870,7 +2851,7 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
 
         return response
 
-    except ClientError:
+    except (ClientError, ImproperlyConfigured):
         raise
     except Exception as e:
         raise ValueError(response_on_error + ':' + str(e))

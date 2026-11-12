@@ -250,8 +250,8 @@ NODE_LIST_MAXIMUM_COUNT = 3500
 SKELETON_EDIT_LOCK_TIMEOUT_MS = 1000
 
 # Optional callable (or dotted path) taking the project, winning neuron ID,
-# losing neuron ID and explicit annotation map (or None). It returns the map
-# to use and may reject the join by raising a ClientError.
+# losing neuron ID and explicit annotation map (or None). Return the map to
+# apply, None to use the default union, or raise a ClientError to reject the join.
 SKELETON_JOIN_ANNOTATION_POLICY = None
 
 # Default importer tile width, tile height and tile source type

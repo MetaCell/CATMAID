@@ -8,7 +8,7 @@ from typing import Any, DefaultDict, Dict, FrozenSet, List, Optional, Set, Tuple
 
 from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404
-from django.db import connection
+from django.db import connection, transaction
 
 from rest_framework.decorators import api_view
 
@@ -836,12 +836,16 @@ def _annotate_entities(project_id:Union[int,str], entity_ids, annotation_map:Dic
     will add an incrementing number starting from X for each entity. Reserved
     source-fragment names remain literal. allow_reserved is only for trusted
     structural operations transferring server-derived provenance.
-    skeleton_targets maps requested skeleton IDs to the neurons they resolved
-    to before any provider locks were acquired.
+    skeleton_targets maps requested skeleton IDs to their initially resolved
+    neurons. The caller must hold a transaction open through the writes.
     """
-    # A provider can lock the neurons around this helper. Recheck the mapping
-    # here so a surviving neuron cannot stand in for a deleted skeleton.
     if skeleton_targets:
+        # Lock in the same order and mode as a join, then recheck the mappings.
+        # A neuron can survive the removal of one of its skeletons.
+        targets = ClassInstance.objects.filter(
+            project_id=project_id, pk__in=skeleton_targets.values(),
+        ).order_by('pk').select_for_update(no_key=True)
+        list(targets.values_list('pk', flat=True))
         current_targets = _skeleton_annotation_targets(project_id, skeleton_targets)
         for skeleton_id, neuron_id in skeleton_targets.items():
             if current_targets.get(skeleton_id) != neuron_id:
@@ -1032,6 +1036,7 @@ def _annotate_entities_with_name(project_id:Union[int,str], user_id, entity_ids)
     return updated_cis, created_name_links
 
 @requires_user_role(UserRole.Annotate)
+@transaction.atomic
 def annotate_entities(request:HttpRequest, project_id = None) -> JsonResponse:
     annotations = get_request_list(request.POST, 'annotations', [])
     meta_annotations = get_request_list(request.POST, 'meta_annotations', [])
@@ -1040,7 +1045,7 @@ def annotate_entities(request:HttpRequest, project_id = None) -> JsonResponse:
     skeleton_ids = get_request_list(request.POST, 'skeleton_ids', [], map_fn=int)
 
     skeleton_targets = {}
-    if any(skeleton_ids):
+    if skeleton_ids:
         skeleton_targets = _skeleton_annotation_targets(project_id, skeleton_ids)
         try:
             entity_ids += [skeleton_targets[skid] for skid in skeleton_ids]
