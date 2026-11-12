@@ -1,4 +1,4 @@
-"""NeuroGlass task labels and protection during skeleton joins and deletion."""
+"""NeuroGlass task labels and the locks that protect their skeletons."""
 
 import re
 
@@ -34,6 +34,28 @@ class TaskSkeletonDeletionConflict(ClientError):
 
 def is_task_annotation(annotation_name: str | None) -> bool:
     return bool(annotation_name and TASK_ANNOTATION.fullmatch(annotation_name))
+
+
+class TaskSkeletonAssociationConflict(ClientError):
+    status_code = 409
+
+
+def lock_task_annotation_targets(project_id, entity_ids) -> None:
+    """Serialize task label writes with joins and final-node deletion."""
+    entity_ids = sorted(set(map(int, entity_ids)))
+    if not entity_ids:
+        return
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            SELECT id FROM class_instance
+            WHERE project_id = %s AND id = ANY(%s::bigint[])
+            ORDER BY id FOR UPDATE
+        """, (project_id, entity_ids))
+        locked_ids = [row[0] for row in cursor.fetchall()]
+    if locked_ids != entity_ids:
+        raise TaskSkeletonAssociationConflict(
+            "The annotation target no longer exists. Please retry the association."
+        )
 
 
 def task_annotations_by_neuron(project_id, neuron_ids) -> dict[int, dict[str, int]]:

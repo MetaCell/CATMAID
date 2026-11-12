@@ -2,19 +2,23 @@
 
 from collections import defaultdict
 import dateutil.parser
+from contextlib import nullcontext
 import re
 
 from typing import Any, DefaultDict, Dict, FrozenSet, List, Optional, Set, Tuple, Union
 
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404
-from django.db import connection
+from django.db import connection, transaction
 
 from rest_framework.decorators import api_view
 
 from catmaid.models import UserRole, Project, Class, ClassInstance, \
         ClassInstanceClassInstance, Relation, ReviewerWhitelist
 from catmaid.control.authentication import requires_user_role, can_edit_or_fail
+from catmaid.neuroglass_tasks import (
+    TASK_ANNOTATION_NAMESPACE, is_task_annotation, lock_task_annotation_targets,
+)
 from catmaid.source_fragments import (
     SOURCE_FRAGMENT_ANNOTATION_PREFIX, is_source_fragment_annotation_name,
     reject_reserved_annotation_names, reject_reserved_annotations,
@@ -817,6 +821,18 @@ def _annotate_entities(project_id:Union[int,str], entity_ids, annotation_map:Dic
     source-fragment names remain literal. allow_reserved is only for trusted
     structural operations transferring server-derived provenance.
     """
+    # Numbered templates can expand into task labels during the write.
+    lock_targets = any(TASK_ANNOTATION_NAMESPACE.match(name) for name in annotation_map)
+    with transaction.atomic() if lock_targets else nullcontext():
+        if lock_targets:
+            entity_ids = list(entity_ids)
+            lock_task_annotation_targets(project_id, entity_ids)
+        return _add_annotation_links(project_id, entity_ids, annotation_map,
+                update_existing, allow_reserved)
+
+
+def _add_annotation_links(project_id:Union[int,str], entity_ids, annotation_map:Dict[str,Any],
+        update_existing=False, allow_reserved=False) -> Tuple[Dict,Set,Set]:
     # Annotations can also be targets of meta-annotations. Check both names and
     # target objects so ordinary editing cannot alter the reserved source records.
     if not allow_reserved:
@@ -1178,6 +1194,7 @@ def remove_annotation(request:HttpRequest, project_id=None, annotation_id=None) 
         'left_uses': num_left
     })
 
+@transaction.atomic
 def _remove_annotation(user, project_id:Union[int,str], entity_ids, annotation_id) -> Tuple[List, List, int, int]:
     """Remove an annotation made by a certain user in a given project on a set
     of entities (usually neurons and annotations). Returned is a 4-tuple which
@@ -1186,6 +1203,17 @@ def _remove_annotation(user, project_id:Union[int,str], entity_ids, annotation_i
     (because it wasn't used anymore) and how many uses of this annotation are
     left.
     """
+    annotation_name = ClassInstance.objects.filter(
+        project_id=project_id, pk=annotation_id,
+    ).values_list('name', flat=True).first()
+    if is_task_annotation(annotation_name):
+        entity_ids = list(entity_ids)
+        lock_task_annotation_targets(project_id, entity_ids)
+    return _remove_annotation_links(user, project_id, entity_ids, annotation_id)
+
+
+def _remove_annotation_links(user, project_id:Union[int,str], entity_ids,
+        annotation_id) -> Tuple[List, List, int, int]:
     reject_reserved_annotations(project_id, [annotation_id])
     reject_reserved_annotations(project_id, entity_ids)
     p = get_object_or_404(Project, pk=project_id)
