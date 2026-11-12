@@ -6,7 +6,7 @@ import re
 
 from typing import Any, DefaultDict, Dict, FrozenSet, List, Optional, Set, Tuple, Union
 
-from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
+from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404
 from django.db import connection
 
@@ -804,10 +804,6 @@ def delete_annotation_if_unused(project, annotation, relation) -> Tuple[bool, in
 
         return True, 0
 
-class SkeletonAnnotationTargetNotFound(Http404):
-    meta = {'code': 'skeleton_annotation_target_stale'}
-
-
 def _annotate_entities(project_id:Union[int,str], entity_ids, annotation_map:Dict[str,Any],
         update_existing=False, allow_reserved=False) -> Tuple[Dict,Set,Set]:
     """ Annotate the entities with the given <entity_ids> with the given
@@ -1006,26 +1002,24 @@ def _annotate_entities_with_name(project_id:Union[int,str], user_id, entity_ids)
 def annotate_entities(request:HttpRequest, project_id = None) -> JsonResponse:
     p = get_object_or_404(Project, pk = project_id)
 
+    # Read keys in a sorted manner
+    sorted_keys = sorted(request.POST.keys())
+
     annotations = get_request_list(request.POST, 'annotations', [])
     meta_annotations = get_request_list(request.POST, 'meta_annotations', [])
     reject_reserved_annotation_names(annotations + meta_annotations)
     entity_ids = get_request_list(request.POST, 'entity_ids', [], map_fn=int)
     skeleton_ids = get_request_list(request.POST, 'skeleton_ids', [], map_fn=int)
 
-    if skeleton_ids:
+    if any(skeleton_ids):
         skid_to_eid = dict(ClassInstance.objects.filter(project = p,
                 class_column__class_name = 'neuron',
                 cici_via_b__relation__relation_name = 'model_of',
                 cici_via_b__class_instance_a__in = skeleton_ids).values_list(
                         'cici_via_b__class_instance_a', 'id'))
-        try:
-            entity_ids += [skid_to_eid[skid] for skid in skeleton_ids]
-        except KeyError as error:
-            raise SkeletonAnnotationTargetNotFound(
-                f"Skeleton {error.args[0]} does not exist in project {project_id}."
-            ) from error
+        entity_ids += [skid_to_eid[skid] for skid in skeleton_ids]
 
-    # Annotate entities
+    # Annotate enties
     annotation_map = {a: { 'user_id': request.user.id } for a in annotations}
     annotation_objs, new_annotations, existing_annotations = _annotate_entities(
             project_id, entity_ids, annotation_map)

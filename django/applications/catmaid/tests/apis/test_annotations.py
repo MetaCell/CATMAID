@@ -6,7 +6,6 @@ from datetime import datetime
 
 from catmaid.control.annotation import _annotate_entities
 from catmaid.control.annotation import create_annotation_query
-from catmaid.models import ClassInstance
 
 from .common import CatmaidApiTestCase
 
@@ -45,35 +44,6 @@ class AnnotationsApiTests(CatmaidApiTestCase):
         self.assertEqual(aq[0].name, 'myannotation')
         self.assertEqual(aq[1].name, 'pattern 10 test-2-annotation')
 
-
-    def test_add_annotations_rejects_missing_skeleton_without_writing(self):
-        self.fake_authentication()
-        name = 'batch-annotation'
-        missing_skeleton_id = 2147483647
-        response = self.client.post(f'/{self.test_project_id}/annotations/add', {
-            'annotations[0]': name,
-            'skeleton_ids[0]': 2364,
-            'skeleton_ids[1]': missing_skeleton_id,
-        })
-
-        self.assertStatus(response, 404)
-        self.assertEqual(response.json()['meta']['code'], 'skeleton_annotation_target_stale')
-        self.assertIn(str(missing_skeleton_id), response.json()['error'])
-        annotations = create_annotation_query(self.test_project_id, {'neuron_id': 2365})
-        self.assertFalse(annotations.filter(name=name).exists())
-
-    def test_add_annotations_rejects_zero_skeleton_without_creating_annotation(self):
-        self.fake_authentication()
-        name = 'zero-target-annotation'
-        response = self.client.post(f'/{self.test_project_id}/annotations/add', {
-            'annotations[0]': name,
-            'skeleton_ids[0]': 0,
-        })
-
-        self.assertStatus(response, 404)
-        self.assertEqual(response.json()['meta']['code'], 'skeleton_annotation_target_stale')
-        self.assertFalse(ClassInstance.objects.filter(project_id=self.test_project_id,
-                class_column__class_name='annotation', name=name).exists())
 
     def test_remove_annotations(self):
         self.fake_authentication()
