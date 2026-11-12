@@ -360,9 +360,6 @@ class CATMAIDConfig(AppConfig):
                     raise ImproperlyConfigured(f"Please make sure settings field {field} "
                             f"is of one of the types {allowed_types} (current type: {current_type})")
 
-        from catmaid.conf.settings import get_skeleton_join_annotation_policy
-        get_skeleton_join_annotation_policy()
-
         # Make sure swagger (API doc) knows about a potential sub-directory
         if not hasattr(settings, 'SWAGGER_SETTINGS'):
             settings.SWAGGER_SETTINGS = {}

@@ -10,8 +10,6 @@ from unittest.mock import patch
 
 import networkx as nx
 
-from django.apps import apps
-from django.core.exceptions import ImproperlyConfigured
 from django.db import close_old_connections, connections, transaction
 from django.db.models import F
 from django.test import override_settings
@@ -23,12 +21,14 @@ from catmaid.control.skeleton import (
     _get_neuronname_from_skeletonid, _import_skeleton, _join_skeleton,
     _lock_source_fragment_neurons,
 )
-from catmaid.error import ClientError
 from catmaid.models import ClassInstance, ClassInstanceClassInstance, Treenode, User
 from catmaid.source_fragments import SOURCE_FRAGMENT_ANNOTATION_PREFIX
 from catmaid.state import make_nocheck_state
 
 from .common import CatmaidApiTestCase, CatmaidApiTransactionTestCase
+
+
+TASK_LABEL = 'neuroglass:study:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:task:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
 
 
 class SourceFragmentFixtures:
@@ -153,90 +153,63 @@ class SourceFragmentSkeletonTests(SourceFragmentFixtures, CatmaidApiTestCase):
         self.assertEqual(ClassInstance.objects.get(pk=stable_winner.neuron).name,
                 stable_winner.name)
 
-    def test_join_policy_observes_stable_swap_and_can_reject_before_edits(self):
+    def test_join_blocks_task_linked_loser_after_stable_swap(self):
         requested_winner = self.fragment('Requested', ['A'])
         stable_winner = self.fragment('Stable', ['B'])
+        _annotate_entities(self.test_project_id, [requested_winner.neuron],
+                {TASK_LABEL: {'user_id': self.test_user_id}})
         _annotate_entities(self.test_project_id, [stable_winner.neuron],
                 {'stable': {'user_id': self.test_user_id}})
 
-        class JoinConflict(ClientError):
-            status_code = 409
-            meta = {'code': 'test_join_conflict'}
-
-        def policy(project_id, winning_neuron_id, losing_neuron_id, annotation_map):
-            self.assertTrue(transaction.get_connection().in_atomic_block)
-            self.assertEqual(project_id, self.test_project_id)
-            self.assertEqual(winning_neuron_id, stable_winner.neuron)
-            self.assertEqual(losing_neuron_id, requested_winner.neuron)
-            self.assertIsNone(annotation_map)
-            raise JoinConflict('Rejected by join policy')
-
-        with override_settings(SKELETON_JOIN_ANNOTATION_POLICY=policy):
-            response = self.join(requested_winner, stable_winner, omit_map=True)
+        response = self.join(requested_winner, stable_winner, omit_map=True)
         self.assertStatus(response, 409)
-        self.assertEqual(response.json()['meta'], {'code': 'test_join_conflict'})
+        self.assertEqual(response.json()['meta'], {'code': 'task_skeleton_merge_blocked'})
         for fragment in (requested_winner, stable_winner):
             self.assertTrue(ClassInstance.objects.filter(pk=fragment.skeleton).exists())
             for index, node_id in enumerate(fragment.nodes):
                 parent = fragment.nodes[index - 1] if index else None
                 self.assertTreenodeHasProperties(node_id, parent, fragment.skeleton)
 
-    def test_join_policy_can_retain_a_surviving_annotation(self):
+    def test_join_keeps_stored_task_links_and_ignores_submitted_task_templates(self):
         winner = self.fragment('A', ['A'])
         loser = self.fragment('B', ['B'])
         _annotate_entities(self.test_project_id, [winner.neuron],
-                {'retained': {'user_id': self.test_user_id}})
-        with patch(
-                __name__ + '.retain_join_annotations',
-                create=True, return_value={'retained': self.test_user_id}) as policy:
-            with override_settings(SKELETON_JOIN_ANNOTATION_POLICY=__name__ + '.retain_join_annotations'):
-                response = self.join(winner, loser)
+                {TASK_LABEL: {'user_id': self.test_user_id}})
+        task_template = TASK_LABEL[:-1] + '{n}'
+        forged_task = TASK_LABEL[:-1] + '1'
+
+        response = self.join(winner, loser, {task_template: self.test_user_id})
         self.assertStatus(response)
-        policy.assert_called_once_with(self.test_project_id, winner.neuron, loser.neuron, {})
         self.assertEqual(response.json()['result_skeleton_id'], winner.skeleton)
-        self.assertIn('retained', annotations_for_skeleton(self.test_project_id, winner.skeleton))
+        annotations = annotations_for_skeleton(self.test_project_id, winner.skeleton)
+        self.assertIn(TASK_LABEL, annotations)
+        self.assertNotIn(forged_task, annotations)
         self.assert_sources(winner.neuron, ['A', 'B'])
 
-    def test_join_policy_configuration_rejects_invalid_settings(self):
-        winner = self.fragment('Winner', [])
-        loser = self.fragment('Loser', [])
-        invalid_policies = (
-            False,
-            __name__ + '.missing_join_policy',
-            __name__ + '.SOURCE_FRAGMENT_ANNOTATION_PREFIX',
-        )
-        for policy in invalid_policies:
-            with self.subTest(policy=policy), override_settings(SKELETON_JOIN_ANNOTATION_POLICY=policy):
-                with self.assertRaisesRegex(ImproperlyConfigured, 'SKELETON_JOIN_ANNOTATION_POLICY'):
-                    apps.get_app_config('catmaid').validate_configuration()
-                response = self.join(winner, loser)
-                self.assertStatus(response, 500)
-                self.assertEqual(response.json()['type'], 'ImproperlyConfigured')
-
-    def test_join_policy_receives_normalized_annotation_selections(self):
+    def test_join_normalizes_explicit_annotation_selections(self):
         cases = (
-            ('', {}),
-            ('[]', {}),
-            (json.dumps([['retained', self.test_user_id]]), {'retained': self.test_user_id}),
+            ('', set()),
+            ('[]', set()),
+            (json.dumps([['retained', self.test_user_id]]), {'retained'}),
         )
         for annotation_set, expected in cases:
             with self.subTest(annotation_set=annotation_set):
-                winner = self.fragment('A', ['A'])
-                loser = self.fragment('B', ['B'])
-
-                def policy(project_id, winning_neuron_id, losing_neuron_id, annotation_map):
-                    self.assertEqual(annotation_map, expected)
-                    return annotation_map
-
-                with override_settings(SKELETON_JOIN_ANNOTATION_POLICY=policy):
-                    response = self.client.post(f'/{self.test_project_id}/skeleton/join', {
-                        'from_id': winner.nodes[0],
-                        'to_id': loser.nodes[0],
-                        'annotation_set': annotation_set,
-                    })
+                winner = self.fragment('A', [])
+                loser = self.fragment('B', [])
+                _annotate_entities(self.test_project_id, [winner.neuron], {
+                    'retained': {'user_id': self.test_user_id},
+                    'omitted': {'user_id': self.test_user_id},
+                })
+                response = self.client.post(f'/{self.test_project_id}/skeleton/join', {
+                    'from_id': winner.nodes[0],
+                    'to_id': loser.nodes[0],
+                    'annotation_set': annotation_set,
+                })
 
                 self.assertStatus(response)
                 self.assertEqual(response.json()['result_skeleton_id'], winner.skeleton)
+                annotations = annotations_for_skeleton(self.test_project_id, winner.skeleton)
+                self.assertEqual(set(annotations), expected)
 
     def test_split_copies_all_identifiers_even_with_empty_downstream_map(self):
         original = self.fragment('Original visible label', ['0001', 'part{n}', 'A,B'])

@@ -27,10 +27,10 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from catmaid.conf.settings import get_skeleton_join_annotation_policy
 from catmaid.error import ClientError
 from catmaid.history import add_log_entry
 from catmaid.locks import NeuronLockTimeout, lock_skeleton_neurons
+from catmaid.neuroglass_tasks import protect_task_annotations_on_join
 from catmaid.source_fragments import (
     SOURCE_FRAGMENT_ANNOTATION_PREFIX, is_source_fragment_annotation_name,
     reject_reserved_annotation_names)
@@ -2585,7 +2585,6 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
     if from_treenode_id is None or to_treenode_id is None:
         raise ValueError('Missing arguments to _join_skeleton')
 
-    annotation_policy = get_skeleton_join_annotation_policy()
     response_on_error = ''
     try:
         from_treenode_id = int(from_treenode_id)
@@ -2706,9 +2705,8 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
             to_treenode_id: to_skid,
         }, {from_skid: from_neuron['neuronid'], to_skid: to_neuron['neuronid']}, cursor)
 
-        if annotation_policy is not None:
-            annotation_map = annotation_policy(int(project_id), from_neuron['neuronid'],
-                    to_neuron['neuronid'], annotation_map)
+        annotation_map = protect_task_annotations_on_join(project_id, from_neuron['neuronid'],
+                to_neuron['neuronid'], annotation_map)
 
         neuron_ids = [to_neuron['neuronid'], from_neuron['neuronid']]
         if annotation_map is None:

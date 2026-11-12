@@ -80,4 +80,4 @@ django/projects/mysite/ingestion_settings.py:60: error: List item 0 has incompat
 django/projects/mysite/ingestion_settings.py:64: error: Incompatible types in assignment (expression has type "tuple[str, ...]", variable has type "tuple[str, str, str, str, str, str, str, str, str, str, str, str, str, str, str, str, str, str, str, str, str, str]")  [assignment]
 django/applications/catmaid/control/node.py:16: error: Library stubs not installed for "ujson"  [import-untyped]
 django/applications/catmaid/control/node.py:16: note: Hint: "python3 -m pip install types-ujson"
-Found 67 errors in 40 files (checked 349 source files)
+Found 67 errors in 40 files (checked 350 source files)
