@@ -4,6 +4,8 @@ from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.db import OperationalError, transaction
 
+from catmaid.error import ClientError
+
 
 # The base lock is formed from the multiplication of all characters of "catmaid"
 # as ASCII: 99 * 97 * 116 * 109 * 97 * 105 * 100.
@@ -15,8 +17,11 @@ spatial_update_event_lock = base_lock_id + 1
 history_update_event_lock = base_lock_id + 2
 
 
-class SkeletonEditLockTimeout(Exception):
+class SkeletonEditLockTimeout(ClientError):
     """The wait for a skeleton edit lock timed out."""
+
+    status_code = 409
+    meta = {"code": "edit_lock_timeout"}
 
 
 @contextmanager
@@ -42,5 +47,5 @@ def skeleton_edit_lock_timeout(cursor):
     except OperationalError as error:
         cause = error.__cause__
         if (getattr(cause, 'sqlstate', None) or getattr(cause, 'pgcode', None)) == '55P03':
-            raise SkeletonEditLockTimeout from error
+            raise SkeletonEditLockTimeout("The target is being edited. Please retry.") from error
         raise

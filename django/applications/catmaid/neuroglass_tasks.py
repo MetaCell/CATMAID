@@ -5,7 +5,7 @@ import re
 from django.db import connection
 
 from catmaid.error import ClientError
-from catmaid.locks import SkeletonEditLockTimeout, skeleton_edit_lock_timeout
+from catmaid.locks import skeleton_edit_lock_timeout
 
 
 PUBLIC_ID_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
@@ -41,28 +41,18 @@ class TaskSkeletonAssociationConflict(ClientError):
     status_code = 409
 
 
-class TaskAnnotationTargetBusy(ClientError):
-    status_code = 409
-    meta = {"code": "skeleton_annotation_target_busy"}
-
-
 def lock_task_annotation_targets(project_id, entity_ids) -> None:
     """Serialize task label writes with joins and final-node deletion."""
     entity_ids = sorted(set(map(int, entity_ids)))
     if not entity_ids:
         return
-    try:
-        with connection.cursor() as cursor, skeleton_edit_lock_timeout(cursor):
-            cursor.execute("""
-                SELECT id FROM class_instance
-                WHERE project_id = %s AND id = ANY(%s::bigint[])
-                ORDER BY id FOR UPDATE
-            """, (project_id, entity_ids))
-            locked_ids = [row[0] for row in cursor.fetchall()]
-    except SkeletonEditLockTimeout as error:
-        raise TaskAnnotationTargetBusy(
-            "An annotation target is being edited. Please retry."
-        ) from error
+    with connection.cursor() as cursor, skeleton_edit_lock_timeout(cursor):
+        cursor.execute("""
+            SELECT id FROM class_instance
+            WHERE project_id = %s AND id = ANY(%s::bigint[])
+            ORDER BY id FOR UPDATE
+        """, (project_id, entity_ids))
+        locked_ids = [row[0] for row in cursor.fetchall()]
     if locked_ids != entity_ids:
         raise TaskSkeletonAssociationConflict(
             "The annotation target no longer exists. Please retry the association."

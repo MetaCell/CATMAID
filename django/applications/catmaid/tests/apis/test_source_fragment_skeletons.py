@@ -540,7 +540,7 @@ class SourceFragmentTransactionTests(SourceFragmentFixtures, CatmaidApiTransacti
             for url, data in ((add_url, add), (remove_url, remove)):
                 response = self.client.post(url, data)
                 self.assertStatus(response, 409)
-                self.assertEqual(response.json()['meta'], {'code': 'skeleton_annotation_target_busy'})
+                self.assertEqual(response.json()['meta'], {'code': 'edit_lock_timeout'})
                 self.assertIn('Please retry', response.json()['error'])
 
             current = annotations_for_skeleton(self.test_project_id, winner.skeleton)
