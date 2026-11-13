@@ -28,6 +28,9 @@ from catmaid.state import make_nocheck_state
 from .common import CatmaidApiTestCase, CatmaidApiTransactionTestCase
 
 
+TASK_LABEL = 'neuroglass:study:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:task:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+
+
 class SourceFragmentFixtures:
     def setUp(self):
         super().setUp()
@@ -111,6 +114,32 @@ class SourceFragmentSkeletonTests(SourceFragmentFixtures, CatmaidApiTestCase):
                 for entity in response.json()['entities']],
                 [(winner.neuron, 'A', [winner.skeleton])])
 
+    def test_default_join_unions_annotations_with_winner_annotator_precedence(self):
+        winner = self.fragment('Winner', ['A'])
+        loser = self.fragment('Loser', ['B'])
+        other_user_id = User.objects.get(username='test1').id
+        _annotate_entities(self.test_project_id, [winner.neuron], {
+            'shared': {'user_id': self.test_user_id},
+            'winner-only': {'user_id': self.test_user_id},
+        })
+        _annotate_entities(self.test_project_id, [loser.neuron], {
+            'shared': {'user_id': other_user_id},
+            'loser-only': {'user_id': other_user_id},
+        })
+
+        self.assertStatus(self.join(winner, loser, omit_map=True))
+        annotations = dict(ClassInstanceClassInstance.objects.filter(
+            project_id=self.test_project_id, class_instance_a_id=winner.neuron,
+            relation__relation_name='annotated_with',
+        ).values_list('class_instance_b__name', 'user_id'))
+        self.assertEqual(annotations, {
+            'shared': self.test_user_id,
+            'winner-only': self.test_user_id,
+            'loser-only': other_user_id,
+            SOURCE_FRAGMENT_ANNOTATION_PREFIX + 'A': self.test_user_id,
+            SOURCE_FRAGMENT_ANNOTATION_PREFIX + 'B': self.test_user_id,
+        })
+
     def test_stable_partner_is_actual_named_winner(self):
         requested_winner = self.fragment('Requested', ['A'])
         stable_winner = self.fragment('Stable visible label', ['B'])
@@ -123,6 +152,89 @@ class SourceFragmentSkeletonTests(SourceFragmentFixtures, CatmaidApiTestCase):
         self.assert_sources(stable_winner.neuron, ['A', 'B'])
         self.assertEqual(ClassInstance.objects.get(pk=stable_winner.neuron).name,
                 stable_winner.name)
+
+    def test_join_blocks_task_linked_loser_after_stable_swap(self):
+        requested_winner = self.fragment('Requested', ['A'])
+        stable_winner = self.fragment('Stable', ['B'])
+        _annotate_entities(self.test_project_id, [requested_winner.neuron],
+                {TASK_LABEL: {'user_id': self.test_user_id}})
+        _annotate_entities(self.test_project_id, [stable_winner.neuron],
+                {'stable': {'user_id': self.test_user_id}})
+
+        response = self.join(requested_winner, stable_winner, omit_map=True)
+        self.assertStatus(response, 409)
+        self.assertEqual(response.json()['meta'], {'code': 'task_skeleton_merge_blocked'})
+        for fragment in (requested_winner, stable_winner):
+            self.assertTrue(ClassInstance.objects.filter(pk=fragment.skeleton).exists())
+            for index, node_id in enumerate(fragment.nodes):
+                parent = fragment.nodes[index - 1] if index else None
+                self.assertTreenodeHasProperties(node_id, parent, fragment.skeleton)
+
+    def test_join_keeps_stored_task_links_and_ignores_submitted_task_templates(self):
+        winner = self.fragment('A', ['A'])
+        loser = self.fragment('B', ['B'])
+        _annotate_entities(self.test_project_id, [winner.neuron],
+                {TASK_LABEL: {'user_id': self.test_user_id}})
+        task_template = TASK_LABEL[:-1] + '{n}'
+        forged_task = TASK_LABEL[:-1] + '1'
+
+        response = self.join(winner, loser, {task_template: self.test_user_id})
+        self.assertStatus(response)
+        self.assertEqual(response.json()['result_skeleton_id'], winner.skeleton)
+        annotations = annotations_for_skeleton(self.test_project_id, winner.skeleton)
+        self.assertIn(TASK_LABEL, annotations)
+        self.assertNotIn(forged_task, annotations)
+        self.assert_sources(winner.neuron, ['A', 'B'])
+
+    def test_delete_blocks_the_final_treenode_of_a_task_linked_skeleton(self):
+        fragment = self.fragment('Linked', ['A'])
+        task_annotations, _, _ = _annotate_entities(self.test_project_id,
+                [fragment.neuron], {TASK_LABEL: {'user_id': self.test_user_id}})
+        task_annotation, = task_annotations
+        delete_url = f'/{self.test_project_id}/treenode/delete'
+
+        for node_id in reversed(fragment.nodes[1:]):
+            self.assertStatus(self.client.post(delete_url, {
+                'treenode_id': node_id, 'state': make_nocheck_state(),
+            }))
+
+        root = {'treenode_id': fragment.nodes[0], 'state': make_nocheck_state()}
+        response = self.client.post(delete_url, root)
+        self.assertStatus(response, 409)
+        self.assertEqual(response.json()['meta'], {'code': 'task_skeleton_final_node'})
+        self.assertTreenodeHasProperties(fragment.nodes[0], None, fragment.skeleton)
+        self.assertIn(TASK_LABEL, annotations_for_skeleton(self.test_project_id, fragment.skeleton))
+
+        self.assertStatus(self.client.post(f'/{self.test_project_id}/annotations/remove', {
+            'entity_ids[0]': fragment.neuron, 'annotation_ids[0]': task_annotation.id,
+        }))
+        self.assertStatus(self.client.post(delete_url, root))
+        self.assertFalse(ClassInstance.objects.filter(pk=fragment.skeleton).exists())
+
+    def test_join_normalizes_explicit_annotation_selections(self):
+        cases = (
+            ('', set()),
+            ('[]', set()),
+            (json.dumps([['retained', self.test_user_id]]), {'retained'}),
+        )
+        for annotation_set, expected in cases:
+            with self.subTest(annotation_set=annotation_set):
+                winner = self.fragment('A', [])
+                loser = self.fragment('B', [])
+                _annotate_entities(self.test_project_id, [winner.neuron], {
+                    'retained': {'user_id': self.test_user_id},
+                    'omitted': {'user_id': self.test_user_id},
+                })
+                response = self.client.post(f'/{self.test_project_id}/skeleton/join', {
+                    'from_id': winner.nodes[0],
+                    'to_id': loser.nodes[0],
+                    'annotation_set': annotation_set,
+                })
+
+                self.assertStatus(response)
+                self.assertEqual(response.json()['result_skeleton_id'], winner.skeleton)
+                annotations = annotations_for_skeleton(self.test_project_id, winner.skeleton)
+                self.assertEqual(set(annotations), expected)
 
     def test_split_copies_all_identifiers_even_with_empty_downstream_map(self):
         original = self.fragment('Original visible label', ['0001', 'part{n}', 'A,B'])
@@ -324,8 +436,11 @@ class SourceFragmentTransactionTests(SourceFragmentFixtures, CatmaidApiTransacti
         new_neuron = _get_neuronname_from_skeletonid(self.test_project_id, new_skeleton)['neuronid']
         self.assert_sources(winner.neuron, ['A', 'B'])
         self.assert_sources(new_neuron, ['A', 'B'])
-        crossing = Treenode.objects.filter(skeleton_id__in=[winner.skeleton, new_skeleton]
-                ).exclude(parent__isnull=True).exclude(parent__skeleton_id=F('skeleton_id'))
+        crossing = (
+            Treenode.objects.filter(skeleton_id__in=[winner.skeleton, new_skeleton])
+            .exclude(parent__isnull=True)
+            .exclude(parent__skeleton_id=F('skeleton_id'))
+        )
         self.assertFalse(crossing.exists())
 
     @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
@@ -408,6 +523,71 @@ class SourceFragmentTransactionTests(SourceFragmentFixtures, CatmaidApiTransacti
                         finally:
                             probe.close()
 
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=75)
+    def test_task_annotation_writes_time_out_during_join_and_succeed_on_retry(self):
+        winner = self.fragment('A', [])
+        loser = self.fragment('B', [])
+        annotations, _, _ = _annotate_entities(self.test_project_id, [winner.neuron],
+                {TASK_LABEL: {'user_id': self.test_user_id}})
+        stored_annotation, = annotations
+        new_label = TASK_LABEL[:-1] + 'c'
+        add_url = f'/{self.test_project_id}/annotations/add'
+        remove_url = f'/{self.test_project_id}/annotations/remove'
+        add = {'annotations[0]': new_label, 'skeleton_ids[0]': winner.skeleton}
+        remove = {'annotation_ids[0]': stored_annotation.id, 'entity_ids[0]': winner.neuron}
+
+        with self.paused_join(winner, loser):
+            for url, data in ((add_url, add), (remove_url, remove)):
+                response = self.client.post(url, data)
+                self.assertStatus(response, 409)
+                self.assertEqual(response.json()['meta'], {'code': 'edit_lock_timeout'})
+                self.assertIn('Please retry', response.json()['error'])
+
+            current = annotations_for_skeleton(self.test_project_id, winner.skeleton)
+            self.assertIn(TASK_LABEL, current)
+            self.assertNotIn(new_label, current)
+
+        self.assertStatus(self.client.post(add_url, add))
+        self.assertStatus(self.client.post(remove_url, remove))
+        current = annotations_for_skeleton(self.test_project_id, winner.skeleton)
+        self.assertIn(new_label, current)
+        self.assertNotIn(TASK_LABEL, current)
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=75)
+    def test_final_node_delete_times_out_on_either_lock_and_can_be_retried(self):
+        url = f'/{self.test_project_id}/treenode/delete'
+        for table in ('treenode', 'class_instance'):
+            with self.subTest(locked_table=table):
+                fragment = self.fragment('Delete under contention', [])
+                for node_id in reversed(fragment.nodes[1:]):
+                    self.assertStatus(self.client.post(url, {
+                        'treenode_id': node_id, 'state': make_nocheck_state(),
+                    }))
+                root = {'treenode_id': fragment.nodes[0], 'state': make_nocheck_state()}
+                locked_id = fragment.nodes[0] if table == 'treenode' else fragment.neuron
+
+                holder = connections['default'].copy(alias='delete_lock_holder')
+                try:
+                    holder.set_autocommit(False)
+                    with holder.cursor() as cursor:
+                        cursor.execute(f'SELECT id FROM {table} WHERE id = %s FOR UPDATE',
+                                [locked_id])
+
+                    # A longer fallback keeps a regression from hanging the test.
+                    with transaction.atomic(), connections['default'].cursor() as cursor:
+                        cursor.execute("SELECT set_config('lock_timeout', '400ms', true)")
+                        response = self.client.post(url, root)
+                        self.assertStatus(response, 409)
+                        self.assertEqual(response.json()['meta'], {'code': 'edit_lock_timeout'})
+                        self.assertTreenodeHasProperties(fragment.nodes[0], None, fragment.skeleton)
+                        cursor.execute("SELECT setting::integer FROM pg_settings WHERE name='lock_timeout'")
+                        self.assertEqual(cursor.fetchone()[0], 400)
+                finally:
+                    holder.close()
+
+                self.assertStatus(self.client.post(url, root))
+                self.assertFalse(ClassInstance.objects.filter(pk=fragment.skeleton).exists())
+
     def test_successful_lock_restores_database_timeout(self):
         fragment = self.fragment('Uncontended', [])
         with transaction.atomic(), connections['default'].cursor() as cursor:
@@ -448,10 +628,12 @@ class SourceFragmentTransactionTests(SourceFragmentFixtures, CatmaidApiTransacti
         new_neuron = _get_neuronname_from_skeletonid(self.test_project_id, new_skeleton)
         self.assert_sources(winner.neuron, ['A', 'B'])
         self.assert_sources(new_neuron['neuronid'], ['A', 'B'])
-        crossing_parents = Treenode.objects.filter(
-                project_id=self.test_project_id,
-                skeleton_id__in=[winner.skeleton, new_skeleton]
-            ).exclude(parent__isnull=True).exclude(parent__skeleton_id=F('skeleton_id'))
+        crossing_parents = (
+            Treenode.objects.filter(project_id=self.test_project_id,
+                    skeleton_id__in=[winner.skeleton, new_skeleton])
+            .exclude(parent__isnull=True)
+            .exclude(parent__skeleton_id=F('skeleton_id'))
+        )
         self.assertFalse(crossing_parents.exists())
 
 
