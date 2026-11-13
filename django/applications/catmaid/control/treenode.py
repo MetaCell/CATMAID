@@ -645,9 +645,11 @@ def delete_treenode(request:HttpRequest, project_id=None) -> JsonResponse:
     # Raise an Exception if the user doesn't have permission to edit the neuron
     # the skeleton of the treenode is modeling.
     can_edit_treenode_or_fail(request.user, project_id, treenode_id)
-    # Make sure the back-end is in the expected state
-    state.validate_state(treenode_id, request.POST.get('state'), lock=True,
-            neighborhood=True)
+    # Bound the treenode lock wait as well as the later neuron lock wait.
+    cursor = connection.cursor()
+    with skeleton_edit_lock_timeout(cursor):
+        state.validate_state(treenode_id, request.POST.get('state'), lock=True,
+                neighborhood=True, cursor=cursor)
 
     treenode = Treenode.objects.get(pk=treenode_id)
     parent_id = treenode.parent_id
@@ -660,7 +662,6 @@ def delete_treenode(request:HttpRequest, project_id=None) -> JsonResponse:
     # Prevent deletion if node is referenced from sampler or sampler domain. The
     # deletion would fail regardless, but this way we can provide a nicer error
     # message.
-    cursor = connection.cursor()
     cursor.execute("""
         SELECT
             EXISTS(
@@ -690,7 +691,6 @@ def delete_treenode(request:HttpRequest, project_id=None) -> JsonResponse:
 
     response_on_error = ''
     deleted_neuron = False
-    cursor = connection.cursor()
     try:
         if not parent_id:
             children:List = []

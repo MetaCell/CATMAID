@@ -554,36 +554,39 @@ class SourceFragmentTransactionTests(SourceFragmentFixtures, CatmaidApiTransacti
         self.assertNotIn(TASK_LABEL, current)
 
     @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=75)
-    def test_final_node_delete_times_out_on_neuron_lock_and_can_be_retried(self):
-        fragment = self.fragment('Delete under contention', [])
+    def test_final_node_delete_times_out_on_either_lock_and_can_be_retried(self):
         url = f'/{self.test_project_id}/treenode/delete'
-        for node_id in reversed(fragment.nodes[1:]):
-            self.assertStatus(self.client.post(url, {
-                'treenode_id': node_id, 'state': make_nocheck_state(),
-            }))
-        root = {'treenode_id': fragment.nodes[0], 'state': make_nocheck_state()}
+        for table in ('treenode', 'class_instance'):
+            with self.subTest(locked_table=table):
+                fragment = self.fragment('Delete under contention', [])
+                for node_id in reversed(fragment.nodes[1:]):
+                    self.assertStatus(self.client.post(url, {
+                        'treenode_id': node_id, 'state': make_nocheck_state(),
+                    }))
+                root = {'treenode_id': fragment.nodes[0], 'state': make_nocheck_state()}
+                locked_id = fragment.nodes[0] if table == 'treenode' else fragment.neuron
 
-        holder = connections['default'].copy(alias='neuron_lock_holder')
-        try:
-            holder.set_autocommit(False)
-            with holder.cursor() as cursor:
-                cursor.execute('SELECT id FROM class_instance WHERE id = %s FOR UPDATE',
-                        [fragment.neuron])
+                holder = connections['default'].copy(alias='delete_lock_holder')
+                try:
+                    holder.set_autocommit(False)
+                    with holder.cursor() as cursor:
+                        cursor.execute(f'SELECT id FROM {table} WHERE id = %s FOR UPDATE',
+                                [locked_id])
 
-            # A longer fallback keeps a regression from hanging the test.
-            with transaction.atomic(), connections['default'].cursor() as cursor:
-                cursor.execute("SELECT set_config('lock_timeout', '400ms', true)")
-                response = self.client.post(url, root)
-                self.assertStatus(response, 409)
-                self.assertEqual(response.json()['meta'], {'code': 'edit_lock_timeout'})
-                self.assertTreenodeHasProperties(fragment.nodes[0], None, fragment.skeleton)
-                cursor.execute("SELECT setting::integer FROM pg_settings WHERE name='lock_timeout'")
-                self.assertEqual(cursor.fetchone()[0], 400)
-        finally:
-            holder.close()
+                    # A longer fallback keeps a regression from hanging the test.
+                    with transaction.atomic(), connections['default'].cursor() as cursor:
+                        cursor.execute("SELECT set_config('lock_timeout', '400ms', true)")
+                        response = self.client.post(url, root)
+                        self.assertStatus(response, 409)
+                        self.assertEqual(response.json()['meta'], {'code': 'edit_lock_timeout'})
+                        self.assertTreenodeHasProperties(fragment.nodes[0], None, fragment.skeleton)
+                        cursor.execute("SELECT setting::integer FROM pg_settings WHERE name='lock_timeout'")
+                        self.assertEqual(cursor.fetchone()[0], 400)
+                finally:
+                    holder.close()
 
-        self.assertStatus(self.client.post(url, root))
-        self.assertFalse(ClassInstance.objects.filter(pk=fragment.skeleton).exists())
+                self.assertStatus(self.client.post(url, root))
+                self.assertFalse(ClassInstance.objects.filter(pk=fragment.skeleton).exists())
 
     def test_successful_lock_restores_database_timeout(self):
         fragment = self.fragment('Uncontended', [])
