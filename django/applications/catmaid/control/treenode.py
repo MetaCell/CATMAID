@@ -7,6 +7,7 @@ import networkx as nx
 import re
 from typing import Any, DefaultDict, Dict, List, Union
 
+from django.core.exceptions import ImproperlyConfigured
 from django.db import connection, transaction
 from django.http import HttpRequest, JsonResponse
 from django.shortcuts import get_object_or_404
@@ -14,6 +15,8 @@ from django.shortcuts import get_object_or_404
 from rest_framework.decorators import api_view
 
 from catmaid import state
+from catmaid.error import ClientError
+from catmaid.locks import skeleton_edit_lock_timeout
 from catmaid.models import UserRole, Treenode, ClassInstance, \
         TreenodeConnector, Location, SamplerInterval
 from catmaid.control.authentication import requires_user_role, \
@@ -24,7 +27,7 @@ from catmaid.control.common import (get_relation_to_id_map,
 from catmaid.control.neuron import _delete_if_empty
 from catmaid.control.node import _fetch_location, _fetch_locations
 from catmaid.control.link import create_connector_link
-from catmaid.neuroglass_tasks import TaskSkeletonDeletionConflict, protect_task_annotations_on_delete
+from catmaid.neuroglass_tasks import protect_task_annotations_on_delete
 from catmaid.util import Point3D, is_collinear
 
 
@@ -709,11 +712,12 @@ def delete_treenode(request:HttpRequest, project_id=None) -> JsonResponse:
                         "Check for multiple root nodes.")
 
             # Use the same neuron row lock as task annotation writers.
-            neuron = ClassInstance.objects.select_for_update(of=('self',)).get(
-                project_id=project_id,
-                cici_via_b__relation__relation_name='model_of',
-                cici_via_b__class_instance_a_id=treenode.skeleton_id,
-            )
+            with skeleton_edit_lock_timeout(cursor):
+                neuron = ClassInstance.objects.select_for_update(of=('self',)).get(
+                    project_id=project_id,
+                    cici_via_b__relation__relation_name='model_of',
+                    cici_via_b__class_instance_a_id=treenode.skeleton_id,
+                )
             protect_task_annotations_on_delete(project_id, neuron.id)
             # The skeleton deletion also removes its final treenode and model link.
             ClassInstance.objects.filter(pk=treenode.skeleton_id).delete()
@@ -764,7 +768,7 @@ def delete_treenode(request:HttpRequest, project_id=None) -> JsonResponse:
             'success': "Removed treenode successfully."
         })
 
-    except TaskSkeletonDeletionConflict:
+    except (ClientError, ImproperlyConfigured):
         raise
     except Exception as e:
         raise ValueError(response_on_error + ': ' + str(e))

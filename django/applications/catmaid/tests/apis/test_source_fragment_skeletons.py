@@ -553,6 +553,38 @@ class SourceFragmentTransactionTests(SourceFragmentFixtures, CatmaidApiTransacti
         self.assertIn(new_label, current)
         self.assertNotIn(TASK_LABEL, current)
 
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=75)
+    def test_final_node_delete_times_out_on_neuron_lock_and_can_be_retried(self):
+        fragment = self.fragment('Delete under contention', [])
+        url = f'/{self.test_project_id}/treenode/delete'
+        for node_id in reversed(fragment.nodes[1:]):
+            self.assertStatus(self.client.post(url, {
+                'treenode_id': node_id, 'state': make_nocheck_state(),
+            }))
+        root = {'treenode_id': fragment.nodes[0], 'state': make_nocheck_state()}
+
+        holder = connections['default'].copy(alias='neuron_lock_holder')
+        try:
+            holder.set_autocommit(False)
+            with holder.cursor() as cursor:
+                cursor.execute('SELECT id FROM class_instance WHERE id = %s FOR UPDATE',
+                        [fragment.neuron])
+
+            # A longer fallback keeps a regression from hanging the test.
+            with transaction.atomic(), connections['default'].cursor() as cursor:
+                cursor.execute("SELECT set_config('lock_timeout', '400ms', true)")
+                response = self.client.post(url, root)
+                self.assertStatus(response, 409)
+                self.assertEqual(response.json()['meta'], {'code': 'edit_lock_timeout'})
+                self.assertTreenodeHasProperties(fragment.nodes[0], None, fragment.skeleton)
+                cursor.execute("SELECT setting::integer FROM pg_settings WHERE name='lock_timeout'")
+                self.assertEqual(cursor.fetchone()[0], 400)
+        finally:
+            holder.close()
+
+        self.assertStatus(self.client.post(url, root))
+        self.assertFalse(ClassInstance.objects.filter(pk=fragment.skeleton).exists())
+
     def test_successful_lock_restores_database_timeout(self):
         fragment = self.fragment('Uncontended', [])
         with transaction.atomic(), connections['default'].cursor() as cursor:
