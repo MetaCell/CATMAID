@@ -17,6 +17,7 @@ from rest_framework.decorators import api_view
 from catmaid import state
 from catmaid.error import ClientError
 from catmaid.locks import lock_skeleton_topology, skeleton_edit_lock_timeout
+from catmaid.review_items import guard_review_item_nodes, review_items_confirmed
 from catmaid.models import UserRole, Treenode, ClassInstance, \
         TreenodeConnector, Location, SamplerInterval
 from catmaid.control.authentication import requires_user_role, \
@@ -661,6 +662,7 @@ def delete_treenode(request:HttpRequest, project_id=None) -> JsonResponse:
     with skeleton_edit_lock_timeout(cursor):
         state.validate_state(treenode_id, request.POST.get('state'), lock=True,
                 neighborhood=True, cursor=cursor)
+    guard_review_item_nodes(project_id, confirmed=review_items_confirmed(request), treenode_ids=[treenode_id])
 
     treenode = Treenode.objects.get(pk=treenode_id)
     parent_id = treenode.parent_id
