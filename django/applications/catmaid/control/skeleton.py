@@ -36,6 +36,7 @@ from catmaid.source_fragments import (
     SOURCE_FRAGMENT_ANNOTATION_PREFIX, is_source_fragment_annotation_name,
     reject_reserved_annotation_names)
 from catmaid.control import tracing
+from catmaid.review_items import guard_review_item_nodes, review_items_confirmed
 from catmaid.models import (Project, UserRole, Class, ClassInstance, Review,
         ClassInstanceClassInstance, Relation, Sampler, Treenode,
         TreenodeConnector, SamplerDomain, SkeletonSummary, SamplerDomainEnd,
@@ -5348,7 +5349,8 @@ def delete_skeleton(request:HttpRequest, project_id, skeleton_id):
             f'different ID ({skeleton_ids[0]}) than the one passed in '
             f'({skeleton_id}).')
 
-    deleted_skeleton_ids = _delete_neuron_as_user(request.user, project_id, neuron_id)
+    deleted_skeleton_ids = _delete_neuron_as_user(request.user, project_id, neuron_id,
+            confirm_review_items=review_items_confirmed(request))
 
     return JsonResponse({
         'skeleton_ids': list(deleted_skeleton_ids),

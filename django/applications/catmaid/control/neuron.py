@@ -17,6 +17,7 @@ from catmaid.control.authentication import requires_user_role, \
         can_edit_class_instance_or_fail, can_edit_all_or_fail
 from catmaid.control.common import insert_into_log, get_request_list, \
         get_class_to_id_map
+from catmaid.review_items import guard_review_item_nodes, review_items_confirmed
 from catmaid.models import UserRole, Project, Class, ClassInstance, \
         ClassInstanceClassInstance, Relation, Treenode
 
@@ -183,7 +184,8 @@ def delete_neuron(request:HttpRequest, project_id=None, neuron_id=None) -> JsonR
     ownes all treenodes of the skeleton modeling the neuron in question and
     2. The neuron is not annotated by other users.
     """
-    deleted_skeleton_ids = _delete_neuron_as_user(request.user, project_id, neuron_id)
+    deleted_skeleton_ids = _delete_neuron_as_user(request.user, project_id, neuron_id,
+            confirm_review_items=review_items_confirmed(request))
 
     return JsonResponse({
         'skeleton_ids': list(deleted_skeleton_ids),
@@ -191,7 +193,7 @@ def delete_neuron(request:HttpRequest, project_id=None, neuron_id=None) -> JsonR
     })
 
 
-def _delete_neuron_as_user(user, project_id, neuron_id):
+def _delete_neuron_as_user(user, project_id, neuron_id, *, confirm_review_items=False):
     candidate = get_object_or_404(ClassInstance.objects.select_related('class_column'),
             pk=neuron_id)
     # This generic endpoint must not delete a reserved annotation passed as a neuron.
@@ -208,6 +210,7 @@ def _delete_neuron_as_user(user, project_id, neuron_id):
             class_instance_b=neuron_id,
             relation_id=relations['model_of']).values_list(
                     'class_instance_a', flat=True)
+    guard_review_item_nodes(project_id, confirmed=confirm_review_items, skeleton_ids=list(skeleton_ids))
     for skid in skeleton_ids:
         others_nodes = Treenode.objects.filter(skeleton_id=skid).exclude(
                 user_id=user.id).values_list('id', flat=True)

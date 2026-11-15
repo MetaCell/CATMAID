@@ -21,3 +21,17 @@ def label_nodes(project_id, treenode_ids, label=REVIEW_ITEM_LABEL):
         call_command("label_treenodes", "--project-id", str(project_id), "--label", label,
                      "--treenode-ids", str(ids_path), "--result", str(Path(directory) / "result.json"),
                      "--user-id", str(_importer().pk))
+
+
+def unlabel_nodes(project_id, treenode_ids, label=REVIEW_ITEM_LABEL):
+    TreenodeClassInstance.objects.filter(project_id=project_id, treenode_id__in=list(treenode_ids),
+                                         class_instance__name=label).delete()
+
+
+def link_skeleton_to_neuron(project_id, *, skeleton_id, neuron_id):
+    """Make a neuron modelled by one more skeleton."""
+    from catmaid.models import ClassInstanceClassInstance
+
+    ClassInstanceClassInstance.objects.create(
+        project_id=project_id, user=_importer(), class_instance_a_id=skeleton_id, class_instance_b_id=neuron_id,
+        relation=Relation.objects.get(project_id=project_id, relation_name="model_of"))
