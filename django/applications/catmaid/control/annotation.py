@@ -799,8 +799,10 @@ def delete_annotation_if_unused(project, annotation, relation) -> Tuple[bool, in
             project=project, class_instance_a=annotation, relation=relation)
         meta_annotation_ids = [cici.class_instance_b_id for cici in meta_annotation_links]
 
-        # Delete annotation
-        ClassInstance.objects.filter(project=project, id=annotation).delete()
+        # Delete annotation. Only annotations: this generic endpoint is given IDs by the client,
+        # and other class instances (labels, skeletons, neurons) cascade to their data (NGLASS-2386).
+        ClassInstance.objects.filter(project=project, id=annotation,
+                class_column__class_name='annotation').delete()
 
         # Delete also meta annotation instances, if they exist
         for ma in meta_annotation_ids:

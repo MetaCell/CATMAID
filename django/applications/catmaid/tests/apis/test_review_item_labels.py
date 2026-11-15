@@ -1,3 +1,4 @@
+from catmaid.models import ClassInstance, Treenode
 from catmaid.review_items import REVIEW_ITEM_LABEL, labelled_treenode_ids
 from catmaid.tests.review_item_helpers import label_nodes
 
@@ -28,3 +29,12 @@ class ReviewItemLabelTests(CatmaidApiTestCase):
         self.assertEqual(200, self.update(349, "soma", delete_existing="false").status_code,
                          "Without delete_existing nothing is removed")
         self.assertEqual([349], labelled_treenode_ids(self.test_project_id, treenode_ids=[349]), "The label stays")
+
+    def test_the_annotation_endpoint_cannot_delete_the_label_or_a_skeleton(self):
+        label_id = ClassInstance.objects.get(project_id=self.test_project_id, name=REVIEW_ITEM_LABEL).id
+        self.client.post(f"/{self.test_project_id}/annotations/{label_id}/remove")
+        self.assertEqual([349], labelled_treenode_ids(self.test_project_id, treenode_ids=[349]),
+                         "Removing an 'annotation' by the label's ID must not delete the label and its links")
+        self.client.post(f"/{self.test_project_id}/annotations/1/remove")
+        self.assertTrue(Treenode.objects.filter(skeleton_id=1).exists(),
+                        "Removing an 'annotation' by a skeleton's ID must not delete the skeleton")
