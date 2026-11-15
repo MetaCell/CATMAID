@@ -1,10 +1,16 @@
 import json
+from io import StringIO
+
+from guardian.shortcuts import assign_perm
 
 from catmaid.models import Treenode
 from catmaid.state import make_nocheck_state
 from catmaid.tests.review_item_helpers import label_nodes, link_skeleton_to_neuron, unlabel_nodes
 
 from .common import CatmaidApiTestCase, CatmaidApiTransactionTestCase
+
+
+SWC = "1 0 0 0 0 1 -1\n2 0 1 0 0 1 1\n"
 
 
 class ReviewItemDeleteTests(CatmaidApiTestCase):
@@ -61,3 +67,17 @@ class ReviewItemNeuronDeleteTests(CatmaidApiTransactionTestCase):
         unlabel_nodes(self.test_project_id, [349])
         response = self.client.post(f"/{self.test_project_id}/skeletons/1/delete", {"delete_multi_skeleton_neurons": "true"})
         self.assertEqual(409, response.status_code, "The labelled node is on the neuron's other skeleton")
+
+    def test_replacing_a_labelled_skeleton_by_import_is_refused(self):
+        assign_perm("can_import", self.test_user, self.test_project)
+        response = self.client.post(f"/{self.test_project_id}/skeletons/import",
+                                    {"file.swc": StringIO(SWC), "name": "replacement", "neuron_id": 2, "force": True})
+        self.assertEqual(409, response.status_code, "Replacing neuron 2's skeleton 1 would delete labelled node 349")
+        self.assertTrue(Treenode.objects.filter(pk=349).exists(), "The old skeleton is untouched")
+
+    def test_replacing_a_labelled_skeleton_by_its_id_is_refused(self):
+        assign_perm("can_import", self.test_user, self.test_project)
+        response = self.client.post(f"/{self.test_project_id}/skeletons/import",
+                                    {"file.swc": StringIO(SWC), "name": "replacement", "skeleton_id": 1, "force": True})
+        self.assertEqual(409, response.status_code, "Replacing skeleton 1 by ID would delete labelled node 349")
+        self.assertTrue(Treenode.objects.filter(pk=349).exists(), "The old skeleton is untouched")
