@@ -33,6 +33,17 @@ included in this changelog.
   annotations on the original skeleton. Annotation selections distribute ordinary
   annotations and cannot introduce task links.
 
+- `POST /{project_id}/treenode/delete`, `POST /{project_id}/neuron/{neuron_id}/delete`,
+  `POST /{project_id}/skeletons/{skeleton_id}/delete` and `POST /{project_id}/skeletons/import`
+  (when it replaces an existing skeleton): a request that would remove a treenode labelled
+  `neuroglass:review-item` returns HTTP 409 with type `ReviewItemNodesProtected` and
+  `meta: {label, count, treenode_ids}` (at most 1000 IDs), unless it sends
+  `confirm_review_items=true`.
+
+- `POST /{project_id}/label/{ntype}/{location_id}/update` and `.../remove`: adding or removing
+  the reserved `neuroglass:review-item` label returns HTTP 403; only NeuroGlass imports
+  (`label_treenodes`, `prune_treenode_labels`) write it.
+
 - `GET|POST /{project_id}/skeletons/compact-detail`:
   The new parameter 'with_edition_times' can now be used to return the edition
   time for every returned treenode, connector and labe/tag.

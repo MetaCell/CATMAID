@@ -35,3 +35,12 @@ def link_skeleton_to_neuron(project_id, *, skeleton_id, neuron_id):
     ClassInstanceClassInstance.objects.create(
         project_id=project_id, user=_importer(), class_instance_a_id=skeleton_id, class_instance_b_id=neuron_id,
         relation=Relation.objects.get(project_id=project_id, relation_name="model_of"))
+
+
+def add_plain_label(project_id, treenode_id, name):
+    label_nodes(project_id, [treenode_id], label=name)
+
+
+def has_label(project_id, treenode_id, name):
+    return TreenodeClassInstance.objects.filter(project_id=project_id, treenode_id=treenode_id,
+                                                class_instance__name=name).exists()
