@@ -16,6 +16,23 @@ included in this changelog.
   ID. Requests with more than 5000 points or a non-positive radius are
   rejected with a 400 response.
 
+- `POST /{project_id}/skeletons/task-links`:
+  Link NeuroGlass task annotations (`neuroglass:study:<uuid>:task:<uuid>`) to
+  skeletons and reroot those skeletons, all in one transaction. The JSON body
+  has the field `changes`, a list of objects with `annotation`,
+  `expected_skeleton_id` (the skeleton the annotation is linked to now, or
+  `null`), `skeleton_id` (the skeleton to link it to) and `reroot_treenode_id`
+  (a node of `skeleton_id` that becomes its root). Each change is validated
+  against the current state first; invalid or stale changes are skipped. The
+  annotation is moved from the neuron of the previous skeleton to the neuron of
+  the new one, which must not hold another task annotation of the same study
+  unless that one is moved off in the same request. The response has one entry
+  per change, in input order: `annotation`, `status` (`applied` or `skipped`),
+  `reason` (or `null`) and `rerooted`. Requests that change one annotation or
+  target one skeleton more than once are rejected with a 400 response. If any
+  valid change can't be fully applied, none is written and an error is
+  returned.
+
 - `POST /{project_id}/skeletons/{skeleton_id}/delete`:
   Delete a skeleton along with its neuron (like calling /delete on the neuron).
   The neuron is by default only deleted if the skeleton was the only model of
