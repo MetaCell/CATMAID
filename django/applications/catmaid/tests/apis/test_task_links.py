@@ -4,7 +4,7 @@ import json
 import uuid
 from unittest.mock import patch
 
-from catmaid.control import annotation
+from catmaid.control import annotation, task_links
 from catmaid.models import ClassInstanceClassInstance, Treenode
 
 from .common import CatmaidApiTestCase
@@ -180,6 +180,41 @@ class TaskLinksApiTests(CatmaidApiTestCase):
                 'reason': None, 'rerooted': False}], results)
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
         self.assertEqual(7, self.root(1))
+
+    def test_validation_sees_state_under_locks(self):
+        # Another task of the same study is linked to the target after the
+        # request arrived, but before the neuron locks are taken.
+        lock_neurons = task_links._lock_neurons
+
+        def link_concurrently(*args, **kwargs):
+            if not self.neurons_with(self.task_b):
+                self.link(self.task_b, SKELETON_1_NEURON)
+            return lock_neurons(*args, **kwargs)
+
+        with patch.object(task_links, '_lock_neurons', side_effect=link_concurrently):
+            results = self.results(self.post(self.change(self.task_a, None, 1, 11)))
+        self.assertEqual('skipped', results[0]['status'])
+        self.assertEqual(set(), self.neurons_with(self.task_a))
+        self.assertEqual(7, self.root(1))
+
+    def test_treenodes_are_locked_before_neurons(self):
+        events = []
+        lock_treenodes = task_links._lock_treenodes
+        lock_neurons = task_links._lock_neurons
+
+        def record(name, lock):
+            def locked(project_id, ids):
+                events.append((name, sorted(set(ids))))
+                return lock(project_id, ids)
+            return locked
+
+        with patch.object(task_links, '_lock_treenodes', record('treenodes', lock_treenodes)), \
+                patch.object(task_links, '_lock_neurons', record('neurons', lock_neurons)):
+            self.results(self.post(
+                    self.change(self.task_a, None, 373, 405),
+                    self.change(self.task_b, None, 1, 11)))
+        self.assertEqual([('treenodes', [11, 405]),
+                ('neurons', [SKELETON_1_NEURON, SKELETON_373_NEURON])], events)
 
     def test_duplicate_annotations_rejected(self):
         response = self.post(

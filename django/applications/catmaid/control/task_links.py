@@ -4,14 +4,13 @@
 
 from dataclasses import dataclass
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from django.db import connection, transaction
 from django.http import HttpRequest, HttpResponseBadRequest, JsonResponse
 
 from rest_framework.decorators import api_view
 
-from catmaid import state
 from catmaid.control import annotation, skeleton
 from catmaid.control.authentication import requires_user_role
 from catmaid.error import ClientError
@@ -87,7 +86,11 @@ def _parse_request(data: Any) -> List[ChangePlan]:
 
 def _validate(project_id: int, plans: List[ChangePlan]) -> List[ChangePlan]:
     """Check every change against the current state. Changes that can't be
-    applied get a reason. Nothing is written."""
+    applied get a reason. Nothing is written. Can be run again on the same
+    plans, e.g. once the involved rows are locked."""
+    for plan in plans:
+        plan.reason = plan.study_id = plan.annotation_id = None
+        plan.previous_neuron_id = plan.target_neuron_id = None
     classes = dict(Class.objects.filter(project_id=project_id,
             class_name__in=('annotation', 'neuron', 'skeleton')).values_list('class_name', 'id'))
     relations = dict(Relation.objects.filter(project_id=project_id,
@@ -209,6 +212,23 @@ def _validate(project_id: int, plans: List[ChangePlan]) -> List[ChangePlan]:
             return plans
 
 
+def _neuron_ids(plans: List[ChangePlan]) -> Set[int]:
+    """The target and previous neurons of all applied changes."""
+    applied = [p for p in plans if p.applied]
+    return {p.target_neuron_id for p in applied} | \
+            {p.previous_neuron_id for p in applied if p.previous_neuron_id is not None}
+
+
+def _lock_treenodes(project_id: int, node_ids) -> None:
+    """Lock the reroot nodes in ID order. Missing nodes fail validation."""
+    cursor = connection.cursor()
+    cursor.execute('''
+        SELECT id FROM treenode
+        WHERE project_id = %s AND id = ANY(%s::bigint[])
+        ORDER BY id FOR UPDATE
+    ''', [project_id, sorted(set(node_ids))])
+
+
 def _lock_neurons(project_id: int, neuron_ids) -> None:
     """Take the same row locks as NeuroGlass' task guard."""
     neuron_ids = sorted(set(neuron_ids))
@@ -224,14 +244,24 @@ def _lock_neurons(project_id: int, neuron_ids) -> None:
         raise TaskLinkConflict('A neuron to link no longer exists, please retry')
 
 
+def _validate_locked(project_id: int, plans: List[ChangePlan]) -> List[ChangePlan]:
+    """Validate the plans against locked state. Like NeuroGlass' task skeleton
+    deletion guard, treenode rows are locked before neuron rows. The neurons to
+    lock come from a first validation; the second one runs under the locks.
+    Must run inside a transaction."""
+    _lock_treenodes(project_id, [p.reroot_treenode_id for p in plans])
+    locked = _neuron_ids(_validate(project_id, plans))
+    _lock_neurons(project_id, locked)
+    _validate(project_id, plans)
+    if not _neuron_ids(plans) <= locked:
+        raise TaskLinkConflict('Task links changed during the request, please retry')
+    return plans
+
+
 def _apply(project_id: int, user, plans: List[ChangePlan]) -> None:
-    """Write all applied changes. Must run inside a transaction: any exception
-    leaves every change unwritten."""
-    applied = [p for p in plans if p.applied]
-    _lock_neurons(project_id, [p.target_neuron_id for p in applied] +
-            [p.previous_neuron_id for p in applied if p.previous_neuron_id is not None])
-    cursor = connection.cursor()
-    for plan in applied:
+    """Write all applied changes. Must run inside a transaction, after
+    _validate_locked: any exception leaves every change unwritten."""
+    for plan in (p for p in plans if p.applied):
         if plan.target_neuron_id != plan.previous_neuron_id:
             # Add before removing, so that the annotation is never unused and
             # therefore kept with its ID and meta-annotations. Both helpers
@@ -248,7 +278,7 @@ def _apply(project_id: int, user, plans: List[ChangePlan]) -> None:
                 if missed or len(deleted) != 1:
                     raise TaskLinkConflict('Annotation %s could not be removed from skeleton %s' % (
                             plan.annotation, plan.expected_skeleton_id))
-        state.lock_node(plan.reroot_treenode_id, cursor)
+        # The reroot node is locked by _validate_locked.
         plan.rerooted = bool(skeleton._reroot_skeleton(plan.reroot_treenode_id, project_id))
 
 
@@ -299,7 +329,7 @@ def link_tasks(request: HttpRequest, project_id=None) -> JsonResponse:
 
     project_id = int(project_id)
     with transaction.atomic():
-        _validate(project_id, plans)
+        _validate_locked(project_id, plans)
         _apply(project_id, request.user, plans)
 
     return JsonResponse({'results': [{
