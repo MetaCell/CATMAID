@@ -18,7 +18,7 @@ from catmaid.control import (authentication, user, group, log, message, client,
         classification, notifications, roi, clustering, volume, noop,
         useranalytics, user_evaluation, search, graphexport, transaction,
         graph2, circles, analytics, review, wiringdiagram, object, sampler,
-        similarity, nat, origin, point, landmarks, project_token, pointcloud, pointset)
+        similarity, skeleton_proximity, nat, origin, point, landmarks, project_token, pointcloud, pointset)
 
 from catmaid.history import record_request_action as record_view
 from catmaid.views import CatmaidView
@@ -317,6 +317,7 @@ urlpatterns += [
 # General skeleton access
 urlpatterns += [
     re_path(r'^(?P<project_id>\d+)/skeletons/$', skeleton.list_skeletons),
+    re_path(r'^(?P<project_id>\d+)/skeletons/near-points$', skeleton_proximity.skeletons_near_points),
     re_path(r'^(?P<project_id>\d+)/skeletons/cable-length$', skeleton.cable_lengths),
     re_path(r'^(?P<project_id>\d+)/skeletons/summary$', skeleton.summary),
     re_path(r'^(?P<project_id>\d+)/skeletons/connectivity-counts$', skeleton.connectivity_counts),

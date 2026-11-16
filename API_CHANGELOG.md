@@ -6,6 +6,16 @@ included in this changelog.
 
 ### Additions
 
+- `POST /{project_id}/skeletons/near-points`:
+  Find all skeletons with a node within a radius (nm) of each of up to 5000
+  points (nm, project space). The JSON body has the fields `points`
+  (`[[x, y, z], ...]`) and `radius`. The response has one list per input point,
+  in input order, with one entry per skeleton in range: `skeleton_id`, the
+  skeleton's nearest node (`treenode_id`, `distance`, `x`, `y`, `z`) and the
+  skeleton's current `root_id`. Entries are sorted by distance, then skeleton
+  ID. Requests with more than 5000 points or a non-positive radius are
+  rejected with a 400 response.
+
 - `POST /{project_id}/skeletons/{skeleton_id}/delete`:
   Delete a skeleton along with its neuron (like calling /delete on the neuron).
   The neuron is by default only deleted if the skeleton was the only model of
