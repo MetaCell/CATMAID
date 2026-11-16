@@ -2,12 +2,18 @@
 
 import json
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
+from time import monotonic, sleep
 from unittest.mock import patch
 
-from catmaid.control import annotation, task_links
-from catmaid.models import ClassInstanceClassInstance, Treenode
+from django.db import connection, connections
+from django.test import Client
 
-from .common import CatmaidApiTestCase
+from catmaid.control import annotation, task_links
+from catmaid.models import ClassInstanceClassInstance, Project, TaskLinkOperation
+
+from .common import CatmaidApiTestCase, CatmaidApiTransactionTestCase
 
 
 SKELETON_1_NEURON = 2
@@ -18,7 +24,7 @@ def task_annotation(study_id):
     return 'neuroglass:study:%s:task:%s' % (study_id, uuid.uuid4())
 
 
-class TaskLinksApiTests(CatmaidApiTestCase):
+class TaskLinksFixtures:
     def setUp(self):
         super().setUp()
         self.url = '/%d/skeletons/task-links' % self.test_project_id
@@ -58,8 +64,20 @@ class TaskLinksApiTests(CatmaidApiTestCase):
 
     def results(self, response):
         self.assertStatus(response)
-        return json.loads(response.content.decode('utf-8'))['results']
+        body = response.json()
+        self.assertEqual({'results'}, body.keys())
+        return body['results']
 
+    def post_operation(self, payload, client=None):
+        return (client or self.client).post(self.url, payload,
+                content_type='application/json')
+
+    def operation(self, **kwargs):
+        return {'study_id': str(self.study_id), 'operation_id': str(uuid.uuid4()),
+                **kwargs}
+
+
+class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
     def test_links_unlinked_task_and_reroots(self):
         results = self.results(self.post(self.change(self.task_a, None, 1, 11)))
         self.assertEqual([{'annotation': self.task_a, 'status': 'applied',
@@ -236,3 +254,190 @@ class TaskLinksApiTests(CatmaidApiTestCase):
                 'annotation': self.task_a, 'skeleton_id': 'one'}]}),
                 content_type='application/json')
         self.assertEqual(400, response.status_code)
+
+
+
+class DurableTaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
+    def test_recovery_cancels_unseen_operation_and_blocks_late_apply(self):
+        recovery = self.operation(cancel=True)
+        apply = {key: recovery[key] for key in ('study_id', 'operation_id')}
+        apply['operation_changes'] = [self.change(self.task_a, None, 1, 11)]
+        expected = {'state': 'cancelled', 'results': []}
+        for payload in (recovery, recovery, apply):
+            response = self.post_operation(payload)
+            self.assertStatus(response)
+            self.assertEqual(expected, response.json())
+        self.assertEqual(set(), self.neurons_with(self.task_a))
+        self.assertEqual(7, self.root(1))
+
+    def test_recovery_and_apply_retry_return_the_original_results(self):
+        apply = self.operation(operation_changes=[
+            self.change(self.task_a, None, 1, 11),
+            self.change(self.task_b, 1, 373, 405),
+        ])
+        response = self.post_operation(apply)
+        self.assertStatus(response)
+        completed = response.json()
+        self.assertEqual('completed', completed['state'])
+        self.assertEqual({'annotation': self.task_a, 'status': 'applied',
+                'reason': None, 'rerooted': True}, completed['results'][0])
+        self.assertEqual('skipped', completed['results'][1]['status'])
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+        self.assertEqual(11, self.root(1))
+
+        recovery = {key: apply[key] for key in ('study_id', 'operation_id')}
+        recovery['cancel'] = True
+        with patch.object(task_links, '_apply', side_effect=AssertionError('Repeated apply')):
+            for payload in (apply, recovery):
+                replay = self.post_operation(payload)
+                self.assertStatus(replay)
+                self.assertEqual(completed, replay.json())
+
+        mismatch = dict(apply, operation_changes=[self.change(self.task_a, None, 373, 405)])
+        self.assertEqual(409, self.post_operation(mismatch).status_code)
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+        self.assertEqual(377, self.root(373))
+
+    def test_operation_id_is_scoped_to_study(self):
+        apply = self.operation(operation_changes=[self.change(self.task_a, None, 1, 11)])
+        recovery = {'study_id': str(uuid.uuid4()), 'operation_id': apply['operation_id'],
+                'cancel': True}
+        result = self.post_operation(recovery)
+        self.assertStatus(result)
+        self.assertEqual('cancelled', result.json()['state'])
+        result = self.post_operation(apply)
+        self.assertStatus(result)
+        self.assertEqual('completed', result.json()['state'])
+
+    def test_rejects_malformed_operation_envelopes_and_cross_study_annotations(self):
+        apply = self.operation(operation_changes=[self.change(self.task_a, None, 1, 11)])
+        recovery = {key: apply[key] for key in ('study_id', 'operation_id')}
+        for payload in (
+                dict(apply, operation_changes=[self.change(self.task_b.replace(
+                        str(self.study_id), str(uuid.uuid4())), None, 1, 11)]),
+                dict(apply, study_id='AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA'),
+                dict(apply, operation_id=apply['operation_id'].replace('-', '')),
+                dict(apply, cancel=True),
+                dict(apply, changes=apply['operation_changes']),
+                dict(apply, operation_changes=[dict(apply['operation_changes'][0], unrelated=True)]),
+                dict(recovery, cancel=False),
+                dict(recovery, cancel=1),
+                dict(recovery, cancel=True, operation_changes=[]),
+                dict(recovery, cancel=True, changes=[]),
+                dict(recovery, cancel=True, extra='unexpected'),
+                {'operation_id': apply['operation_id'], 'operation_changes': apply['operation_changes']},
+                {'study_id': apply['study_id'], 'operation_changes': apply['operation_changes']}):
+            with self.subTest(payload=payload):
+                self.assertEqual(400, self.post_operation(payload).status_code)
+        self.assertEqual(set(), self.neurons_with(self.task_a))
+        self.assertEqual(7, self.root(1))
+        response = self.post_operation(apply)
+        self.assertStatus(response)
+        self.assertEqual('completed', response.json()['state'])
+
+    def test_failed_apply_rolls_back_mutations_and_leaves_operation_unseen(self):
+        apply = self.operation(operation_changes=[self.change(self.task_a, None, 1, 11)])
+        original = task_links._apply
+
+        def apply_then_fail(*args, **kwargs):
+            original(*args, **kwargs)
+            raise ValueError('Simulated failure after annotations and reroot')
+
+        with patch.object(task_links, '_apply', side_effect=apply_then_fail):
+            response = self.post_operation(apply)
+        self.assertEqual(400, response.status_code)
+        self.assertEqual(set(), self.neurons_with(self.task_a))
+        self.assertEqual(7, self.root(1))
+
+        response = self.post_operation(apply)
+        self.assertStatus(response)
+        self.assertEqual('completed', response.json()['state'])
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+        self.assertEqual(11, self.root(1))
+
+
+class DurableTaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase):
+    def test_failed_cancellation_commit_returns_no_receipt(self):
+        recovery = self.operation(cancel=True)
+        original = TaskLinkOperation.save
+        missing_project_id = Project.objects.latest('id').id + 1
+
+        def save_invalid_project(receipt, *args, **kwargs):
+            # PostgreSQL checks this foreign key when the request commits.
+            receipt.project_id = missing_project_id
+            original(receipt, *args, **kwargs)
+
+        with patch.object(TaskLinkOperation, 'save', save_invalid_project):
+            response = self.post_operation(recovery)
+        self.assertEqual(500, response.status_code)
+        self.assertFalse(TaskLinkOperation.objects.filter(
+                operation_id=recovery['operation_id']).exists())
+        apply = {key: recovery[key] for key in ('study_id', 'operation_id')}
+        apply['operation_changes'] = [self.change(self.task_a, None, 1, 11)]
+        response = self.post_operation(apply)
+        self.assertStatus(response)
+        self.assertEqual('completed', response.json()['state'])
+
+    def overlapping_apply_and_recovery(self, *, rollback=False):
+        apply = self.operation(operation_changes=[self.change(self.task_a, None, 1, 11)])
+        recovery = {key: apply[key] for key in ('study_id', 'operation_id')}
+        recovery['cancel'] = True
+        recovery_client = Client()
+        recovery_client.cookies.update(self.client.cookies)
+        backend_ids = Queue()
+        original = task_links._apply
+        waiters = []
+
+        def recover():
+            try:
+                with connections['default'].cursor() as cursor:
+                    cursor.execute("SELECT set_config('lock_timeout', '10s', false), "
+                            "pg_backend_pid()")
+                    backend_ids.put(cursor.fetchone()[1])
+                return self.post_operation(recovery, recovery_client)
+            finally:
+                connections['default'].close()
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            def apply_and_wait_for_recovery(*args, **kwargs):
+                original(*args, **kwargs)
+                waiting = pool.submit(recover)
+                waiters.append(waiting)
+                backend_id = backend_ids.get(timeout=10)
+                deadline = monotonic() + 5
+                with connection.cursor() as cursor:
+                    cursor.execute('SELECT pg_backend_pid()')
+                    apply_backend_id = cursor.fetchone()[0]
+                    while True:
+                        cursor.execute('SELECT pg_blocking_pids(%s)', [backend_id])
+                        if apply_backend_id in cursor.fetchone()[0]:
+                            break
+                        self.assertFalse(waiting.done(), 'Recovery completed before apply committed')
+                        self.assertLess(monotonic(), deadline, 'Recovery did not wait in PostgreSQL')
+                        sleep(0.01)
+                if rollback:
+                    raise ValueError('Simulated rollback of in-flight apply')
+
+            with patch.object(task_links, '_apply', side_effect=apply_and_wait_for_recovery):
+                apply_response = self.post_operation(apply)
+            recovery_response = waiters[0].result(timeout=10)
+        self.assertStatus(recovery_response)
+        return apply, apply_response, recovery_response.json()
+
+    def test_recovery_waits_for_pending_apply_and_returns_committed_receipt(self):
+        _, apply_response, recovered = self.overlapping_apply_and_recovery()
+        self.assertStatus(apply_response)
+        self.assertEqual(apply_response.json(), recovered)
+        self.assertEqual('completed', recovered['state'])
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+        self.assertEqual(11, self.root(1))
+
+    def test_recovery_waits_for_pending_apply_rollback_and_blocks_late_retry(self):
+        apply, apply_response, recovered = self.overlapping_apply_and_recovery(rollback=True)
+        self.assertEqual(400, apply_response.status_code)
+        self.assertEqual({'state': 'cancelled', 'results': []}, recovered)
+        late_apply = self.post_operation(apply)
+        self.assertStatus(late_apply)
+        self.assertEqual(recovered, late_apply.json())
+        self.assertEqual(set(), self.neurons_with(self.task_a))
+        self.assertEqual(7, self.root(1))

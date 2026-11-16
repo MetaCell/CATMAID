@@ -3,6 +3,8 @@
 """Atomically link NeuroGlass task annotations to skeletons."""
 
 from dataclasses import dataclass
+from hashlib import sha256
+import json
 import re
 from typing import Any, Dict, List, Optional, Set
 
@@ -14,13 +16,15 @@ from rest_framework.decorators import api_view
 from catmaid.control import annotation, skeleton
 from catmaid.control.authentication import requires_user_role
 from catmaid.error import ClientError
-from catmaid.models import Class, Relation, UserRole
+from catmaid.models import Class, Relation, TaskLinkOperation, UserRole
 
 UUID_PATTERN = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 TASK_ANNOTATION = re.compile(r'neuroglass:study:(%s):task:%s' % (UUID_PATTERN, UUID_PATTERN),
         re.IGNORECASE)
 # The same pattern for PostgreSQL's case-insensitive ~* operator.
 TASK_ANNOTATION_SQL = '^%s$' % TASK_ANNOTATION.pattern
+OPERATION_KEYS = {'study_id', 'operation_id'}
+CHANGE_KEYS = {'annotation', 'expected_skeleton_id', 'skeleton_id', 'reroot_treenode_id'}
 
 
 class TaskLinkConflict(ClientError):
@@ -46,6 +50,14 @@ class ChangePlan:
         return self.reason is None
 
 
+@dataclass
+class OperationRequest:
+    study_id: str
+    operation_id: str
+    plans: List[ChangePlan]
+    changes_digest: Optional[str] = None
+
+
 def _int_field(change: Dict, field: str, nullable=False) -> Optional[int]:
     value = change.get(field)
     if value is None and nullable:
@@ -56,11 +68,11 @@ def _int_field(change: Dict, field: str, nullable=False) -> Optional[int]:
     return value
 
 
-def _parse_request(data: Any) -> List[ChangePlan]:
+def _parse_changes(changes: Any, *, study_id: Optional[str] = None) -> List[ChangePlan]:
     """Return one plan per change or raise ValueError with a message."""
-    changes = data.get('changes') if isinstance(data, dict) else None
     if not isinstance(changes, list):
-        raise ValueError('"changes" must be a list')
+        field = 'operation_changes' if study_id is not None else 'changes'
+        raise ValueError('"%s" must be a list' % field)
     plans = []
     for change in changes:
         if not isinstance(change, dict):
@@ -68,6 +80,12 @@ def _parse_request(data: Any) -> List[ChangePlan]:
         name = change.get('annotation')
         if not isinstance(name, str):
             raise ValueError('"annotation" must be a string')
+        if study_id is not None:
+            if change.keys() != CHANGE_KEYS:
+                raise ValueError('Every operation change must have exactly the task-link fields')
+            match = TASK_ANNOTATION.fullmatch(name)
+            if not match or match.group(1).lower() != study_id:
+                raise ValueError('Every operation annotation must be a task of the requested study')
         if 'expected_skeleton_id' not in change:
             raise ValueError('"expected_skeleton_id" is required')
         plans.append(ChangePlan(
@@ -82,6 +100,26 @@ def _parse_request(data: Any) -> List[ChangePlan]:
     if len(set(skeleton_ids)) != len(skeleton_ids):
         raise ValueError('Every skeleton can only be targeted once per request')
     return plans
+
+
+def _canonical_uuid(data: Dict, field: str) -> str:
+    value = data.get(field)
+    if not isinstance(value, str) or re.fullmatch(UUID_PATTERN, value) is None:
+        raise ValueError('"%s" must be a canonical UUID' % field)
+    return value
+
+
+def _parse_operation(data: Dict) -> OperationRequest:
+    study_id = _canonical_uuid(data, 'study_id')
+    operation_id = _canonical_uuid(data, 'operation_id')
+    if data.keys() == OPERATION_KEYS | {'cancel'} and data['cancel'] is True:
+        return OperationRequest(study_id, operation_id, [])
+    if data.keys() != OPERATION_KEYS | {'operation_changes'}:
+        raise ValueError('Expected a task-link apply or cancellation request')
+    changes = data['operation_changes']
+    plans = _parse_changes(changes, study_id=study_id)
+    digest = sha256(json.dumps(changes, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    return OperationRequest(study_id, operation_id, plans, digest)
 
 
 def _validate(project_id: int, plans: List[ChangePlan]) -> List[ChangePlan]:
@@ -282,6 +320,35 @@ def _apply(project_id: int, user, plans: List[ChangePlan]) -> None:
         plan.rerooted = bool(skeleton._reroot_skeleton(plan.reroot_treenode_id, project_id))
 
 
+def _apply_plans(project_id: int, user, plans: List[ChangePlan]) -> List[Dict]:
+    _validate_locked(project_id, plans)
+    _apply(project_id, user, plans)
+    return [{
+        'annotation': p.annotation,
+        'status': 'applied' if p.applied else 'skipped',
+        'reason': p.reason,
+        'rerooted': p.rerooted,
+    } for p in plans]
+
+
+def _resolve_operation(project_id: int, user, operation: OperationRequest) -> Dict:
+    # The unique index arbitrates concurrent inserts. Django's get_or_create
+    # retries with a locked read if another transaction inserted first.
+    receipt, created = TaskLinkOperation.objects.select_for_update().get_or_create(
+            project_id=project_id, study_id=operation.study_id,
+            operation_id=operation.operation_id)
+    if created and operation.changes_digest is not None:
+        # The insert, task mutations and receipt become visible at one commit.
+        receipt.results = _apply_plans(project_id, user, operation.plans)
+        receipt.changes_digest = operation.changes_digest
+        receipt.save(update_fields=['results', 'changes_digest'])
+    if receipt.changes_digest is None:
+        return {'state': 'cancelled', 'results': []}
+    if operation.changes_digest is not None and operation.changes_digest != receipt.changes_digest:
+        raise TaskLinkConflict('This operation already completed with different changes')
+    return {'state': 'completed', 'results': receipt.results}
+
+
 @api_view(['POST'])
 @requires_user_role(UserRole.Annotate)
 def link_tasks(request: HttpRequest, project_id=None) -> JsonResponse:
@@ -294,6 +361,12 @@ def link_tasks(request: HttpRequest, project_id=None) -> JsonResponse:
     first. Changes that fail validation are skipped and reported with a reason.
     All other changes are applied together: if any of them fails, none is
     written and an error is returned.
+
+    The legacy changes request returns results. A durable apply instead
+    supplies study_id, operation_id and operation_changes. A request with
+    the same IDs and cancel set to true returns the committed results or
+    prevents the operation from applying. Durable requests return state
+    (completed or cancelled) and results.
     ---
     parameters:
     - name: project_id
@@ -322,19 +395,22 @@ def link_tasks(request: HttpRequest, project_id=None) -> JsonResponse:
           was skipped).
         required: true
     """
+    data = request.data
     try:
-        plans = _parse_request(request.data)
+        if not isinstance(data, dict):
+            raise ValueError('Expected a task-link request object')
+        operation = None
+        if data.keys() == {'changes'}:
+            plans = _parse_changes(data['changes'])
+        else:
+            operation = _parse_operation(data)
     except ValueError as e:
         return HttpResponseBadRequest(str(e))
 
     project_id = int(project_id)
     with transaction.atomic():
-        _validate_locked(project_id, plans)
-        _apply(project_id, request.user, plans)
-
-    return JsonResponse({'results': [{
-        'annotation': p.annotation,
-        'status': 'applied' if p.applied else 'skipped',
-        'reason': p.reason,
-        'rerooted': p.rerooted,
-    } for p in plans]})
+        if operation is None:
+            reply = {'results': _apply_plans(project_id, request.user, plans)}
+        else:
+            reply = _resolve_operation(project_id, request.user, operation)
+    return JsonResponse(reply)

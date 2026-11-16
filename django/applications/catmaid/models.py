@@ -90,6 +90,24 @@ class Project(models.Model):
     def __str__(self):
         return self.title
 
+class TaskLinkOperation(models.Model):
+    """A terminal task-link result or cancellation fence for one operation."""
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, db_index=False)
+    study_id = models.UUIDField()
+    operation_id = models.UUIDField()
+    # A null digest denotes cancellation. A completed apply can have no results.
+    changes_digest = models.CharField(max_length=64, null=True, editable=False)
+    results = models.JSONField(default=list, editable=False)
+
+    class Meta:
+        db_table = "catmaid_task_link_operation"
+        constraints = [
+            models.UniqueConstraint(fields=("project", "study_id", "operation_id"),
+                    name="catmaid_task_link_operation_scope"),
+        ]
+
+
 def on_project_save(sender, instance, created, raw, **kwargs) -> None:
     """ Make sure all required classes and relations are set up for all
     projects but the ontology dummy projects. Don't do this when fixtures are in
