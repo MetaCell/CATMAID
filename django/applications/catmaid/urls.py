@@ -318,7 +318,7 @@ urlpatterns += [
 urlpatterns += [
     re_path(r'^(?P<project_id>\d+)/skeletons/$', skeleton.list_skeletons),
     re_path(r'^(?P<project_id>\d+)/skeletons/near-points$', skeleton_proximity.skeletons_near_coordinates),
-    re_path(r'^(?P<project_id>\d+)/skeletons/task-links$', record_view("skeletons.link_tasks")(task_links.link_tasks)),
+    re_path(r'^(?P<project_id>\d+)/skeletons/task-link$', record_view("skeletons.link_task")(task_links.link_task)),
     re_path(r'^(?P<project_id>\d+)/skeletons/cable-length$', skeleton.cable_lengths),
     re_path(r'^(?P<project_id>\d+)/skeletons/summary$', skeleton.summary),
     re_path(r'^(?P<project_id>\d+)/skeletons/connectivity-counts$', skeleton.connectivity_counts),
