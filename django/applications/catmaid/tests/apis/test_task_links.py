@@ -73,8 +73,8 @@ class TaskLinksFixtures:
             'reroot_treenode_id': reroot,
         }
 
-    def post(self, *changes):
-        return self.client.post(self.url, json.dumps({'changes': list(changes)}),
+    def post(self, *changes, client=None):
+        return (client or self.client).post(self.url, {'changes': list(changes)},
                 content_type='application/json')
 
     def results(self, response):
@@ -83,25 +83,13 @@ class TaskLinksFixtures:
         self.assertEqual({'results'}, body.keys())
         return body['results']
 
-    def post_operation(self, payload, client=None):
-        return (client or self.client).post(self.url, payload,
-                content_type='application/json')
-
-    def operation(self, **kwargs):
-        return {'study_id': str(self.study_id), 'operation_id': str(uuid.uuid4()),
-                'deadline': 253402300799, **kwargs}
-
-    def recovery(self, apply):
-        return {**{key: apply[key] for key in ('study_id', 'operation_id', 'deadline')},
-                'recover': True}
-
 
 class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
     def test_native_annotator_cannot_apply_task_links(self):
         native = Client()
         native.cookies.update(self.client.cookies)
-        apply = self.operation(operation_changes=[self.change(self.task_a, None, 1, 11)])
-        self.assertEqual(403, self.post_operation(apply, native).status_code)
+        response = self.post(self.change(self.task_a, None, 1, 11), client=native)
+        self.assertEqual(403, response.status_code)
         self.assertEqual(set(), self.neurons_with(self.task_a))
         self.assertEqual(7, self.root(1))
 
@@ -297,102 +285,21 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
                 content_type='application/json')
         self.assertEqual(400, response.status_code)
 
-
-
-class DeadlineTaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
-    def test_apply_before_deadline_reports_applied_and_skipped_changes(self):
-        apply = self.operation(operation_changes=[
-            self.change(self.task_a, None, 1, 11),
-            self.change(self.task_b, 1, 373, 405),
-        ])
-        response = self.post_operation(apply)
-        self.assertStatus(response)
-        completed = response.json()
-        self.assertEqual('completed', completed['state'])
-        self.assertEqual({'annotation': self.task_a, 'status': 'applied',
-                'reason': None, 'rerooted': True}, completed['results'][0])
-        self.assertEqual('skipped', completed['results'][1]['status'])
-        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
-        self.assertEqual(11, self.root(1))
-
-    def test_recovery_before_deadline_is_pending_without_mutations(self):
-        apply = self.operation(operation_changes=[self.change(self.task_a, None, 1, 11)])
-        response = self.post_operation(self.recovery(apply))
-        self.assertStatus(response)
-        self.assertEqual({'state': 'pending', 'results': []}, response.json())
-        self.assertEqual(set(), self.neurons_with(self.task_a))
-        self.assertEqual(7, self.root(1))
-
-        apply_response = self.post_operation(apply)
-        self.assertStatus(apply_response)
-        self.assertEqual('completed', apply_response.json()['state'])
-
-    def test_expired_apply_never_changes_annotation_or_root(self):
-        apply = self.operation(deadline=1,
-                operation_changes=[self.change(self.task_a, None, 1, 11)])
-        response = self.post_operation(apply)
-        self.assertStatus(response)
-        self.assertEqual({'state': 'expired', 'results': []}, response.json())
-        self.assertEqual(set(), self.neurons_with(self.task_a))
-        self.assertEqual(7, self.root(1))
-
-    def test_recovery_after_deadline_settles_without_changing_existing_links_or_roots(self):
-        self.link(self.task_a, SKELETON_1_NEURON)
-        self.link(self.task_b, SKELETON_373_NEURON)
-
-        response = self.post_operation(self.operation(deadline=1, recover=True))
-        self.assertStatus(response)
-        self.assertEqual({'state': 'settled', 'results': []}, response.json())
-        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
-        self.assertEqual({SKELETON_373_NEURON}, self.neurons_with(self.task_b))
-        self.assertEqual(7, self.root(1))
-        self.assertEqual(377, self.root(373))
-
-    def test_rejects_malformed_operation_envelopes_and_cross_study_annotations(self):
-        apply = self.operation(operation_changes=[self.change(self.task_a, None, 1, 11)])
-        recovery = self.recovery(apply)
-        for payload in (
-                dict(apply, operation_changes=[self.change(self.task_b.replace(
-                        str(self.study_id), str(uuid.uuid4())), None, 1, 11)]),
-                dict(apply, study_id='AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA'),
-                dict(apply, operation_id=apply['operation_id'].replace('-', '')),
-                dict(apply, cancel=True),
-                dict(recovery, recover=False),
-                dict(recovery, recover=1),
-                dict(apply, recover=True),
-                dict(recovery, operation_changes=[]),
-                dict(apply, operation_changes=[]),
-                dict(apply, changes=apply['operation_changes']),
-                dict(apply, operation_changes=[dict(apply['operation_changes'][0], unrelated=True)]),
-                *({key: value for key, value in apply.items() if key != missing}
-                  for missing in ('study_id', 'operation_id', 'deadline', 'operation_changes')),
-                *(dict(apply, deadline=value) for value in
-                  (None, True, 0, -1, 1.5, '1', 253402300800))):
+    def test_rejects_former_operation_envelopes_without_applying(self):
+        operation = {'study_id': str(self.study_id), 'operation_id': str(uuid.uuid4()),
+                'deadline': 253402300799}
+        changes = [self.change(self.task_a, None, 1, 11)]
+        for payload in (dict(operation, operation_changes=changes),
+                dict(operation, recover=True)):
             with self.subTest(payload=payload):
-                self.assertEqual(400, self.post_operation(payload).status_code)
+                response = self.client.post(self.url, payload, content_type='application/json')
+                self.assertEqual(400, response.status_code)
         self.assertEqual(set(), self.neurons_with(self.task_a))
         self.assertEqual(7, self.root(1))
 
-    def test_failed_apply_rolls_back_mutations(self):
-        apply = self.operation(operation_changes=[self.change(self.task_a, None, 1, 11)])
-        original = task_links._apply
 
-        def apply_then_fail(*args, **kwargs):
-            original(*args, **kwargs)
-            raise ValueError('Simulated failure after annotations and reroot')
-
-        with patch.object(task_links, '_apply', side_effect=apply_then_fail):
-            response = self.post_operation(apply)
-        self.assertEqual(400, response.status_code)
-        self.assertEqual(set(), self.neurons_with(self.task_a))
-        self.assertEqual(7, self.root(1))
-        retry = self.post_operation(apply)
-        self.assertStatus(retry)
-        self.assertEqual('applied', retry.json()['results'][0]['status'])
-
-
-class DeadlineTaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase):
-    def overlapping_request(self, pool, call, *, require_lock=False):
+class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase):
+    def overlapping_request(self, pool, call):
         backend_ids = Queue()
 
         def request():
@@ -417,7 +324,6 @@ class DeadlineTaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransaction
                     return waiting
                 self.assertLess(monotonic(), deadline, 'Concurrent request neither waited nor completed')
                 sleep(0.01)
-        self.assertFalse(require_lock, 'Concurrent request completed before the study lock was released')
         return waiting
 
     def test_independent_applies_cannot_link_one_task_to_different_skeletons(self):
@@ -427,8 +333,8 @@ class DeadlineTaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransaction
                 class_name='annotation')
         ClassInstance.objects.create(project_id=self.test_project_id,
                 class_column=annotation_class, user_id=self.test_user_id, name=self.task_a)
-        first = self.operation(operation_changes=[self.change(self.task_a, None, 1, 11)])
-        second = self.operation(operation_changes=[self.change(self.task_a, None, 373, 405)])
+        first = self.change(self.task_a, None, 1, 11)
+        second = self.change(self.task_a, None, 373, 405)
         second_client = TaskLinkTestClient()
         second_client.cookies.update(self.client.cookies)
         original = task_links._apply
@@ -439,20 +345,19 @@ class DeadlineTaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransaction
                 original(project_id, user, plans)
                 if plans[0].skeleton_id == 1:
                     waiters.append(self.overlapping_request(pool,
-                            lambda: self.post_operation(second, second_client)))
+                            lambda: self.post(second, client=second_client)))
 
             with patch.object(task_links, '_apply', side_effect=apply_then_overlap):
-                first_response = self.post_operation(first)
+                first_response = self.post(first)
                 self.assertStatus(first_response)
                 second_response = waiters[0].result(timeout=10)
-        self.assertStatus(second_response)
-        self.assertEqual('applied', first_response.json()['results'][0]['status'])
-        self.assertEqual('skipped', second_response.json()['results'][0]['status'])
+        self.assertEqual('applied', self.results(first_response)[0]['status'])
+        self.assertEqual('skipped', self.results(second_response)[0]['status'])
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
         self.assertEqual(377, self.root(373))
 
     def test_native_reroot_reads_topology_after_concurrent_task_link_commits(self):
-        apply = self.operation(operation_changes=[self.change(self.task_a, None, 373, 407)])
+        change = self.change(self.task_a, None, 373, 407)
         native = Client()
         native.cookies.update(self.client.cookies)
         original = task_links._apply
@@ -465,7 +370,7 @@ class DeadlineTaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransaction
                         '/%d/skeleton/reroot' % self.test_project_id, {'treenode_id': 405})))
 
             with patch.object(task_links, '_apply', side_effect=apply_then_overlap):
-                apply_response = self.post_operation(apply)
+                apply_response = self.post(change)
                 self.assertStatus(apply_response)
             reroot_response = waiters[0].result(timeout=10)
         self.assertStatus(reroot_response)
@@ -473,90 +378,3 @@ class DeadlineTaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransaction
         self.assertEqual({405}, {node for node, parent in parents.items() if parent is None})
         self.assertEqual(405, parents[407])
         self.assertEqual(405, parents[377])
-
-    def database_deadline(self):
-        with connection.cursor() as cursor:
-            cursor.execute('SELECT floor(extract(epoch FROM clock_timestamp()))::bigint + 3')
-            return cursor.fetchone()[0]
-
-    def wait_until_database_deadline(self, deadline):
-        with connection.cursor() as cursor:
-            cursor.execute('''
-                SELECT pg_sleep(GREATEST(0, extract(epoch FROM
-                    (to_timestamp(%s) - clock_timestamp()))))
-            ''', [deadline])
-
-    def test_apply_queued_before_deadline_expires_if_admitted_after_cutoff(self):
-        first = self.operation(operation_changes=[self.change(self.task_a, None, 1, 11)])
-        queued = self.operation(deadline=self.database_deadline(),
-                operation_changes=[self.change(self.task_b, None, 373, 405)])
-        second_client = TaskLinkTestClient()
-        second_client.cookies.update(self.client.cookies)
-        original = task_links._apply
-        waiters = []
-
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            def apply_and_hold_study(project_id, user, plans):
-                original(project_id, user, plans)
-                if plans[0].annotation == self.task_a:
-                    waiters.append(self.overlapping_request(pool,
-                            lambda: self.post_operation(queued, second_client), require_lock=True))
-                    with connection.cursor() as cursor:
-                        cursor.execute('SELECT clock_timestamp() < to_timestamp(%s)',
-                                [queued['deadline']])
-                        self.assertTrue(cursor.fetchone()[0], 'Apply was not queued before cutoff')
-                    self.wait_until_database_deadline(queued['deadline'])
-
-            with patch.object(task_links, '_apply', side_effect=apply_and_hold_study):
-                first_response = self.post_operation(first)
-                self.assertStatus(first_response)
-                second_response = waiters[0].result(timeout=10)
-
-        self.assertStatus(second_response)
-        self.assertEqual({'state': 'expired', 'results': []}, second_response.json())
-        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
-        self.assertEqual(set(), self.neurons_with(self.task_b))
-        self.assertEqual(377, self.root(373))
-
-    def overlapping_apply_and_recovery(self, *, rollback=False):
-        apply = self.operation(deadline=self.database_deadline(),
-                operation_changes=[self.change(self.task_a, None, 1, 11)])
-        recovery = self.recovery(apply)
-        recovery_client = TaskLinkTestClient()
-        recovery_client.cookies.update(self.client.cookies)
-        original = task_links._apply
-        waiters = []
-
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            def apply_and_wait_for_recovery(*args, **kwargs):
-                original(*args, **kwargs)
-                self.wait_until_database_deadline(apply['deadline'])
-                waiters.append(self.overlapping_request(pool,
-                        lambda: self.post_operation(recovery, recovery_client), require_lock=True))
-                if rollback:
-                    raise ValueError('Simulated rollback of in-flight apply')
-
-            with patch.object(task_links, '_apply', side_effect=apply_and_wait_for_recovery):
-                apply_response = self.post_operation(apply)
-                self.assertEqual(400 if rollback else 200, apply_response.status_code,
-                        apply_response.content)
-            self.assertTrue(waiters, 'Recovery did not overlap the admitted apply')
-            recovery_response = waiters[0].result(timeout=10)
-        self.assertStatus(recovery_response)
-        return apply, apply_response, recovery_response.json()
-
-    def test_recovery_waits_for_admitted_apply_to_commit(self):
-        _, apply_response, recovered = self.overlapping_apply_and_recovery()
-        self.assertEqual('completed', apply_response.json()['state'])
-        self.assertEqual({'state': 'settled', 'results': []}, recovered)
-        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
-        self.assertEqual(11, self.root(1))
-
-    def test_recovery_waits_for_admitted_apply_to_roll_back(self):
-        apply, _, recovered = self.overlapping_apply_and_recovery(rollback=True)
-        self.assertEqual({'state': 'settled', 'results': []}, recovered)
-        late_apply = self.post_operation(apply)
-        self.assertStatus(late_apply)
-        self.assertEqual({'state': 'expired', 'results': []}, late_apply.json())
-        self.assertEqual(set(), self.neurons_with(self.task_a))
-        self.assertEqual(7, self.root(1))

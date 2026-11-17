@@ -21,9 +21,6 @@ TASK_ANNOTATION = re.compile(r'neuroglass:study:(%s):task:%s' % (UUID_PATTERN, U
         re.IGNORECASE)
 # The same pattern for PostgreSQL's case-insensitive ~* operator.
 TASK_ANNOTATION_SQL = '^%s$' % TASK_ANNOTATION.pattern
-OPERATION_KEYS = {'study_id', 'operation_id', 'deadline'}
-MAX_DEADLINE = 253402300799
-CHANGE_KEYS = {'annotation', 'expected_skeleton_id', 'skeleton_id', 'reroot_treenode_id'}
 
 
 class TaskLinkConflict(ClientError):
@@ -49,13 +46,6 @@ class ChangePlan:
         return self.reason is None
 
 
-@dataclass
-class OperationRequest:
-    study_id: str
-    deadline: int
-    plans: Optional[List[ChangePlan]]
-
-
 def _int_field(change: Dict, field: str, nullable=False) -> Optional[int]:
     value = change.get(field)
     if value is None and nullable:
@@ -68,11 +58,10 @@ def _int_field(change: Dict, field: str, nullable=False) -> Optional[int]:
     return value
 
 
-def _parse_changes(changes: Any, *, study_id: Optional[str] = None) -> List[ChangePlan]:
+def _parse_changes(changes: Any) -> List[ChangePlan]:
     """Return one plan per change or raise ValueError with a message."""
     if not isinstance(changes, list):
-        field = 'operation_changes' if study_id is not None else 'changes'
-        raise ValueError('"%s" must be a list' % field)
+        raise ValueError('"changes" must be a list')
     plans = []
     for change in changes:
         if not isinstance(change, dict):
@@ -80,12 +69,6 @@ def _parse_changes(changes: Any, *, study_id: Optional[str] = None) -> List[Chan
         name = change.get('annotation')
         if not isinstance(name, str):
             raise ValueError('"annotation" must be a string')
-        if study_id is not None:
-            if change.keys() != CHANGE_KEYS:
-                raise ValueError('Every operation change must have exactly the task-link fields')
-            match = TASK_ANNOTATION.fullmatch(name)
-            if not match or match.group(1).lower() != study_id:
-                raise ValueError('Every operation annotation must be a task of the requested study')
         if 'expected_skeleton_id' not in change:
             raise ValueError('"expected_skeleton_id" is required')
         plans.append(ChangePlan(
@@ -100,30 +83,6 @@ def _parse_changes(changes: Any, *, study_id: Optional[str] = None) -> List[Chan
     if len(set(skeleton_ids)) != len(skeleton_ids):
         raise ValueError('Every skeleton can only be targeted once per request')
     return plans
-
-
-def _canonical_uuid(data: Dict, field: str) -> str:
-    value = data.get(field)
-    if not isinstance(value, str) or re.fullmatch(UUID_PATTERN, value) is None:
-        raise ValueError('"%s" must be a canonical UUID' % field)
-    return value
-
-
-def _parse_operation(data: Dict) -> OperationRequest:
-    recover = data.keys() == OPERATION_KEYS | {'recover'} and data['recover'] is True
-    if not recover and data.keys() != OPERATION_KEYS | {'operation_changes'}:
-        raise ValueError('Expected a task-link apply or recovery request')
-    study_id = _canonical_uuid(data, 'study_id')
-    _canonical_uuid(data, 'operation_id')
-    deadline = _int_field(data, 'deadline')
-    if deadline is None or not 0 < deadline <= MAX_DEADLINE:
-        raise ValueError('"deadline" must be an epoch second in the supported range')
-    if recover:
-        return OperationRequest(study_id, deadline, None)
-    plans = _parse_changes(data['operation_changes'], study_id=study_id)
-    if not plans:
-        raise ValueError('"operation_changes" must not be empty')
-    return OperationRequest(study_id, deadline, plans)
 
 
 def _validate(project_id: int, plans: List[ChangePlan]) -> List[ChangePlan]:
@@ -367,22 +326,6 @@ def _apply_plans(project_id: int, user, plans: List[ChangePlan]) -> List[Dict]:
     } for p in plans]
 
 
-def _resolve_operation(project_id: int, user, operation: OperationRequest) -> Dict:
-    # Recovery waits for admitted operations to commit or roll back. Read the
-    # database wall clock after acquiring the lock, including time spent waiting.
-    with connection.cursor() as cursor:
-        lock_key = 'catmaid-task-link-study:%s:%s' % (project_id, operation.study_id)
-        cursor.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))', [lock_key])
-        cursor.execute('SELECT clock_timestamp() >= to_timestamp(%s)', [operation.deadline])
-        expired = cursor.fetchone()[0]
-
-    if operation.plans is None:
-        return {'state': 'settled' if expired else 'pending', 'results': []}
-    if expired:
-        return {'state': 'expired', 'results': []}
-    return {'state': 'completed', 'results': _apply_plans(project_id, user, operation.plans)}
-
-
 @api_view(['POST'])
 @requires_user_role(UserRole.Annotate)
 def link_tasks(request: HttpRequest, project_id=None) -> JsonResponse:
@@ -396,12 +339,6 @@ def link_tasks(request: HttpRequest, project_id=None) -> JsonResponse:
     All other changes are applied together: if any of them fails, none is
     written and an error is returned.
 
-    The legacy changes request returns results. A deadline-bound apply instead
-    supplies study_id, operation_id, deadline (Unix epoch seconds), and
-    operation_changes. It returns state completed or expired and results.
-    Recovery supplies study_id, operation_id, deadline, and recover set to
-    true. It returns pending before the deadline or settled after the deadline
-    once admitted writes have finished, with an empty results list either way.
     ---
     parameters:
     - name: project_id
@@ -437,21 +374,13 @@ def link_tasks(request: HttpRequest, project_id=None) -> JsonResponse:
         raise PermissionError('Task links require authorization from NeuroGlass')
 
     data = request.data
+    if not isinstance(data, dict) or data.keys() != {'changes'}:
+        return HttpResponseBadRequest('Expected a task-link request containing only "changes"')
     try:
-        if not isinstance(data, dict):
-            raise ValueError('Expected a task-link request object')
-        operation = None
-        if data.keys() == {'changes'}:
-            plans = _parse_changes(data['changes'])
-        else:
-            operation = _parse_operation(data)
+        plans = _parse_changes(data['changes'])
     except ValueError as e:
         return HttpResponseBadRequest(str(e))
 
-    project_id = int(project_id)
     with transaction.atomic():
-        if operation is None:
-            reply = {'results': _apply_plans(project_id, request.user, plans)}
-        else:
-            reply = _resolve_operation(project_id, request.user, operation)
-    return JsonResponse(reply)
+        results = _apply_plans(int(project_id), request.user, plans)
+    return JsonResponse({'results': results})

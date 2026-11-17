@@ -19,32 +19,20 @@ included in this changelog.
 - `POST /{project_id}/skeletons/task-links`:
   Link NeuroGlass task annotations (`neuroglass:study:<uuid>:task:<uuid>`) to
   skeletons and reroot those skeletons, all in one transaction. The JSON body
-  has the field `changes`, a list of objects with `annotation`,
+  is `{"changes": [...]}`. Each change contains `annotation`,
   `expected_skeleton_id` (the skeleton the annotation is linked to now, or
   `null`), `skeleton_id` (the skeleton to link it to) and `reroot_treenode_id`
   (a node of `skeleton_id` that becomes its root). Each change is validated
   against the current state first; invalid or stale changes are skipped. The
   annotation is moved from the neuron of the previous skeleton to the neuron of
   the new one, which must not hold another task annotation of the same study
-  unless that one is moved off in the same request. The response has one entry
-  per change, in input order: `annotation`, `status` (`applied` or `skipped`),
-  `reason` (or `null`) and `rerooted`. Requests that change one annotation or
+  unless that one is moved off in the same request. The response is
+  `{"results": [...]}` with one entry per change in input order. Each result contains
+  `annotation`, `status` (`applied` or `skipped`), `reason` (or `null`) and `rerooted`.
+  Requests that change one annotation or
   target one skeleton more than once are rejected with a 400 response. If any
   valid change can't be fully applied, none is written and an error is
   returned.
-
-  The legacy body is `{changes}` and the response is `{results}`.
-  Clients that need to recover an uncertain outcome can send
-  `{study_id, operation_id, operation_changes}` instead, using canonical UUID
-  strings and the same change objects. Every annotation must belong to
-  `study_id`. An apply returns `{state: "completed", results}` after the
-  results and edits commit together. Retrying the same operation with the
-  same changes returns its stored result. Reusing a completed operation
-  with different changes returns 409.
-  To recover, send `{study_id, operation_id, cancel: true}` with the same IDs.
-  This waits for an in-flight apply and returns its completed result if it
-  commits. Otherwise it returns `{state: "cancelled", results: []}` and
-  prevents any later apply with those IDs in the same project and study.
 
 - `POST /{project_id}/skeletons/{skeleton_id}/delete`:
   Delete a skeleton along with its neuron (like calling /delete on the neuron).
