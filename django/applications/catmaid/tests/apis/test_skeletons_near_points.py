@@ -5,7 +5,7 @@ import json
 from django.contrib.auth.models import User
 from guardian.shortcuts import assign_perm
 
-from catmaid.control.skeleton_proximity import NEAR_POINTS_MAX
+from catmaid.control.skeleton_proximity import MAX_COORDINATE_TRIPLETS
 from catmaid.models import Treenode
 
 from .common import CatmaidApiTestCase
@@ -18,10 +18,10 @@ class SkeletonsNearPointsApiTests(CatmaidApiTestCase):
         self.node_7 = Treenode.objects.get(pk=7)
         self.node_405 = Treenode.objects.get(pk=405)
 
-    def post(self, points, radius):
+    def post(self, coordinates_nm, radius_nm):
         return self.client.post(
                 self.url,
-                json.dumps({'points': points, 'radius': radius}),
+                json.dumps({'points': coordinates_nm, 'radius': radius_nm}),
                 content_type='application/json')
 
     def results(self, response):
@@ -75,8 +75,8 @@ class SkeletonsNearPointsApiTests(CatmaidApiTestCase):
 
     def test_rejects_more_than_5000_points(self):
         self.fake_authentication()
-        self.assertEqual(5000, NEAR_POINTS_MAX)
-        response = self.post([[0, 0, 0]] * (NEAR_POINTS_MAX + 1), 10)
+        self.assertEqual(5000, MAX_COORDINATE_TRIPLETS)
+        response = self.post([[0, 0, 0]] * (MAX_COORDINATE_TRIPLETS + 1), 10)
         self.assertEqual(400, response.status_code)
 
     def test_rejects_non_positive_radius(self):
