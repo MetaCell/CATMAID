@@ -4,7 +4,6 @@
 
 from dataclasses import dataclass
 import math
-import re
 import sys
 
 from django.db import connection, transaction
@@ -16,11 +15,7 @@ from catmaid.control.authentication import PermissionError, requires_user_role
 from catmaid.control.common import get_class_to_id_map, get_relation_to_id_map
 from catmaid.error import ClientError
 from catmaid.models import ClassInstance, ClassInstanceClassInstance, Treenode, UserRole
-
-UUID_PATTERN = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-TASK_ANNOTATION = re.compile(r'neuroglass:study:(%s):task:%s' % (UUID_PATTERN, UUID_PATTERN),
-        re.IGNORECASE)
-
+from catmaid.task_annotations import TASK_ANNOTATION, UUID_PATTERN
 
 # Leave room for the search bounds and squared 3D distances in double precision.
 MAX_SPATIAL_MAGNITUDE = math.sqrt(sys.float_info.max) / 4

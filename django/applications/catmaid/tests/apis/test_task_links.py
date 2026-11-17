@@ -13,6 +13,7 @@ from django.test.client import ClientHandler
 
 from catmaid.control import annotation, skeleton, task_links
 from catmaid.models import Class, ClassInstance, ClassInstanceClassInstance, Treenode
+from catmaid.source_fragments import SOURCE_FRAGMENT_ANNOTATION_PREFIX
 from catmaid.state import make_nocheck_state
 
 from .common import CatmaidApiTestCase, CatmaidApiTransactionTestCase
@@ -119,6 +120,26 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
         self.assertEqual({'skeleton_id': 1, 'rerooted': False}, result)
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
         self.assertEqual(7, self.root(1))
+
+    def test_fast_split_keeps_task_link_on_the_original_skeleton(self):
+        self.assertEqual(1, self.result(self.post(self.change(self.task_a, 7)))['skeleton_id'])
+        provenance = SOURCE_FRAGMENT_ANNOTATION_PREFIX + 'imported-fragment'
+        annotation._annotate_entities(self.test_project_id, [SKELETON_1_NEURON],
+                {name: {'user_id': self.test_user_id}
+                    for name in ('ordinary annotation', provenance)}, allow_reserved=True)
+
+        result = self.result(self.client.post('/%d/skeleton/split' % self.test_project_id,
+                {'treenode_id': 11}))
+
+        self.assertEqual(1, result['existing_skeleton_id'])
+        new_skeleton = result['new_skeleton_id']
+        self.assertNotEqual(1, new_skeleton)
+        self.assertEqual(7, self.root(1))
+        self.assertEqual(11, self.root(new_skeleton))
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+        for skeleton_id in (1, new_skeleton):
+            self.assertLessEqual({'ordinary annotation', provenance},
+                    annotation.annotations_for_skeleton(self.test_project_id, skeleton_id).keys())
 
     def test_assigned_task_cannot_move_or_reroot(self):
         self.link(self.task_a, SKELETON_1_NEURON)

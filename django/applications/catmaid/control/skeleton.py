@@ -32,6 +32,7 @@ from catmaid.history import add_log_entry
 from catmaid.source_fragments import (
     SOURCE_FRAGMENT_ANNOTATION_PREFIX, is_source_fragment_annotation_name,
     reject_reserved_annotation_names)
+from catmaid.task_annotations import TASK_ANNOTATION
 from catmaid.control import tracing
 from catmaid.models import (Project, UserRole, Class, ClassInstance, Review,
         ClassInstanceClassInstance, Relation, Sampler, Treenode,
@@ -1283,6 +1284,8 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
 
     If upstream_annotation_map or downstream_annotation_map are not defined,
     this is interpreted as keeping all annotations for the respective skeleton.
+    Fast Split omits both maps and keeps NeuroGlass task links on the original
+    skeleton, which retains its ID and root.
     Imported source-fragment identifiers are always copied to both parts,
     independently of the requested distribution of ordinary annotations.
     """
@@ -1334,12 +1337,18 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
             {skeleton_id: neuron.id}, cursor)
 
     # Read metadata after serializing structural edits of the source neuron.
+    fast_split = not upstream_annotation_map and not downstream_annotation_map
     if not upstream_annotation_map or not downstream_annotation_map:
         current_annotations = annotations_for_skeleton(project_id, skeleton_id)
     upstream_annotation_map = (json.loads(upstream_annotation_map)
             if upstream_annotation_map else current_annotations)
     downstream_annotation_map = (json.loads(downstream_annotation_map)
             if downstream_annotation_map else current_annotations)
+    if fast_split:
+        downstream_annotation_map = {
+            name: annotator for name, annotator in downstream_annotation_map.items()
+            if not TASK_ANNOTATION.fullmatch(name)
+        }
     source_annotations = _source_fragment_annotations(project_id, [neuron.id], cursor)
     # These annotations record inherited origin, rather than per-node membership.
     # Both split results therefore retain the complete source set.
