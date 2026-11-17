@@ -3,6 +3,7 @@
 """Generic spatial search for skeletons close to given points."""
 
 import math
+import sys
 from typing import Any, List
 
 from django.db import connection
@@ -14,10 +15,26 @@ from catmaid.control.authentication import requires_user_role
 from catmaid.models import UserRole
 
 NEAR_POINTS_MAX = 5000
+# Keep the search box and squared 3D distances within double precision.
+MAX_SPATIAL_MAGNITUDE = math.sqrt(sys.float_info.max) / 4
+
+
+def _spatial_number(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError('Expected a number')
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        raise ValueError('Number is too large for a spatial search') from exc
+    if not math.isfinite(number) or abs(number) > MAX_SPATIAL_MAGNITUDE:
+        raise ValueError('Number is outside the range for spatial searches')
+    return number
 
 
 def _parse_request(data: Any):
     """Return (points, radius) or raise ValueError with a message."""
+    if not isinstance(data, dict):
+        raise ValueError('Expected a proximity request object')
     points = data.get('points')
     if not isinstance(points, list):
         raise ValueError('"points" must be a list of [x, y, z] positions')
@@ -29,17 +46,15 @@ def _parse_request(data: Any):
         if not isinstance(point, (list, tuple)) or len(point) != 3:
             raise ValueError('Every point must be a list of three numbers')
         try:
-            xyz = [float(c) for c in point]
-        except (TypeError, ValueError):
-            raise ValueError('Every point must be a list of three numbers')
-        if not all(math.isfinite(c) for c in xyz):
-            raise ValueError('Point coordinates must be finite')
+            xyz = [_spatial_number(c) for c in point]
+        except ValueError as exc:
+            raise ValueError('Every point must have three finite coordinates in range') from exc
         parsed.append(xyz)
     try:
-        radius = float(data.get('radius'))
-    except (TypeError, ValueError):
-        raise ValueError('"radius" must be a positive number')
-    if not math.isfinite(radius) or radius <= 0:
+        radius = _spatial_number(data.get('radius'))
+    except ValueError as exc:
+        raise ValueError('"radius" must be a positive number in range') from exc
+    if radius <= 0:
         raise ValueError('"radius" must be a positive number')
     return parsed, radius
 

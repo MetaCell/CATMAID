@@ -91,6 +91,21 @@ class SkeletonsNearPointsApiTests(CatmaidApiTestCase):
             response = self.post(points, 10)
             self.assertEqual(400, response.status_code)
 
+    def test_rejects_non_object_body(self):
+        self.fake_authentication()
+        for payload in ([], None, 'points'):
+            with self.subTest(payload=payload):
+                response = self.client.post(self.url, json.dumps(payload),
+                        content_type='application/json')
+                self.assertEqual(400, response.status_code)
+
+    def test_rejects_unusable_spatial_numbers(self):
+        self.fake_authentication()
+        for value in (True, 10**400, 1e308):
+            with self.subTest(value=value):
+                self.assertEqual(400, self.post([[value, 0, 0]], 10).status_code)
+                self.assertEqual(400, self.post([[0, 0, 0]], value).status_code)
+
     def test_browse_only_user_can_read(self):
         user = User.objects.create_user('browse_only', password='pw')
         assign_perm('can_browse', user, self.test_project)

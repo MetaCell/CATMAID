@@ -14,7 +14,7 @@ from django.http import HttpRequest, HttpResponseBadRequest, JsonResponse
 from rest_framework.decorators import api_view
 
 from catmaid.control import annotation, skeleton
-from catmaid.control.authentication import requires_user_role
+from catmaid.control.authentication import PermissionError, requires_user_role
 from catmaid.error import ClientError
 from catmaid.models import Class, Relation, TaskLinkOperation, UserRole
 
@@ -65,6 +65,8 @@ def _int_field(change: Dict, field: str, nullable=False) -> Optional[int]:
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValueError('"%s" must be an integer%s' % (
                 field, ' or null' if nullable else ''))
+    if not -(2**63) <= value < 2**63:
+        raise ValueError('"%s" is outside the supported integer range' % field)
     return value
 
 
@@ -163,21 +165,31 @@ def _validate(project_id: int, plans: List[ChangePlan]) -> List[ChangePlan]:
         if neuron_id is not None:
             holders.setdefault(name, []).append((neuron_id, skeleton_id))
 
-    # The neuron of every target skeleton.
+    # The destination must have one model_of relation in both directions:
+    # task annotations belong to neurons, and a shared neuron would make a
+    # successful link refer to more than one skeleton.
     cursor.execute('''
-        SELECT s.id, model.class_instance_b
+        SELECT s.id, neuron.id, (
+            SELECT count(*)
+            FROM class_instance_class_instance reverse_model
+            WHERE reverse_model.project_id = %(project_id)s
+              AND reverse_model.relation_id = %(model_of)s
+              AND reverse_model.class_instance_b = neuron.id
+        )
         FROM class_instance s
         LEFT JOIN class_instance_class_instance model
             ON model.class_instance_a = s.id AND model.relation_id = %(model_of)s
+            AND model.project_id = %(project_id)s
+        LEFT JOIN class_instance neuron
+            ON neuron.id = model.class_instance_b AND neuron.class_id = %(neuron)s
+            AND neuron.project_id = %(project_id)s
         WHERE s.project_id = %(project_id)s AND s.class_id = %(skeleton)s
           AND s.id = ANY(%(skeleton_ids)s::bigint[])
     ''', {**classes, **relations, 'project_id': project_id,
           'skeleton_ids': [p.skeleton_id for p in plans]})
-    target_neurons: Dict[int, List[int]] = {}
-    for skeleton_id, neuron_id in cursor.fetchall():
-        target_neurons.setdefault(skeleton_id, [])
-        if neuron_id is not None:
-            target_neurons[skeleton_id].append(neuron_id)
+    target_neurons: Dict[int, List] = {}
+    for skeleton_id, neuron_id, model_count in cursor.fetchall():
+        target_neurons.setdefault(skeleton_id, []).append((neuron_id, model_count))
 
     cursor.execute('''
         SELECT id, skeleton_id FROM treenode
@@ -202,10 +214,15 @@ def _validate(project_id: int, plans: List[ChangePlan]) -> List[ChangePlan]:
         if plan.skeleton_id not in target_neurons:
             plan.reason = 'Skeleton %s does not exist' % plan.skeleton_id
             continue
-        if len(target_neurons[plan.skeleton_id]) != 1:
+        models = target_neurons[plan.skeleton_id]
+        if len(models) != 1 or models[0][0] is None:
             plan.reason = 'Skeleton %s is not modeling exactly one neuron' % plan.skeleton_id
             continue
-        plan.target_neuron_id = target_neurons[plan.skeleton_id][0]
+        neuron_id, model_count = models[0]
+        if model_count != 1:
+            plan.reason = 'The target neuron is not modeled by exactly one skeleton'
+            continue
+        plan.target_neuron_id = neuron_id
         if node_skeletons.get(plan.reroot_treenode_id) != plan.skeleton_id:
             plan.reason = 'Node %s is not part of skeleton %s' % (
                     plan.reroot_treenode_id, plan.skeleton_id)
@@ -282,11 +299,27 @@ def _lock_neurons(project_id: int, neuron_ids) -> None:
         raise TaskLinkConflict('A neuron to link no longer exists, please retry')
 
 
+def _lock_task_annotations(project_id: int, plans: List[ChangePlan]) -> None:
+    """Serialize independent operations even if the task has no holder yet."""
+    names = ['catmaid-task-link:%s:%s' % (project_id, p.annotation.lower())
+            for p in plans if TASK_ANNOTATION.fullmatch(p.annotation)]
+    with connection.cursor() as cursor:
+        cursor.execute('''
+            SELECT pg_advisory_xact_lock(lock_id)
+            FROM (
+                SELECT DISTINCT hashtextextended(name, 0) AS lock_id
+                FROM unnest(%s::text[]) AS names(name)
+                ORDER BY lock_id
+            ) locks
+        ''', [names])
+
+
 def _validate_locked(project_id: int, plans: List[ChangePlan]) -> List[ChangePlan]:
-    """Validate the plans against locked state. Like NeuroGlass' task skeleton
-    deletion guard, treenode rows are locked before neuron rows. The neurons to
-    lock come from a first validation; the second one runs under the locks.
-    Must run inside a transaction."""
+    """Lock tasks and reroot targets before checking the current holder.
+    Like NeuroGlass' deletion guard, acquire treenode row locks before neuron
+    row locks. Must run inside a transaction."""
+    _lock_task_annotations(project_id, plans)
+    skeleton._lock_skeletons_for_reroot(project_id, [p.skeleton_id for p in plans])
     _lock_treenodes(project_id, [p.reroot_treenode_id for p in plans])
     locked = _neuron_ids(_validate(project_id, plans))
     _lock_neurons(project_id, locked)
@@ -395,6 +428,12 @@ def link_tasks(request: HttpRequest, project_id=None) -> JsonResponse:
           was skipped).
         required: true
     """
+    # Only the NeuroGlass policy may grant this capability on the request,
+    # after verifying the signed project, study and payload. Native CATMAID
+    # annotation permissions alone must never activate this workflow.
+    if getattr(request, '_neuroglass_task_link_authorized', False) is not True:
+        raise PermissionError('Task links require authorization from NeuroGlass')
+
     data = request.data
     try:
         if not isinstance(data, dict):

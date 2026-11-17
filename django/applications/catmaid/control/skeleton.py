@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 from collections import defaultdict
+from contextlib import contextmanager
 import csv
 from datetime import datetime, timedelta
 from itertools import chain
@@ -2282,6 +2283,19 @@ def reroot_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
         raise ValueError(response_on_error + ':' + str(e))
 
 
+def _lock_skeletons_for_reroot(project_id, skeleton_ids):
+    """Serialize topology snapshots for reroots within the current transaction."""
+    with connection.cursor() as cursor, _bounded_skeleton_edit_lock(
+            cursor, 'A skeleton is being edited; retry the operation.'):
+        cursor.execute('''
+            SELECT pg_advisory_xact_lock(
+                hashtextextended('catmaid-reroot:' || %s::text || ':' || id, 0))
+            FROM unnest(%s::bigint[]) AS skeletons(id)
+            ORDER BY id
+        ''', [int(project_id), sorted(set(skeleton_ids))])
+
+
+@transaction.atomic
 def _reroot_skeleton(treenode_id, project_id):
     """ Returns the treenode instance that is now root,
     or False if the treenode was root already. """
@@ -2291,7 +2305,12 @@ def _reroot_skeleton(treenode_id, project_id):
     response_on_error = ''
     try:
         response_on_error = 'Failed to select treenode with id %s.' % treenode_id
+        skeleton_id = Treenode.objects.values_list('skeleton_id', flat=True).get(
+                id=treenode_id, project=project_id)
+        _lock_skeletons_for_reroot(project_id, [skeleton_id])
         rootnode = Treenode.objects.get(id=treenode_id, project=project_id)
+        if rootnode.skeleton_id != skeleton_id:
+            raise ValueError('The treenode changed skeletons during reroot, please retry')
 
         # Obtain the treenode from the response
         first_parent = rootnode.parent_id
@@ -2431,21 +2450,16 @@ def join_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
         raise ValueError(response_on_error + ':' + str(e))
 
 
-def _lock_source_fragment_neurons(project_id, neuron_ids, cursor) -> None:
-    """Serialize inheritance even when edits select different nodes of one neuron.
-
-    Read provenance after locking its owner, then recheck captured node ownership.
-    Wait briefly for a conflicting editor; longer contention asks the caller to
-    retry. Limit only this lock acquisition, not the rest of the request.
-    """
-    expected = set(neuron_ids)
+@contextmanager
+def _bounded_skeleton_edit_lock(cursor, conflict_message):
+    """Limit a lock acquisition without changing the rest of the transaction."""
     timeout_ms = settings.SKELETON_EDIT_LOCK_TIMEOUT_MS
     if (isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int)
             or not 0 < timeout_ms <= 2147483647):
         raise ImproperlyConfigured('SKELETON_EDIT_LOCK_TIMEOUT_MS must be a positive integer')
     try:
         # A savepoint restores the timeout and releases partial locks if the
-        # query times out. On success the row locks live until request commit.
+        # query times out. On success the locks live until request commit.
         with transaction.atomic(using=cursor.db.alias):
             cursor.execute("SELECT setting::integer FROM pg_settings WHERE name='lock_timeout'")
             previous_timeout_ms = cursor.fetchone()[0]
@@ -2454,22 +2468,32 @@ def _lock_source_fragment_neurons(project_id, neuron_ids, cursor) -> None:
                     if previous_timeout_ms else timeout_ms)
             cursor.execute("SELECT set_config('lock_timeout', %s, true)",
                     [f'{effective_timeout_ms}ms'])
-            cursor.execute("""
-                SELECT ci.id
-                FROM class_instance ci
-                JOIN class c ON c.id = ci.class_id
-                WHERE ci.project_id = %s AND ci.id = ANY(%s::bigint[])
-                    AND c.class_name = 'neuron'
-                ORDER BY ci.id
-                FOR NO KEY UPDATE OF ci
-            """, (project_id, sorted(expected)))
-            locked = {row[0] for row in cursor.fetchall()}
+            yield
             cursor.execute("SELECT set_config('lock_timeout', %s, true)",
                     [f'{previous_timeout_ms}ms'])
     except OperationalError as error:
         if getattr(error.__cause__, 'pgcode', None) == '55P03':
-            raise ValueError('A source neuron is being edited; retry the operation.') from error
+            raise ValueError(conflict_message) from error
         raise
+
+
+def _lock_source_fragment_neurons(project_id, neuron_ids, cursor) -> None:
+    """Serialize inheritance even when edits select different nodes of one neuron.
+    Read provenance after locking its owner, then recheck captured node ownership.
+    """
+    expected = set(neuron_ids)
+    with _bounded_skeleton_edit_lock(
+            cursor, 'A source neuron is being edited; retry the operation.'):
+        cursor.execute("""
+            SELECT ci.id
+            FROM class_instance ci
+            JOIN class c ON c.id = ci.class_id
+            WHERE ci.project_id = %s AND ci.id = ANY(%s::bigint[])
+                AND c.class_name = 'neuron'
+            ORDER BY ci.id
+            FOR NO KEY UPDATE OF ci
+        """, (project_id, sorted(expected)))
+        locked = {row[0] for row in cursor.fetchall()}
     if locked != expected:
         raise ValueError('A source neuron changed during the operation; retry it.')
 
@@ -2584,6 +2608,7 @@ def get_stable_partner_annotation(project_id):
     return row[0] if row else 'stable'
 
 
+@transaction.atomic
 def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
         annotation_map, sampler_handling=None, lose_sampler_handling='keep-samplers',
         from_name_reference=False) -> Dict[str, Any]:
@@ -2639,6 +2664,10 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
                 user, to_neuron['neuronid'], 'neuron')
 
         cursor = connection.cursor()
+
+        # Join also reroots one partner. Take the same locks as reroot and
+        # task links before either neuron or treenode row locks.
+        _lock_skeletons_for_reroot(project_id, [from_skid, to_skid])
 
         # Acquire ownership locks before reading metadata that can change while
         # waiting, including edit restrictions, names and stable-winner labels.
