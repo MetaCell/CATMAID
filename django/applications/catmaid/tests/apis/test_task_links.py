@@ -91,6 +91,10 @@ class TaskLinksFixtures:
         return {'study_id': str(self.study_id), 'operation_id': str(uuid.uuid4()),
                 'deadline': 253402300799, **kwargs}
 
+    def recovery(self, apply):
+        return {**{key: apply[key] for key in ('study_id', 'operation_id', 'deadline')},
+                'recover': True}
+
 
 class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
     def test_native_annotator_cannot_apply_task_links(self):
@@ -313,7 +317,7 @@ class DeadlineTaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
 
     def test_recovery_before_deadline_is_pending_without_mutations(self):
         apply = self.operation(operation_changes=[self.change(self.task_a, None, 1, 11)])
-        response = self.post_operation(dict(apply, recover=True))
+        response = self.post_operation(self.recovery(apply))
         self.assertStatus(response)
         self.assertEqual({'state': 'pending', 'results': []}, response.json())
         self.assertEqual(set(), self.neurons_with(self.task_a))
@@ -332,43 +336,31 @@ class DeadlineTaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
         self.assertEqual(set(), self.neurons_with(self.task_a))
         self.assertEqual(7, self.root(1))
 
-    def test_recovery_observes_current_links_and_roots_in_request_order(self):
-        missing = task_annotation(self.study_id)
-        ambiguous = task_annotation(self.study_id)
+    def test_recovery_after_deadline_settles_without_changing_existing_links_or_roots(self):
         self.link(self.task_a, SKELETON_1_NEURON)
         self.link(self.task_b, SKELETON_373_NEURON)
-        self.link(ambiguous, SKELETON_1_NEURON)
-        self.link(ambiguous, SKELETON_373_NEURON)
-        # Skeleton 373 has two roots, so recovery cannot report a unique root.
-        Treenode.objects.filter(pk=405).update(parent=None)
 
-        recover = self.operation(deadline=1, recover=True, operation_changes=[
-            self.change(self.task_b, 1, 373, 407),
-            self.change(missing, None, 2, 11),
-            self.change(self.task_a, None, 1, 11),
-            self.change(ambiguous, None, 3, 11),
-        ])
-        response = self.post_operation(recover)
+        response = self.post_operation(self.operation(deadline=1, recover=True))
         self.assertStatus(response)
-        self.assertEqual({'state': 'observed', 'results': [
-            {'annotation': self.task_b, 'skeleton_id': 373, 'root_id': None},
-            {'annotation': missing, 'skeleton_id': None, 'root_id': None},
-            {'annotation': self.task_a, 'skeleton_id': 1, 'root_id': 7},
-            {'annotation': ambiguous, 'skeleton_id': None, 'root_id': None},
-        ]}, response.json())
+        self.assertEqual({'state': 'settled', 'results': []}, response.json())
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+        self.assertEqual({SKELETON_373_NEURON}, self.neurons_with(self.task_b))
         self.assertEqual(7, self.root(1))
+        self.assertEqual(377, self.root(373))
 
     def test_rejects_malformed_operation_envelopes_and_cross_study_annotations(self):
         apply = self.operation(operation_changes=[self.change(self.task_a, None, 1, 11)])
+        recovery = self.recovery(apply)
         for payload in (
                 dict(apply, operation_changes=[self.change(self.task_b.replace(
                         str(self.study_id), str(uuid.uuid4())), None, 1, 11)]),
                 dict(apply, study_id='AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA'),
                 dict(apply, operation_id=apply['operation_id'].replace('-', '')),
                 dict(apply, cancel=True),
-                dict(apply, recover=False),
-                dict(apply, recover=1),
-                dict(apply, recover=True, operation_changes=[]),
+                dict(recovery, recover=False),
+                dict(recovery, recover=1),
+                dict(apply, recover=True),
+                dict(recovery, operation_changes=[]),
                 dict(apply, operation_changes=[]),
                 dict(apply, changes=apply['operation_changes']),
                 dict(apply, operation_changes=[dict(apply['operation_changes'][0], unrelated=True)]),
@@ -529,7 +521,7 @@ class DeadlineTaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransaction
     def overlapping_apply_and_recovery(self, *, rollback=False):
         apply = self.operation(deadline=self.database_deadline(),
                 operation_changes=[self.change(self.task_a, None, 1, 11)])
-        recovery = dict(apply, recover=True)
+        recovery = self.recovery(apply)
         recovery_client = TaskLinkTestClient()
         recovery_client.cookies.update(self.client.cookies)
         original = task_links._apply
@@ -553,19 +545,16 @@ class DeadlineTaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransaction
         self.assertStatus(recovery_response)
         return apply, apply_response, recovery_response.json()
 
-    def test_recovery_waits_for_admitted_apply_commit_and_observes_link_and_root(self):
+    def test_recovery_waits_for_admitted_apply_to_commit(self):
         _, apply_response, recovered = self.overlapping_apply_and_recovery()
         self.assertEqual('completed', apply_response.json()['state'])
-        self.assertEqual({'state': 'observed', 'results': [
-            {'annotation': self.task_a, 'skeleton_id': 1, 'root_id': 11},
-        ]}, recovered)
+        self.assertEqual({'state': 'settled', 'results': []}, recovered)
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+        self.assertEqual(11, self.root(1))
 
-    def test_recovery_waits_for_admitted_apply_rollback_and_observes_no_link(self):
+    def test_recovery_waits_for_admitted_apply_to_roll_back(self):
         apply, _, recovered = self.overlapping_apply_and_recovery(rollback=True)
-        self.assertEqual({'state': 'observed', 'results': [
-            {'annotation': self.task_a, 'skeleton_id': None, 'root_id': None},
-        ]}, recovered)
+        self.assertEqual({'state': 'settled', 'results': []}, recovered)
         late_apply = self.post_operation(apply)
         self.assertStatus(late_apply)
         self.assertEqual({'state': 'expired', 'results': []}, late_apply.json())

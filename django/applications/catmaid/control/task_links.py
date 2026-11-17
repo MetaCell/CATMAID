@@ -21,7 +21,7 @@ TASK_ANNOTATION = re.compile(r'neuroglass:study:(%s):task:%s' % (UUID_PATTERN, U
         re.IGNORECASE)
 # The same pattern for PostgreSQL's case-insensitive ~* operator.
 TASK_ANNOTATION_SQL = '^%s$' % TASK_ANNOTATION.pattern
-OPERATION_KEYS = {'study_id', 'operation_id', 'deadline', 'operation_changes'}
+OPERATION_KEYS = {'study_id', 'operation_id', 'deadline'}
 MAX_DEADLINE = 253402300799
 CHANGE_KEYS = {'annotation', 'expected_skeleton_id', 'skeleton_id', 'reroot_treenode_id'}
 
@@ -53,8 +53,7 @@ class ChangePlan:
 class OperationRequest:
     study_id: str
     deadline: int
-    plans: List[ChangePlan]
-    recover: bool
+    plans: Optional[List[ChangePlan]]
 
 
 def _int_field(change: Dict, field: str, nullable=False) -> Optional[int]:
@@ -112,25 +111,19 @@ def _canonical_uuid(data: Dict, field: str) -> str:
 
 def _parse_operation(data: Dict) -> OperationRequest:
     recover = data.keys() == OPERATION_KEYS | {'recover'} and data['recover'] is True
-    if not recover and data.keys() != OPERATION_KEYS:
+    if not recover and data.keys() != OPERATION_KEYS | {'operation_changes'}:
         raise ValueError('Expected a task-link apply or recovery request')
     study_id = _canonical_uuid(data, 'study_id')
     _canonical_uuid(data, 'operation_id')
     deadline = _int_field(data, 'deadline')
     if deadline is None or not 0 < deadline <= MAX_DEADLINE:
         raise ValueError('"deadline" must be an epoch second in the supported range')
+    if recover:
+        return OperationRequest(study_id, deadline, None)
     plans = _parse_changes(data['operation_changes'], study_id=study_id)
     if not plans:
         raise ValueError('"operation_changes" must not be empty')
-    return OperationRequest(study_id, deadline, plans, recover)
-
-
-def _schema_ids(project_id: int) -> Dict[str, int]:
-    classes = dict(Class.objects.filter(project_id=project_id,
-            class_name__in=('annotation', 'neuron', 'skeleton')).values_list('class_name', 'id'))
-    relations = dict(Relation.objects.filter(project_id=project_id,
-            relation_name__in=('annotated_with', 'model_of')).values_list('relation_name', 'id'))
-    return {**classes, **relations, 'project_id': project_id}
+    return OperationRequest(study_id, deadline, plans)
 
 
 def _validate(project_id: int, plans: List[ChangePlan]) -> List[ChangePlan]:
@@ -140,7 +133,11 @@ def _validate(project_id: int, plans: List[ChangePlan]) -> List[ChangePlan]:
     for plan in plans:
         plan.reason = plan.study_id = plan.annotation_id = None
         plan.previous_neuron_id = plan.target_neuron_id = None
-    schema_ids = _schema_ids(project_id)
+    classes = dict(Class.objects.filter(project_id=project_id,
+            class_name__in=('annotation', 'neuron', 'skeleton')).values_list('class_name', 'id'))
+    relations = dict(Relation.objects.filter(project_id=project_id,
+            relation_name__in=('annotated_with', 'model_of')).values_list('relation_name', 'id'))
+    schema_ids = {**classes, **relations, 'project_id': project_id}
     cursor = connection.cursor()
 
     for plan in plans:
@@ -370,44 +367,6 @@ def _apply_plans(project_id: int, user, plans: List[ChangePlan]) -> List[Dict]:
     } for p in plans]
 
 
-def _observe_task_links(project_id: int, plans: List[ChangePlan]) -> List[Dict]:
-    # Read links and roots in one statement so they share the same snapshot.
-    # An unlinked task or an ambiguous set of links has no current skeleton.
-    with connection.cursor() as cursor:
-        cursor.execute('''
-            WITH requested(name, ordinal) AS (
-                SELECT * FROM unnest(%(names)s::text[]) WITH ORDINALITY
-            ), linked AS (
-                SELECT requested.ordinal, MIN(skeleton.id) AS skeleton_id
-                FROM requested
-                JOIN class_instance a ON a.project_id = %(project_id)s
-                    AND a.class_id = %(annotation)s AND a.name = requested.name
-                JOIN class_instance_class_instance link ON link.class_instance_b = a.id
-                    AND link.project_id = %(project_id)s AND link.relation_id = %(annotated_with)s
-                JOIN class_instance neuron ON neuron.id = link.class_instance_a
-                    AND neuron.project_id = %(project_id)s AND neuron.class_id = %(neuron)s
-                LEFT JOIN class_instance_class_instance model ON model.class_instance_b = neuron.id
-                    AND model.project_id = %(project_id)s AND model.relation_id = %(model_of)s
-                LEFT JOIN class_instance skeleton ON skeleton.id = model.class_instance_a
-                    AND skeleton.project_id = %(project_id)s AND skeleton.class_id = %(skeleton)s
-                GROUP BY requested.ordinal
-                HAVING COUNT(*) = 1
-            )
-            SELECT requested.name, linked.skeleton_id, (
-                SELECT MIN(t.id)
-                FROM treenode t
-                WHERE t.project_id = %(project_id)s AND t.skeleton_id = linked.skeleton_id
-                    AND t.parent_id IS NULL
-                HAVING COUNT(*) = 1
-            ) AS root_id
-            FROM requested
-            LEFT JOIN linked ON linked.ordinal = requested.ordinal
-            ORDER BY requested.ordinal
-        ''', {**_schema_ids(project_id), 'names': [p.annotation for p in plans]})
-        return [{'annotation': name, 'skeleton_id': skeleton_id, 'root_id': root_id}
-                for name, skeleton_id, root_id in cursor.fetchall()]
-
-
 def _resolve_operation(project_id: int, user, operation: OperationRequest) -> Dict:
     # Recovery waits for admitted operations to commit or roll back. Read the
     # database wall clock after acquiring the lock, including time spent waiting.
@@ -417,10 +376,8 @@ def _resolve_operation(project_id: int, user, operation: OperationRequest) -> Di
         cursor.execute('SELECT clock_timestamp() >= to_timestamp(%s)', [operation.deadline])
         expired = cursor.fetchone()[0]
 
-    if operation.recover:
-        if not expired:
-            return {'state': 'pending', 'results': []}
-        return {'state': 'observed', 'results': _observe_task_links(project_id, operation.plans)}
+    if operation.plans is None:
+        return {'state': 'settled' if expired else 'pending', 'results': []}
     if expired:
         return {'state': 'expired', 'results': []}
     return {'state': 'completed', 'results': _apply_plans(project_id, user, operation.plans)}
@@ -442,9 +399,9 @@ def link_tasks(request: HttpRequest, project_id=None) -> JsonResponse:
     The legacy changes request returns results. A deadline-bound apply instead
     supplies study_id, operation_id, deadline (Unix epoch seconds), and
     operation_changes. It returns state completed or expired and results.
-    Recovery sends the same fields and recover set to true. It returns pending
-    before the deadline or observed with one current skeleton and root per
-    requested annotation once admitted writes have finished.
+    Recovery supplies study_id, operation_id, deadline, and recover set to
+    true. It returns pending before the deadline or settled after the deadline
+    once admitted writes have finished, with an empty results list either way.
     ---
     parameters:
     - name: project_id
