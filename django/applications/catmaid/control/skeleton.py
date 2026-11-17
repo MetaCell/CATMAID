@@ -52,8 +52,7 @@ from catmaid.control.link import LINK_TYPES
 from catmaid.control.neuron import _delete_if_empty, _get_all_skeletons_of_neuron, \
         _delete_neuron_as_user
 from catmaid.control.annotation import (annotations_for_skeleton,
-        create_annotation_query, _annotate_entities, _update_neuron_annotations,
-        clear_annotations)
+        _annotate_entities, _update_neuron_annotations, clear_annotations)
 from catmaid.control.provenance import get_data_source, normalize_source_url
 from catmaid.control.review import get_review_status
 from catmaid.control.tree_util import find_root, reroot, edge_count_to_root
@@ -1217,24 +1216,6 @@ def connectivity_counts(request:HttpRequest, project_id=None) -> JsonResponse:
     })
 
 
-def check_annotations_on_split(project_id, skeleton_id, over_annotation_set,
-        under_annotation_set) -> bool:
-    """ With respect to annotations, a split is only correct if one part keeps
-    the whole set of annotations.
-    """
-    # Get current annotation set
-    annotation_query = create_annotation_query(project_id,
-        {'skeleton_id': skeleton_id})
-
-    # Check if current set is equal to under or over set
-    current_annotation_set = frozenset(a.name for a in annotation_query)
-    if not current_annotation_set.difference(over_annotation_set):
-        return True
-    if not current_annotation_set.difference(under_annotation_set):
-        return True
-
-    return False
-
 def check_new_annotations(project_id, user, entity_id, annotation_set) -> bool:
     """ With respect to annotations, the new annotation set is only valid if the
     user doesn't remove annotations for which (s)he has no permissions.
@@ -1283,9 +1264,8 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     neuron are updated to refer to the new skeleton.
 
     If upstream_annotation_map or downstream_annotation_map are not defined,
-    this is interpreted as keeping all annotations for the respective skeleton.
-    Fast Split omits both maps and keeps NeuroGlass task links on the original
-    skeleton, which retains its ID and root.
+    ordinary annotations are copied to the respective skeleton. NeuroGlass task
+    links stay on the original skeleton, which retains its ID and root.
     Imported source-fragment identifiers are always copied to both parts,
     independently of the requested distribution of ordinary annotations.
     """
@@ -1337,18 +1317,20 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
             {skeleton_id: neuron.id}, cursor)
 
     # Read metadata after serializing structural edits of the source neuron.
-    fast_split = not upstream_annotation_map and not downstream_annotation_map
-    if not upstream_annotation_map or not downstream_annotation_map:
-        current_annotations = annotations_for_skeleton(project_id, skeleton_id)
+    current_annotations = annotations_for_skeleton(project_id, skeleton_id)
     upstream_annotation_map = (json.loads(upstream_annotation_map)
             if upstream_annotation_map else current_annotations)
     downstream_annotation_map = (json.loads(downstream_annotation_map)
             if downstream_annotation_map else current_annotations)
-    if fast_split:
-        downstream_annotation_map = {
-            name: annotator for name, annotator in downstream_annotation_map.items()
-            if not TASK_ANNOTATION.fullmatch(name)
-        }
+
+    # Take task links from the locked source, since the preview may be stale.
+    task_annotations = {name: annotator for name, annotator in current_annotations.items()
+            if TASK_ANNOTATION.fullmatch(name)}
+    upstream_annotation_map = {name: annotator for name, annotator in upstream_annotation_map.items()
+            if not TASK_ANNOTATION.fullmatch(name)}
+    upstream_annotation_map.update(task_annotations)
+    downstream_annotation_map = {name: annotator for name, annotator in downstream_annotation_map.items()
+            if not TASK_ANNOTATION.fullmatch(name)}
     source_annotations = _source_fragment_annotations(project_id, [neuron.id], cursor)
     # These annotations record inherited origin, rather than per-node membership.
     # Both split results therefore retain the complete source set.
@@ -1357,9 +1339,10 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     downstream_annotation_map = _retain_source_fragment_annotations(
             downstream_annotation_map, source_annotations)
 
-    if not check_annotations_on_split(project_id, skeleton_id,
-            frozenset(upstream_annotation_map.keys()),
-            frozenset(downstream_annotation_map.keys())):
+    # Either piece can keep the complete set of distributable annotations.
+    distributable_annotations = current_annotations.keys() - task_annotations.keys()
+    if not (distributable_annotations.issubset(upstream_annotation_map)
+            or distributable_annotations.issubset(downstream_annotation_map)):
         raise ValueError("Annotation distribution is not valid for splitting. "
                 "One part has to keep the whole set of annotations!")
 

@@ -2253,17 +2253,8 @@ var SkeletonAnnotations = {};
           var dialog = new CATMAID.SplitMergeDialog({
             model1: model,
             splitNodeId: nodeId,
-            split: function() {
-              // Get upstream and downstream annotation set
-              var upstream_set, downstream_set;
-              if (self.upstream_is_small) {
-                upstream_set = dialog.get_under_annotation_set();
-                downstream_set = dialog.get_over_annotation_set();
-              } else {
-                upstream_set = dialog.get_over_annotation_set();
-                downstream_set = dialog.get_under_annotation_set();
-              }
-              return split(node, upstream_set, downstream_set)
+            split: function(upstreamAnnotations, downstreamAnnotations) {
+              return split(node, upstreamAnnotations, downstreamAnnotations)
                 .catch(CATMAID.handleError)
                 .finally(() => resolve());
             },

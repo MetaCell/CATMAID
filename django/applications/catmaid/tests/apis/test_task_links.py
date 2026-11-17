@@ -141,6 +141,54 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
             self.assertLessEqual({'ordinary annotation', provenance},
                     annotation.annotations_for_skeleton(self.test_project_id, skeleton_id).keys())
 
+    def test_confirmed_split_does_not_duplicate_the_task_link(self):
+        self.link(self.task_a, SKELETON_1_NEURON)
+        self.link('shared label', SKELETON_1_NEURON)
+        selected = json.dumps({self.task_a: self.test_user_id, 'shared label': self.test_user_id})
+
+        result = self.result(self.client.post('/%d/skeleton/split' % self.test_project_id, {
+            'treenode_id': 11,
+            'upstream_annotation_map': selected,
+            'downstream_annotation_map': selected,
+        }))
+
+        self.assertEqual(1, result['existing_skeleton_id'])
+        self.assertEqual(7, self.root(1))
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+        self.assertEqual({'shared label': self.test_user_id},
+                annotation.annotations_for_skeleton(self.test_project_id, result['new_skeleton_id']))
+
+    def test_confirmed_split_keeps_task_link_when_all_ordinary_labels_go_to_new_skeleton(self):
+        self.link(self.task_a, SKELETON_1_NEURON)
+        self.link('selected label', SKELETON_1_NEURON)
+
+        result = self.result(self.client.post('/%d/skeleton/split' % self.test_project_id, {
+            'treenode_id': 11,
+            'upstream_annotation_map': '{}',
+            'downstream_annotation_map': json.dumps({
+                self.task_a: self.test_user_id,
+                self.task_b: self.test_user_id,
+                'selected label': self.test_user_id,
+            }),
+        }))
+
+        self.assertEqual({self.task_a: self.test_user_id},
+                annotation.annotations_for_skeleton(self.test_project_id, 1))
+        self.assertEqual({'selected label': self.test_user_id},
+                annotation.annotations_for_skeleton(self.test_project_id, result['new_skeleton_id']))
+        self.assertEqual(set(), self.neurons_with(self.task_b))
+
+    def test_confirmed_split_keeps_task_link_omitted_from_both_maps(self):
+        self.link(self.task_a, SKELETON_1_NEURON)
+
+        self.result(self.client.post('/%d/skeleton/split' % self.test_project_id, {
+            'treenode_id': 11,
+            'upstream_annotation_map': '{}',
+            'downstream_annotation_map': '{}',
+        }))
+
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+
     def test_assigned_task_cannot_move_or_reroot(self):
         self.link(self.task_a, SKELETON_1_NEURON)
         for skeleton_id, node in ((1, 11), (373, 405)):
