@@ -6,23 +6,15 @@ included in this changelog.
 
 ### Additions
 
-- `POST /{project_id}/skeletons/near-points`:
-  Find all skeletons with a node within a radius (nm) of each of up to 5000
-  points (nm, project space). The JSON body has the fields `points`
-  (`[[x, y, z], ...]`) and `radius`. The response has one list per input point,
-  in input order, with one entry per skeleton in range: `skeleton_id`, the
-  skeleton's nearest node (`treenode_id`, `distance`, `x`, `y`, `z`) and the
-  skeleton's current `root_id`. Entries are sorted by distance, then skeleton
-  ID. Requests with more than 5000 points or a non-positive radius are
-  rejected with a 400 response.
-
 - `POST /{project_id}/skeletons/task-link`:
-  Assign an unlinked NeuroGlass task to a skeleton and reroot it in one
-  transaction. Send `annotation` (`neuroglass:study:<uuid>:task:<uuid>`),
-  `skeleton_id`, and `reroot_treenode_id`. The response contains
-  `skeleton_id` and `rerooted`. The endpoint returns 409 if the task already
-  has an association, another task from the same study holds the destination,
-  or the requested node is no longer on the destination skeleton.
+  Send a task `annotation` (`neuroglass:study:<uuid>:task:<uuid>`), one
+  `coordinate` (`[x, y, z]`), and a positive `radius` in project nanometres.
+  CATMAID picks the nearest available skeleton, breaking ties by skeleton ID and
+  then treenode ID. It assigns an unlinked task and makes the closest node the
+  root in one transaction. The response contains `skeleton_id` and `rerooted`.
+  A search with no eligible skeleton returns 409 with
+  `meta.code: "task_link_no_match"`. A conflicting link or target change also
+  returns 409.
 
 - `POST /{project_id}/skeletons/{skeleton_id}/delete`:
   Delete a skeleton along with its neuron (like calling /delete on the neuron).

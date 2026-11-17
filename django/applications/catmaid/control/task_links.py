@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 
-"""Atomically assign an unlinked NeuroGlass task to a skeleton."""
+"""Find and atomically assign the closest eligible skeleton to a NeuroGlass task."""
 
 from dataclasses import dataclass
+import math
 import re
+import sys
 
 from django.db import connection, transaction
 from django.http import HttpRequest, HttpResponseBadRequest, JsonResponse
@@ -11,6 +13,7 @@ from rest_framework.decorators import api_view
 
 from catmaid.control import annotation, skeleton
 from catmaid.control.authentication import PermissionError, requires_user_role
+from catmaid.control.common import get_class_to_id_map, get_relation_to_id_map
 from catmaid.error import ClientError
 from catmaid.models import ClassInstance, ClassInstanceClassInstance, Treenode, UserRole
 
@@ -19,30 +22,103 @@ TASK_ANNOTATION = re.compile(r'neuroglass:study:(%s):task:%s' % (UUID_PATTERN, U
         re.IGNORECASE)
 
 
+# Leave room for the search bounds and squared 3D distances in double precision.
+MAX_SPATIAL_MAGNITUDE = math.sqrt(sys.float_info.max) / 4
+
+
 class TaskLinkConflict(ClientError):
     status_code = 409
+
+
+class TaskLinkNoMatch(TaskLinkConflict):
+    meta = {'code': 'task_link_no_match'}
 
 
 @dataclass(frozen=True)
 class TaskLink:
     annotation: str
     study_id: str
-    skeleton_id: int
-    reroot_treenode_id: int
+    coordinate: tuple[float, float, float]
+    radius: float
+
+
+def _spatial_number(value) -> float:
+    if type(value) not in (int, float) or not -MAX_SPATIAL_MAGNITUDE <= value <= MAX_SPATIAL_MAGNITUDE:
+        raise ValueError('Expected a finite number in the supported spatial range')
+    return float(value)
 
 
 def _parse_link(data) -> TaskLink:
-    if not isinstance(data, dict) or data.keys() != {'annotation', 'skeleton_id', 'reroot_treenode_id'}:
-        raise ValueError('Expected an annotation, a skeleton ID and a reroot treenode ID')
+    if not isinstance(data, dict) or data.keys() != {'annotation', 'coordinate', 'radius'}:
+        raise ValueError('Expected an annotation, one coordinate and a radius')
     name = data['annotation']
     match = TASK_ANNOTATION.fullmatch(name) if isinstance(name, str) else None
     if match is None:
         raise ValueError('Expected a NeuroGlass task annotation')
-    for field in ('skeleton_id', 'reroot_treenode_id'):
-        value = data[field]
-        if type(value) is not int or not 0 < value < 2**63:
-            raise ValueError('"%s" must be a positive integer in the supported range' % field)
-    return TaskLink(name, match.group(1), data['skeleton_id'], data['reroot_treenode_id'])
+    coordinate = data['coordinate']
+    if not isinstance(coordinate, list) or len(coordinate) != 3:
+        raise ValueError('Expected one [x, y, z] coordinate triplet')
+    x, y, z = (_spatial_number(value) for value in coordinate)
+    radius = _spatial_number(data['radius'])
+    if radius <= 0:
+        raise ValueError('The radius must be positive')
+    return TaskLink(name, match.group(1), (x, y, z), radius)
+
+
+def _nearest_candidate(project_id, coordinate, radius, study_annotations):
+    x, y, z = coordinate
+    with connection.cursor() as cursor:
+        relations = get_relation_to_id_map(project_id, ['model_of', 'annotated_with'], cursor)
+        classes = get_class_to_id_map(project_id, ['neuron', 'skeleton', 'annotation'], cursor)
+        # The indexed edge bounds narrow the search before measuring distances to nodes.
+        # Find each skeleton's closest node before checking neuron ownership.
+        cursor.execute("""
+            WITH nearby AS (
+                SELECT DISTINCT ON (t.skeleton_id) t.skeleton_id, t.id AS treenode_id,
+                    ST_3DDistance(ST_StartPoint(e.edge), ST_MakePoint(%(x)s, %(y)s, %(z)s)) AS distance
+                FROM treenode_edge e
+                JOIN treenode t ON t.id = e.id AND t.project_id = e.project_id
+                WHERE e.project_id = %(project)s
+                  AND e.edge &&& ST_MakeLine(
+                      ST_MakePoint(%(min_x)s, %(min_y)s, %(min_z)s),
+                      ST_MakePoint(%(max_x)s, %(max_y)s, %(max_z)s))
+                  AND ST_3DDWithin(ST_StartPoint(e.edge), ST_MakePoint(%(x)s, %(y)s, %(z)s), %(radius)s)
+                ORDER BY t.skeleton_id, distance, t.id
+            )
+            SELECT candidate.skeleton_id, candidate.treenode_id
+            FROM nearby candidate
+            JOIN class_instance sk ON sk.id = candidate.skeleton_id
+                AND sk.project_id = %(project)s AND sk.class_id = %(skeleton_class)s
+            JOIN class_instance_class_instance model ON model.class_instance_a = sk.id
+                AND model.project_id = %(project)s AND model.relation_id = %(model_of)s
+            JOIN class_instance neuron ON neuron.id = model.class_instance_b
+                AND neuron.project_id = %(project)s AND neuron.class_id = %(neuron_class)s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM class_instance_class_instance other_model
+                WHERE other_model.project_id = %(project)s AND other_model.relation_id = %(model_of)s
+                  AND other_model.id <> model.id
+                  AND (other_model.class_instance_a = sk.id OR other_model.class_instance_b = neuron.id)
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                FROM class_instance_class_instance link
+                JOIN class_instance label ON label.id = link.class_instance_b
+                    AND label.project_id = %(project)s AND label.class_id = %(annotation_class)s
+                WHERE link.project_id = %(project)s AND link.relation_id = %(annotated_with)s
+                  AND link.class_instance_a = neuron.id AND label.name ~* %(study_annotations)s
+            )
+            ORDER BY candidate.distance, candidate.skeleton_id, candidate.treenode_id
+            LIMIT 1
+        """, {
+            'project': project_id,
+            'x': x, 'y': y, 'z': z, 'radius': radius,
+            'min_x': x - radius, 'min_y': y - radius, 'min_z': z - radius,
+            'max_x': x + radius, 'max_y': y + radius, 'max_z': z + radius,
+            'model_of': relations['model_of'], 'annotated_with': relations['annotated_with'],
+            'neuron_class': classes['neuron'], 'skeleton_class': classes['skeleton'],
+            'annotation_class': classes['annotation'], 'study_annotations': study_annotations,
+        })
+        return cursor.fetchone()
 
 
 def _target_neuron(project_id: int, skeleton_id: int) -> int:
@@ -60,23 +136,28 @@ def _target_neuron(project_id: int, skeleton_id: int) -> int:
     return targets[0]
 
 
-def _assign(project_id: int, user, change: TaskLink) -> bool:
+def _assign(project_id: int, user, change: TaskLink) -> tuple[int, bool]:
     # A task can be unlinked before its annotation row even exists. Serialize on its name.
     key = 'catmaid-task-link:%s:%s' % (project_id, change.annotation.lower())
     with connection.cursor() as cursor:
         cursor.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))', [key])
-    skeleton._lock_skeletons_for_reroot(project_id, [change.skeleton_id])
+    study_annotations = r'^neuroglass:study:%s:task:%s$' % (change.study_id, UUID_PATTERN)
+    candidate = _nearest_candidate(project_id, change.coordinate, change.radius, study_annotations)
+    if candidate is None:
+        raise TaskLinkNoMatch('No eligible skeleton within the requested radius')
+    skeleton_id, treenode_id = candidate
+    skeleton._lock_skeletons_for_reroot(project_id, [skeleton_id])
 
     # Match the task deletion guard's lock order. Check the final association under both locks.
     if not Treenode.objects.select_for_update().filter(
-            project_id=project_id, id=change.reroot_treenode_id, skeleton_id=change.skeleton_id,
+            project_id=project_id, id=treenode_id, skeleton_id=skeleton_id,
             ).exists():
         raise TaskLinkConflict('The reroot node is no longer on the target skeleton')
 
-    neuron_id = _target_neuron(project_id, change.skeleton_id)
+    neuron_id = _target_neuron(project_id, skeleton_id)
     if not ClassInstance.objects.select_for_update().filter(project_id=project_id, id=neuron_id).exists():
         raise TaskLinkConflict('The target neuron no longer exists')
-    if _target_neuron(project_id, change.skeleton_id) != neuron_id:
+    if _target_neuron(project_id, skeleton_id) != neuron_id:
         raise TaskLinkConflict('The target skeleton changed during assignment')
 
     links = ClassInstanceClassInstance.objects.filter(
@@ -86,7 +167,6 @@ def _assign(project_id: int, user, change: TaskLink) -> bool:
     )
     if links.filter(class_instance_b__name__iexact=change.annotation).exists():
         raise TaskLinkConflict('The task already has a skeleton')
-    study_annotations = r'^neuroglass:study:%s:task:%s$' % (change.study_id, UUID_PATTERN)
     if links.filter(class_instance_a_id=neuron_id, class_instance_b__name__iregex=study_annotations).exists():
         raise TaskLinkConflict('The skeleton already belongs to another task in this study')
 
@@ -94,7 +174,7 @@ def _assign(project_id: int, user, change: TaskLink) -> bool:
             [neuron_id], {change.annotation: {'user_id': user.id}})
     if not any(neuron_id in entities for entities in added.values()):
         raise TaskLinkConflict('The task annotation could not be added')
-    return bool(skeleton._reroot_skeleton(change.reroot_treenode_id, project_id))
+    return skeleton_id, bool(skeleton._reroot_skeleton(treenode_id, project_id))
 
 
 @api_view(['POST'])
@@ -102,9 +182,9 @@ def _assign(project_id: int, user, change: TaskLink) -> bool:
 def link_task(request: HttpRequest, project_id=None) -> JsonResponse:
     """Assign an unlinked NeuroGlass task and reroot the skeleton atomically.
 
-    Send one annotation name, destination skeleton ID, and reroot treenode ID.
+    Send one task annotation, an [x, y, z] coordinate and a radius in project nanometres.
+    CATMAID chooses the closest eligible skeleton and makes its closest node the root.
     A successful response includes the assigned skeleton ID and whether its root changed.
-    The task and destination must still be available when the transaction holds the locks.
     """
     if getattr(request, '_neuroglass_task_link_authorized', False) is not True:
         raise PermissionError('Task linking requires authorization from NeuroGlass')
@@ -114,5 +194,5 @@ def link_task(request: HttpRequest, project_id=None) -> JsonResponse:
         return HttpResponseBadRequest(str(error))
 
     with transaction.atomic():
-        rerooted = _assign(int(project_id), request.user, change)
-    return JsonResponse({'skeleton_id': change.skeleton_id, 'rerooted': rerooted})
+        skeleton_id, rerooted = _assign(int(project_id), request.user, change)
+    return JsonResponse({'skeleton_id': skeleton_id, 'rerooted': rerooted})
