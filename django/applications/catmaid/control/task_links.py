@@ -136,11 +136,15 @@ def _target_neuron(project_id: int, skeleton_id: int) -> int:
     return targets[0]
 
 
-def _assign(project_id: int, user, change: TaskLink) -> tuple[int, bool]:
-    # A task can be unlinked before its annotation row even exists. Serialize on its name.
-    key = 'catmaid-task-link:%s:%s' % (project_id, change.annotation.lower())
+def lock_task_annotation(project_id: int, name: str) -> None:
+    """Serialize writes for a task whose annotation might not exist yet."""
+    key = 'catmaid-task-link:%s:%s' % (project_id, name.lower())
     with connection.cursor() as cursor:
         cursor.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))', [key])
+
+
+def _assign(project_id: int, user, change: TaskLink) -> tuple[int, bool]:
+    lock_task_annotation(project_id, change.annotation)
     study_annotations = r'^neuroglass:study:%s:task:%s$' % (change.study_id, UUID_PATTERN)
     candidate = _nearest_candidate(project_id, change.coordinate, change.radius, study_annotations)
     if candidate is None:

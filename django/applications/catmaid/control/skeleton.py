@@ -1287,9 +1287,14 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     independently of the requested distribution of ordinary annotations.
     """
     treenode_id = int(request.POST['treenode_id'])
-    treenode = Treenode.objects.get(pk=treenode_id)
-    skeleton_id = treenode.skeleton_id
     project_id = int(project_id)
+    skeleton_id = Treenode.objects.values_list('skeleton_id', flat=True).get(
+            id=treenode_id, project_id=project_id)
+    _lock_skeletons_for_reroot(project_id, [skeleton_id])
+    treenode = Treenode.objects.select_related('parent').get(id=treenode_id, project_id=project_id)
+    if treenode.skeleton_id != skeleton_id:
+        raise ValueError('The treenode changed skeletons during split, please retry')
+
     upstream_annotation_map = request.POST.get('upstream_annotation_map')
     downstream_annotation_map = request.POST.get('downstream_annotation_map')
     cursor = connection.cursor()

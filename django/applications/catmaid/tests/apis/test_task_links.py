@@ -13,6 +13,7 @@ from django.test.client import ClientHandler
 
 from catmaid.control import annotation, skeleton, task_links
 from catmaid.models import Class, ClassInstance, ClassInstanceClassInstance, Treenode
+from catmaid.state import make_nocheck_state
 
 from .common import CatmaidApiTestCase, CatmaidApiTransactionTestCase
 
@@ -297,3 +298,76 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
         self.assertEqual({405}, {node for node, parent in parents.items() if parent is None})
         self.assertEqual(405, parents[407])
         self.assertEqual(405, parents[377])
+
+
+    def test_split_rechecks_parent_after_task_link_reroots_same_node(self):
+        original_nodes = set(Treenode.objects.filter(skeleton_id=1).values_list('id', flat=True))
+        native = Client()
+        native.cookies.update(self.client.cookies)
+        original = task_links._assign
+        splits = []
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            def assign_then_split(*args):
+                result = original(*args)
+                # Start has rerooted but hasn't committed. Split can still see
+                # node 11's old parent until it acquires the topology lock.
+                splits.append(self.overlapping_request(pool, lambda: native.post(
+                        '/%d/skeleton/split' % self.test_project_id, {'treenode_id': 11})))
+                return result
+
+            with patch.object(task_links, '_assign', side_effect=assign_then_split):
+                self.assertStatus(self.post(self.change(self.task_a, 11)))
+            split = splits[0].result(timeout=10)
+
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a),
+                'Splitting at the new root must not duplicate the task annotation')
+        self.assertEqual(original_nodes,
+                set(Treenode.objects.filter(skeleton_id=1).values_list('id', flat=True)),
+                'The linked skeleton must retain its nodes')
+        self.assertEqual(11, self.root(1))
+        self.assertIn(split.status_code, (400, 409), split.content)
+
+    def test_task_link_reroot_preserves_concurrent_insertion_on_ancestor_edge(self):
+        native = Client()
+        native.cookies.update(self.client.cookies)
+        insertions = []
+        parent = Treenode.objects.get(pk=7)
+        child = Treenode.objects.get(pk=11)
+        self.assertEqual(parent.id, child.parent_id)
+        payload = {
+            'parent_id': parent.id,
+            'child_id': child.id,
+            'x': (parent.location_x + child.location_x) / 2,
+            'y': (parent.location_y + child.location_y) / 2,
+            'z': (parent.location_z + child.location_z) / 2,
+            'state': make_nocheck_state(),
+        }
+        original_nodes = set(Treenode.objects.filter(skeleton_id=1).values_list('id', flat=True))
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            def insert_before_reroot_update(execute, sql, params, many, context):
+                if 'SET parent_id = v.parent_id' in sql:
+                    # Reroot has read the old path and is about to reverse it.
+                    insertions.append(self.overlapping_request(pool, lambda: native.post(
+                            '/%d/treenode/insert' % self.test_project_id, payload)))
+                return execute(sql, params, many, context)
+
+            with connection.execute_wrapper(insert_before_reroot_update):
+                self.assertStatus(self.post(self.change(self.task_a, 13)))
+            self.assertEqual(1, len(insertions))
+            insert = insertions[0].result(timeout=10)
+
+        self.assertEqual(13, self.root(1))
+        parents = dict(Treenode.objects.filter(skeleton_id=1).values_list('id', 'parent_id'))
+        if insert.status_code == 200:
+            new_node = insert.json()['treenode_id']
+            self.assertEqual(original_nodes | {new_node}, set(parents))
+            self.assertEqual(new_node, parents[parent.id],
+                    'Reroot must preserve the successful insertion on the reversed edge')
+            self.assertEqual(child.id, parents[new_node])
+        else:
+            self.assertIn(insert.status_code, (400, 409), insert.content)
+            self.assertIn('child and parent', insert.json()['error'])
+            self.assertEqual(original_nodes, set(parents))
+            self.assertEqual(child.id, parents[parent.id])
