@@ -3,8 +3,6 @@
 """Atomically link NeuroGlass task annotations to skeletons."""
 
 from dataclasses import dataclass
-from hashlib import sha256
-import json
 import re
 from typing import Any, Dict, List, Optional, Set
 
@@ -16,14 +14,15 @@ from rest_framework.decorators import api_view
 from catmaid.control import annotation, skeleton
 from catmaid.control.authentication import PermissionError, requires_user_role
 from catmaid.error import ClientError
-from catmaid.models import Class, Relation, TaskLinkOperation, UserRole
+from catmaid.models import Class, Relation, UserRole
 
 UUID_PATTERN = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 TASK_ANNOTATION = re.compile(r'neuroglass:study:(%s):task:%s' % (UUID_PATTERN, UUID_PATTERN),
         re.IGNORECASE)
 # The same pattern for PostgreSQL's case-insensitive ~* operator.
 TASK_ANNOTATION_SQL = '^%s$' % TASK_ANNOTATION.pattern
-OPERATION_KEYS = {'study_id', 'operation_id'}
+OPERATION_KEYS = {'study_id', 'operation_id', 'deadline', 'operation_changes'}
+MAX_DEADLINE = 253402300799
 CHANGE_KEYS = {'annotation', 'expected_skeleton_id', 'skeleton_id', 'reroot_treenode_id'}
 
 
@@ -53,9 +52,9 @@ class ChangePlan:
 @dataclass
 class OperationRequest:
     study_id: str
-    operation_id: str
+    deadline: int
     plans: List[ChangePlan]
-    changes_digest: Optional[str] = None
+    recover: bool
 
 
 def _int_field(change: Dict, field: str, nullable=False) -> Optional[int]:
@@ -112,16 +111,26 @@ def _canonical_uuid(data: Dict, field: str) -> str:
 
 
 def _parse_operation(data: Dict) -> OperationRequest:
+    recover = data.keys() == OPERATION_KEYS | {'recover'} and data['recover'] is True
+    if not recover and data.keys() != OPERATION_KEYS:
+        raise ValueError('Expected a task-link apply or recovery request')
     study_id = _canonical_uuid(data, 'study_id')
-    operation_id = _canonical_uuid(data, 'operation_id')
-    if data.keys() == OPERATION_KEYS | {'cancel'} and data['cancel'] is True:
-        return OperationRequest(study_id, operation_id, [])
-    if data.keys() != OPERATION_KEYS | {'operation_changes'}:
-        raise ValueError('Expected a task-link apply or cancellation request')
-    changes = data['operation_changes']
-    plans = _parse_changes(changes, study_id=study_id)
-    digest = sha256(json.dumps(changes, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-    return OperationRequest(study_id, operation_id, plans, digest)
+    _canonical_uuid(data, 'operation_id')
+    deadline = _int_field(data, 'deadline')
+    if deadline is None or not 0 < deadline <= MAX_DEADLINE:
+        raise ValueError('"deadline" must be an epoch second in the supported range')
+    plans = _parse_changes(data['operation_changes'], study_id=study_id)
+    if not plans:
+        raise ValueError('"operation_changes" must not be empty')
+    return OperationRequest(study_id, deadline, plans, recover)
+
+
+def _schema_ids(project_id: int) -> Dict[str, int]:
+    classes = dict(Class.objects.filter(project_id=project_id,
+            class_name__in=('annotation', 'neuron', 'skeleton')).values_list('class_name', 'id'))
+    relations = dict(Relation.objects.filter(project_id=project_id,
+            relation_name__in=('annotated_with', 'model_of')).values_list('relation_name', 'id'))
+    return {**classes, **relations, 'project_id': project_id}
 
 
 def _validate(project_id: int, plans: List[ChangePlan]) -> List[ChangePlan]:
@@ -131,10 +140,7 @@ def _validate(project_id: int, plans: List[ChangePlan]) -> List[ChangePlan]:
     for plan in plans:
         plan.reason = plan.study_id = plan.annotation_id = None
         plan.previous_neuron_id = plan.target_neuron_id = None
-    classes = dict(Class.objects.filter(project_id=project_id,
-            class_name__in=('annotation', 'neuron', 'skeleton')).values_list('class_name', 'id'))
-    relations = dict(Relation.objects.filter(project_id=project_id,
-            relation_name__in=('annotated_with', 'model_of')).values_list('relation_name', 'id'))
+    schema_ids = _schema_ids(project_id)
     cursor = connection.cursor()
 
     for plan in plans:
@@ -156,7 +162,7 @@ def _validate(project_id: int, plans: List[ChangePlan]) -> List[ChangePlan]:
             ON model.class_instance_b = neuron.id AND model.relation_id = %(model_of)s
         WHERE a.project_id = %(project_id)s AND a.class_id = %(annotation)s
           AND a.name = ANY(%(names)s::text[])
-    ''', {**classes, **relations, 'project_id': project_id,
+    ''', {**schema_ids,
           'names': [p.annotation for p in plans]})
     annotation_ids: Dict[str, int] = {}
     holders: Dict[str, List] = {}
@@ -185,7 +191,7 @@ def _validate(project_id: int, plans: List[ChangePlan]) -> List[ChangePlan]:
             AND neuron.project_id = %(project_id)s
         WHERE s.project_id = %(project_id)s AND s.class_id = %(skeleton)s
           AND s.id = ANY(%(skeleton_ids)s::bigint[])
-    ''', {**classes, **relations, 'project_id': project_id,
+    ''', {**schema_ids,
           'skeleton_ids': [p.skeleton_id for p in plans]})
     target_neurons: Dict[int, List] = {}
     for skeleton_id, neuron_id, model_count in cursor.fetchall():
@@ -236,7 +242,7 @@ def _validate(project_id: int, plans: List[ChangePlan]) -> List[ChangePlan]:
         WHERE link.project_id = %(project_id)s AND link.relation_id = %(annotated_with)s
           AND link.class_instance_a = ANY(%(target_ids)s::bigint[])
           AND a.class_id = %(annotation)s AND a.name ~* %(pattern)s
-    ''', {**classes, **relations, 'project_id': project_id,
+    ''', {**schema_ids,
           'target_ids': target_ids, 'pattern': TASK_ANNOTATION_SQL})
     tasks_on_neuron: Dict[int, List[str]] = {}
     for neuron_id, name in cursor.fetchall():
@@ -364,22 +370,60 @@ def _apply_plans(project_id: int, user, plans: List[ChangePlan]) -> List[Dict]:
     } for p in plans]
 
 
+def _observe_task_links(project_id: int, plans: List[ChangePlan]) -> List[Dict]:
+    # Read links and roots in one statement so they share the same snapshot.
+    # An unlinked task or an ambiguous set of links has no current skeleton.
+    with connection.cursor() as cursor:
+        cursor.execute('''
+            WITH requested(name, ordinal) AS (
+                SELECT * FROM unnest(%(names)s::text[]) WITH ORDINALITY
+            ), linked AS (
+                SELECT requested.ordinal, MIN(skeleton.id) AS skeleton_id
+                FROM requested
+                JOIN class_instance a ON a.project_id = %(project_id)s
+                    AND a.class_id = %(annotation)s AND a.name = requested.name
+                JOIN class_instance_class_instance link ON link.class_instance_b = a.id
+                    AND link.project_id = %(project_id)s AND link.relation_id = %(annotated_with)s
+                JOIN class_instance neuron ON neuron.id = link.class_instance_a
+                    AND neuron.project_id = %(project_id)s AND neuron.class_id = %(neuron)s
+                LEFT JOIN class_instance_class_instance model ON model.class_instance_b = neuron.id
+                    AND model.project_id = %(project_id)s AND model.relation_id = %(model_of)s
+                LEFT JOIN class_instance skeleton ON skeleton.id = model.class_instance_a
+                    AND skeleton.project_id = %(project_id)s AND skeleton.class_id = %(skeleton)s
+                GROUP BY requested.ordinal
+                HAVING COUNT(*) = 1
+            )
+            SELECT requested.name, linked.skeleton_id, (
+                SELECT MIN(t.id)
+                FROM treenode t
+                WHERE t.project_id = %(project_id)s AND t.skeleton_id = linked.skeleton_id
+                    AND t.parent_id IS NULL
+                HAVING COUNT(*) = 1
+            ) AS root_id
+            FROM requested
+            LEFT JOIN linked ON linked.ordinal = requested.ordinal
+            ORDER BY requested.ordinal
+        ''', {**_schema_ids(project_id), 'names': [p.annotation for p in plans]})
+        return [{'annotation': name, 'skeleton_id': skeleton_id, 'root_id': root_id}
+                for name, skeleton_id, root_id in cursor.fetchall()]
+
+
 def _resolve_operation(project_id: int, user, operation: OperationRequest) -> Dict:
-    # The unique index arbitrates concurrent inserts. Django's get_or_create
-    # retries with a locked read if another transaction inserted first.
-    receipt, created = TaskLinkOperation.objects.select_for_update().get_or_create(
-            project_id=project_id, study_id=operation.study_id,
-            operation_id=operation.operation_id)
-    if created and operation.changes_digest is not None:
-        # The insert, task mutations and receipt become visible at one commit.
-        receipt.results = _apply_plans(project_id, user, operation.plans)
-        receipt.changes_digest = operation.changes_digest
-        receipt.save(update_fields=['results', 'changes_digest'])
-    if receipt.changes_digest is None:
-        return {'state': 'cancelled', 'results': []}
-    if operation.changes_digest is not None and operation.changes_digest != receipt.changes_digest:
-        raise TaskLinkConflict('This operation already completed with different changes')
-    return {'state': 'completed', 'results': receipt.results}
+    # Recovery waits for admitted operations to commit or roll back. Read the
+    # database wall clock after acquiring the lock, including time spent waiting.
+    with connection.cursor() as cursor:
+        lock_key = 'catmaid-task-link-study:%s:%s' % (project_id, operation.study_id)
+        cursor.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))', [lock_key])
+        cursor.execute('SELECT clock_timestamp() >= to_timestamp(%s)', [operation.deadline])
+        expired = cursor.fetchone()[0]
+
+    if operation.recover:
+        if not expired:
+            return {'state': 'pending', 'results': []}
+        return {'state': 'observed', 'results': _observe_task_links(project_id, operation.plans)}
+    if expired:
+        return {'state': 'expired', 'results': []}
+    return {'state': 'completed', 'results': _apply_plans(project_id, user, operation.plans)}
 
 
 @api_view(['POST'])
@@ -395,11 +439,12 @@ def link_tasks(request: HttpRequest, project_id=None) -> JsonResponse:
     All other changes are applied together: if any of them fails, none is
     written and an error is returned.
 
-    The legacy changes request returns results. A durable apply instead
-    supplies study_id, operation_id and operation_changes. A request with
-    the same IDs and cancel set to true returns the committed results or
-    prevents the operation from applying. Durable requests return state
-    (completed or cancelled) and results.
+    The legacy changes request returns results. A deadline-bound apply instead
+    supplies study_id, operation_id, deadline (Unix epoch seconds), and
+    operation_changes. It returns state completed or expired and results.
+    Recovery sends the same fields and recover set to true. It returns pending
+    before the deadline or observed with one current skeleton and root per
+    requested annotation once admitted writes have finished.
     ---
     parameters:
     - name: project_id
