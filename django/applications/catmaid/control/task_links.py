@@ -40,6 +40,7 @@ class TaskLink:
     study_id: str
     coordinate: tuple[float, float, float]
     radius: float
+    cutoff_ms: int
 
 
 def _spatial_number(value) -> float:
@@ -48,7 +49,7 @@ def _spatial_number(value) -> float:
     return float(value)
 
 
-def _parse_link(data) -> TaskLink:
+def _parse_link(data, cutoff_ms: int) -> TaskLink:
     if not isinstance(data, dict) or data.keys() != {'annotation', 'coordinate', 'radius'}:
         raise ValueError('Expected an annotation, one coordinate and a radius')
     name = data['annotation']
@@ -62,7 +63,7 @@ def _parse_link(data) -> TaskLink:
     radius = _spatial_number(data['radius'])
     if radius <= 0:
         raise ValueError('The radius must be positive')
-    return TaskLink(name, match.group(1), (x, y, z), radius)
+    return TaskLink(name, match.group(1), (x, y, z), radius, cutoff_ms)
 
 
 def _nearest_candidate(project_id, coordinate, radius, study_annotations):
@@ -136,6 +137,13 @@ def _target_neuron(project_id: int, skeleton_id: int) -> int:
     return targets[0]
 
 
+def task_link_clock_ms() -> int:
+    """Read the clock shared by all workers of this CATMAID database."""
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint')
+        return cursor.fetchone()[0]
+
+
 def lock_task_annotation(project_id: int, name: str) -> None:
     """Serialize writes for a task whose annotation might not exist yet."""
     key = 'catmaid-task-link:%s:%s' % (project_id, name.lower())
@@ -145,6 +153,10 @@ def lock_task_annotation(project_id: int, name: str) -> None:
 
 def _assign(project_id: int, user, change: TaskLink) -> tuple[int, bool]:
     lock_task_annotation(project_id, change.annotation)
+    # A deletion can drain admitted writes under this lock. A request still
+    # waiting here must check its deadline after the wait.
+    if task_link_clock_ms() >= change.cutoff_ms:
+        raise TaskLinkConflict('The task link request has expired. Try starting again.')
     study_annotations = r'^neuroglass:study:%s:task:%s$' % (change.study_id, UUID_PATTERN)
     candidate = _nearest_candidate(project_id, change.coordinate, change.radius, study_annotations)
     if candidate is None:
@@ -192,8 +204,11 @@ def link_task(request: HttpRequest, project_id=None) -> JsonResponse:
     """
     if getattr(request, '_neuroglass_task_link_authorized', False) is not True:
         raise PermissionError('Task linking requires authorization from NeuroGlass')
+    cutoff_ms = getattr(request, '_neuroglass_task_link_cutoff_ms', None)
+    if type(cutoff_ms) is not int or not 0 < cutoff_ms < 2**63:
+        raise PermissionError('Task linking requires a signed write cutoff')
     try:
-        change = _parse_link(request.data)
+        change = _parse_link(request.data, cutoff_ms)
     except ValueError as error:
         return HttpResponseBadRequest(str(error))
 

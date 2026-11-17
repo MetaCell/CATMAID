@@ -4,7 +4,7 @@ import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
-from time import monotonic, sleep
+from time import monotonic, sleep, time
 from unittest.mock import patch
 
 from django.db import connection, connections
@@ -27,9 +27,13 @@ def task_annotation(study_id):
 
 
 class TrustedTaskLinkHandler(ClientHandler):
+    cutoff_ms = None
+
     def get_response(self, request):
         # Stand in for the installed overlay's server-side grant.
         request._neuroglass_task_link_authorized = True
+        request._neuroglass_task_link_cutoff_ms = (
+                self.cutoff_ms if self.cutoff_ms is not None else int(time() * 1000) + 60_000)
         return super().get_response(request)
 
 
@@ -91,6 +95,15 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
         native = Client()
         native.cookies.update(self.client.cookies)
         self.assertEqual(403, self.post(self.change(self.task_a, 11), client=native).status_code)
+        self.assertEqual(set(), self.neurons_with(self.task_a))
+        self.assertEqual(7, self.root(1))
+
+    def test_expired_start_cannot_link_or_reroot(self):
+        self.client.handler.cutoff_ms = 1
+
+        response = self.post(self.change(self.task_a, 11))
+
+        self.assertEqual(409, response.status_code, response.content)
         self.assertEqual(set(), self.neurons_with(self.task_a))
         self.assertEqual(7, self.root(1))
 
