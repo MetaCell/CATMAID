@@ -2309,12 +2309,20 @@ def _reroot_skeleton(treenode_id, project_id):
     if treenode_id is None:
         raise ValueError('A treenode id has not been provided!')
 
-    response_on_error = ''
     try:
-        response_on_error = 'Failed to select treenode with id %s.' % treenode_id
         skeleton_id = Treenode.objects.values_list('skeleton_id', flat=True).get(
                 id=treenode_id, project=project_id)
         _lock_skeletons_for_reroot(project_id, [skeleton_id])
+    except Exception as error:
+        raise ValueError(f'Failed to select treenode with id {treenode_id}: {error}') from error
+
+    return _reroot_skeleton_locked(treenode_id, project_id, skeleton_id)
+
+
+def _reroot_skeleton_locked(treenode_id, project_id, skeleton_id):
+    """Reroot within a transaction that already holds the skeleton's topology lock."""
+    response_on_error = f'Failed to select treenode with id {treenode_id}.'
+    try:
         rootnode = Treenode.objects.get(id=treenode_id, project=project_id)
         if rootnode.skeleton_id != skeleton_id:
             raise ValueError('The treenode changed skeletons during reroot, please retry')
@@ -2824,7 +2832,7 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
 
         # Reroot to_skid at to_treenode if necessary
         response_on_error = 'Could not reroot at treenode %s' % to_treenode_id
-        _reroot_skeleton(to_treenode_id, project_id)
+        _reroot_skeleton_locked(to_treenode_id, project_id, to_skid)
 
         # If samplers reference this skeleton, make sure they are updated as well
         sampler_info = _update_samplers_in_merge(project_id, user.id, from_skid, to_skid,

@@ -154,6 +154,11 @@ def task_link_clock_ms() -> int:
         return cursor.fetchone()[0]
 
 
+def _check_task_link_deadline(cutoff_ms: int) -> None:
+    if task_link_clock_ms() >= cutoff_ms:
+        raise TaskLinkConflict('The task link request has expired. Try starting again.')
+
+
 def lock_task_annotation(project_id: int, name: str) -> None:
     """Serialize writes for a task whose annotation might not exist yet."""
     key = 'catmaid-task-link:%s:%s' % (project_id, name.lower())
@@ -171,10 +176,8 @@ def _neuron_annotation_links(project_id: int):
 
 def _assign(project_id: int, user, change: TaskLink) -> tuple[int, bool]:
     lock_task_annotation(project_id, change.annotation)
-    # A deletion can drain admitted writes under this lock. A request still
-    # waiting here must check its deadline after the wait.
-    if task_link_clock_ms() >= change.cutoff_ms:
-        raise TaskLinkConflict('The task link request has expired. Try starting again.')
+    # A request waiting for the task lock can expire before it is admitted.
+    _check_task_link_deadline(change.cutoff_ms)
     if _neuron_annotation_links(project_id).filter(class_instance_b__name__iexact=change.annotation).exists():
         raise TaskLinkConflict('The task already has a skeleton')
     study_annotations = r'^neuroglass:study:%s:task:%s$' % (change.study_id, UUID_PATTERN)
@@ -182,6 +185,7 @@ def _assign(project_id: int, user, change: TaskLink) -> tuple[int, bool]:
     while True:
         candidate = _nearest_candidate(project_id, change.coordinate, change.radius,
                 study_annotations, user, skipped_skeletons)
+        _check_task_link_deadline(change.cutoff_ms)
         if candidate is None:
             raise TaskLinkNoMatch('No eligible skeleton within the requested radius')
         skeleton_id, treenode_id, x, y, z = candidate
@@ -192,6 +196,7 @@ def _assign(project_id: int, user, change: TaskLink) -> tuple[int, bool]:
                 return _link_candidate(project_id, user, change, study_annotations,
                         skeleton_id, treenode_id, (x, y, z))
         except skeleton.RerootSamplerConflict:
+            _check_task_link_deadline(change.cutoff_ms)
             skipped_skeletons.append(skeleton_id)
 
 
@@ -224,11 +229,12 @@ def _link_candidate(project_id, user, change, study_annotations, skeleton_id, tr
     if links.filter(class_instance_a_id=neuron_id, class_instance_b__name__iregex=study_annotations).exists():
         raise TaskLinkConflict('The skeleton already belongs to another task in this study')
 
+    _check_task_link_deadline(change.cutoff_ms)
     added, _, _ = annotation._annotate_entities(project_id,
             [neuron_id], {change.annotation: {'user_id': user.id}})
     if not any(neuron_id in entities for entities in added.values()):
         raise TaskLinkConflict('The task annotation could not be added')
-    return skeleton_id, bool(skeleton._reroot_skeleton(treenode_id, project_id))
+    return skeleton_id, bool(skeleton._reroot_skeleton_locked(treenode_id, project_id, skeleton_id))
 
 
 @api_view(['POST'])
@@ -252,4 +258,8 @@ def link_task(request: HttpRequest, project_id=None) -> JsonResponse:
 
     with transaction.atomic():
         skeleton_id, rerooted = _assign(int(project_id), request.user, change)
-    return JsonResponse({'skeleton_id': skeleton_id, 'rerooted': rerooted})
+        response = JsonResponse({'skeleton_id': skeleton_id, 'rerooted': rerooted})
+        # Rerooting can exceed the deadline. Raise before leaving the transaction
+        # so the annotation and topology changes are rolled back together.
+        _check_task_link_deadline(change.cutoff_ms)
+    return response

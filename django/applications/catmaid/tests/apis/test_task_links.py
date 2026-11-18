@@ -109,6 +109,27 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
         self.assertEqual(set(), self.neurons_with(self.task_a))
         self.assertEqual(7, self.root(1))
 
+    def test_start_expiring_during_assignment_rolls_back_link_and_reroot(self):
+        cutoff_ms = 5000
+        self.client.handler.cutoff_ms = cutoff_ms
+        link_candidate = task_links._link_candidate
+
+        def expire_after_linking(*args):
+            result = link_candidate(*args)
+            self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+            self.assertIsNone(Treenode.objects.get(pk=11).parent_id)
+            clock.return_value = cutoff_ms
+            return result
+
+        with patch.object(task_links, 'task_link_clock_ms', return_value=cutoff_ms - 1) as clock, \
+                patch.object(task_links, '_link_candidate', side_effect=expire_after_linking):
+            response = self.post(self.change(self.task_a, 11))
+
+        self.assertEqual(409, response.status_code, response.content)
+        self.assertIn('has expired', response.json()['error'])
+        self.assertEqual(set(), self.neurons_with(self.task_a))
+        self.assertEqual(7, self.root(1))
+
     def test_assignment_adds_link_and_reroots(self):
         self.move_node_near(405, 11, dx=40)
         result = self.result(self.post(self.change(self.task_a, 11, radius=100)))
@@ -344,13 +365,13 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
         self.assertEqual(7, self.root(1))
 
     def test_reroot_error_rolls_back_annotation(self):
-        original = skeleton._reroot_skeleton
+        original = skeleton._reroot_skeleton_locked
 
         def fail_after_reroot(*args):
             original(*args)
             raise ValueError('Simulated failure after changing the root')
 
-        with patch.object(skeleton, '_reroot_skeleton', side_effect=fail_after_reroot):
+        with patch.object(skeleton, '_reroot_skeleton_locked', side_effect=fail_after_reroot):
             self.assertEqual(400, self.post(self.change(self.task_a, 11)).status_code)
         self.assertEqual(set(), self.neurons_with(self.task_a))
         self.assertEqual(7, self.root(1))
@@ -565,7 +586,7 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
         self.assertEqual(7, Treenode.objects.get(pk=11).parent_id)
         native = Client()
         native.cookies.update(self.client.cookies)
-        reroot = skeleton._reroot_skeleton
+        reroot = skeleton._reroot_skeleton_locked
 
         with ThreadPoolExecutor(max_workers=1) as pool:
             pending = []
@@ -577,7 +598,7 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
                         })))
                 return reroot(*args)
 
-            with patch.object(skeleton, '_reroot_skeleton',
+            with patch.object(skeleton, '_reroot_skeleton_locked',
                     side_effect=delete_while_reroot_holds_the_child):
                 response = self.post(self.change(self.task_a, 13))
             deleted = pending[0].result(timeout=10)
