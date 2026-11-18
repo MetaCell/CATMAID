@@ -337,7 +337,8 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
         self.assertEqual(set(), self.neurons_with(self.task_a))
 
     def test_search_result_must_still_belong_to_the_target_at_write(self):
-        with patch.object(task_links, '_nearest_candidate', return_value=(1, 405)):
+        coordinate = self.change(self.task_a, 405)['coordinate']
+        with patch.object(task_links, '_nearest_candidate', return_value=(1, 405, *coordinate)):
             self.assertEqual(409, self.post(self.change(self.task_a, 11)).status_code)
         self.assertEqual(set(), self.neurons_with(self.task_a))
         self.assertEqual(7, self.root(1))
@@ -504,7 +505,13 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
         self.assertIn(split.status_code, (400, 409), split.content)
 
     def test_task_link_refuses_candidate_moved_outside_the_radius_before_lock(self):
-        payload = self.change(self.task_a, 11)
+        self.assert_task_link_refuses_moved_candidate(radius=1)
+
+    def test_task_link_refuses_candidate_moved_within_the_radius_before_lock(self):
+        self.assert_task_link_refuses_moved_candidate(radius=101)
+
+    def assert_task_link_refuses_moved_candidate(self, radius):
+        payload = self.change(self.task_a, 11, radius=radius)
         nearest_candidate = task_links._nearest_candidate
 
         def move_node(node_id):
@@ -517,7 +524,7 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
         with ThreadPoolExecutor(max_workers=1) as pool:
             def choose_then_move(*args):
                 candidate = nearest_candidate(*args)
-                self.assertEqual((1, 11), candidate)
+                self.assertEqual((1, 11), candidate[:2])
                 self.assertEqual(1, pool.submit(move_node, 11).result(timeout=5))
                 return candidate
 

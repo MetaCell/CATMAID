@@ -72,6 +72,7 @@ def _nearest_candidate(project_id, coordinate, radius, study_annotations, user, 
         cursor.execute("""
             WITH nearby AS (
                 SELECT DISTINCT ON (t.skeleton_id) t.skeleton_id, t.id AS treenode_id,
+                    t.location_x, t.location_y, t.location_z,
                     ST_3DDistance(ST_StartPoint(e.edge), ST_MakePoint(%(x)s, %(y)s, %(z)s)) AS distance
                 FROM treenode_edge e
                 JOIN treenode t ON t.id = e.id AND t.project_id = e.project_id
@@ -82,7 +83,8 @@ def _nearest_candidate(project_id, coordinate, radius, study_annotations, user, 
                   AND ST_3DDWithin(ST_StartPoint(e.edge), ST_MakePoint(%(x)s, %(y)s, %(z)s), %(radius)s)
                 ORDER BY t.skeleton_id, distance, t.id
             )
-            SELECT candidate.skeleton_id, candidate.treenode_id
+            SELECT candidate.skeleton_id, candidate.treenode_id,
+                candidate.location_x, candidate.location_y, candidate.location_z
             FROM nearby candidate
             JOIN class_instance sk ON sk.id = candidate.skeleton_id
                 AND sk.project_id = %(project)s AND sk.class_id = %(skeleton_class)s
@@ -182,17 +184,19 @@ def _assign(project_id: int, user, change: TaskLink) -> tuple[int, bool]:
                 study_annotations, user, skipped_skeletons)
         if candidate is None:
             raise TaskLinkNoMatch('No eligible skeleton within the requested radius')
-        skeleton_id, treenode_id = candidate
+        skeleton_id, treenode_id, x, y, z = candidate
         try:
             # Roll back any label and release this candidate's locks if its
             # sampler prevents rerooting before trying a different skeleton.
             with transaction.atomic():
-                return _link_candidate(project_id, user, change, study_annotations, skeleton_id, treenode_id)
+                return _link_candidate(project_id, user, change, study_annotations,
+                        skeleton_id, treenode_id, (x, y, z))
         except skeleton.RerootSamplerConflict:
             skipped_skeletons.append(skeleton_id)
 
 
-def _link_candidate(project_id, user, change, study_annotations, skeleton_id, treenode_id):
+def _link_candidate(project_id, user, change, study_annotations, skeleton_id, treenode_id,
+        candidate_coordinate):
     skeleton._lock_skeletons_for_reroot(project_id, [skeleton_id])
 
     # Lock the neuron before the treenode, as whole-skeleton deletion does.
@@ -209,7 +213,9 @@ def _link_candidate(project_id, user, change, study_annotations, skeleton_id, tr
                         project_id=project_id, id=treenode_id, skeleton_id=skeleton_id)
     except Treenode.DoesNotExist:
         raise TaskLinkConflict('The reroot node is no longer on the target skeleton')
-    if math.dist(locked_coordinate, change.coordinate) > change.radius:
+    # Moving within the radius can also change which candidate is nearest.
+    if (locked_coordinate != candidate_coordinate
+            or math.dist(locked_coordinate, change.coordinate) > change.radius):
         raise TaskLinkConflict('The nearest node moved during assignment. Try starting again.')
 
     links = _neuron_annotation_links(project_id)
