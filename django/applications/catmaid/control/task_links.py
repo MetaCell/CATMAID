@@ -203,8 +203,7 @@ def _link_candidate(project_id, user, change, study_annotations, skeleton_id, tr
     except Treenode.DoesNotExist:
         raise TaskLinkConflict('The reroot node is no longer on the target skeleton')
     # Moving within the radius can also change which candidate is nearest.
-    if (locked_coordinate != candidate_coordinate
-            or math.dist(locked_coordinate, change.coordinate) > change.radius):
+    if locked_coordinate != candidate_coordinate:
         raise TaskLinkConflict('The nearest node moved during assignment. Try starting again.')
 
     links = _neuron_annotation_links(project_id)
