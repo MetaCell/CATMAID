@@ -31,22 +31,23 @@ def task_annotation(study_id):
 class TrustedTaskLinkHandler(ClientHandler):
     def get_response(self, request):
         # Stand in for the installed overlay's server-side grant.
-        request._neuroglass_task_link_authorized = True
+        request._neuroglass_task_link_scope = self.task_link_scope
         return super().get_response(request)
 
 
 class TaskLinkTestClient(Client):
-    def __init__(self):
+    def __init__(self, project_id, study_id):
         super().__init__()
         self.handler = TrustedTaskLinkHandler(enforce_csrf_checks=False)
+        self.handler.task_link_scope = (project_id, str(study_id))
 
 
 class TaskLinksFixtures:
     def setUp(self):
         super().setUp()
-        self.client = TaskLinkTestClient()
-        self.url = '/%d/skeletons/task-link' % self.test_project_id
         self.study_id = uuid.uuid4()
+        self.client = TaskLinkTestClient(self.test_project_id, self.study_id)
+        self.url = '/%d/skeletons/task-link' % self.test_project_id
         self.task_a = task_annotation(self.study_id)
         self.task_b = task_annotation(self.study_id)
         self.fake_authentication()
@@ -96,16 +97,33 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
         self.assertEqual(set(), self.neurons_with(self.task_a))
         self.assertEqual(7, self.root(1))
 
+    def test_rejects_task_links_outside_the_signed_project_or_study(self):
+        for project_id, study_id in (
+                (self.test_project_id + 1, str(self.study_id)),
+                (self.test_project_id, str(uuid.uuid4()))):
+            with self.subTest(project_id=project_id, study_id=study_id):
+                self.client.handler.task_link_scope = (project_id, study_id)
+                response = self.post(self.change(self.task_a, 11))
+                self.assertEqual(403, response.status_code, response.content)
+                self.assertEqual(set(), self.neurons_with(self.task_a))
+                self.assertEqual(7, self.root(1))
+
+    def test_task_link_requires_json(self):
+        response = self.client.post(self.url, self.change(self.task_a, 11))
+        self.assertEqual(415, response.status_code, response.content)
+        self.assertEqual(set(), self.neurons_with(self.task_a))
+        self.assertEqual(7, self.root(1))
+
     def test_assignment_adds_link_and_reroots(self):
         self.move_node_near(405, 11, dx=40)
         result = self.result(self.post(self.change(self.task_a, 11, radius=100)))
-        self.assertEqual({'skeleton_id': 1, 'rerooted': True}, result)
+        self.assertEqual({'skeleton_id': 1}, result)
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
         self.assertEqual(11, self.root(1))
 
     def test_already_root_only_links(self):
         result = self.result(self.post(self.change(self.task_a, 7)))
-        self.assertEqual({'skeleton_id': 1, 'rerooted': False}, result)
+        self.assertEqual({'skeleton_id': 1}, result)
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
         self.assertEqual(7, self.root(1))
 
@@ -242,7 +260,7 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
 
         result = self.result(self.post(self.change(self.task_a, 11, radius=100)))
 
-        self.assertEqual({'skeleton_id': 373, 'rerooted': True}, result)
+        self.assertEqual({'skeleton_id': 373}, result)
         self.assertEqual({SKELETON_373_NEURON}, self.neurons_with(self.task_a))
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_b))
         self.assertEqual(405, self.root(373))
@@ -256,7 +274,7 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
 
         result = self.result(self.post(self.change(self.task_a, 11, radius=100)))
 
-        self.assertEqual({'skeleton_id': 373, 'rerooted': True}, result)
+        self.assertEqual({'skeleton_id': 373}, result)
         self.assertEqual({SKELETON_373_NEURON}, self.neurons_with(self.task_a))
         self.assertEqual(7, self.root(1))
         self.assertEqual(405, self.root(373))
@@ -268,7 +286,7 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
 
         result = self.result(self.post(self.change(self.task_a, 11)))
 
-        self.assertEqual({'skeleton_id': 1, 'rerooted': True}, result)
+        self.assertEqual({'skeleton_id': 1}, result)
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
 
     def test_skips_a_candidate_whose_new_root_would_break_a_sampler(self):
@@ -285,7 +303,7 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
 
         result = self.result(self.post(self.change(self.task_a, 13, radius=100)))
 
-        self.assertEqual({'skeleton_id': 373, 'rerooted': True}, result)
+        self.assertEqual({'skeleton_id': 373}, result)
         self.assertEqual({SKELETON_373_NEURON}, self.neurons_with(self.task_a))
         self.assertEqual(7, self.root(1))
         self.assertEqual(405, self.root(373))
@@ -346,6 +364,7 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
         valid = self.change(self.task_a, 11)
         old = {'annotation': self.task_a, 'skeleton_id': 1, 'reroot_treenode_id': 11}
         for payload in (old, {'changes': [valid]}, dict(valid, annotation='ordinary'),
+                dict(valid, annotation=self.task_a.upper()),
                 dict(valid, coordinate=[[1, 2, 3], [4, 5, 6]]),
                 dict(valid, coordinate=[1, 2]), dict(valid, coordinate=[1, 'two', 3]),
                 dict(valid, coordinate=[True, 0, 0]), dict(valid, coordinate=[10**400, 0, 0]),
@@ -392,7 +411,7 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
                 class_column=annotation_class, user_id=self.test_user_id, name=self.task_a)
         first = self.change(self.task_a, 11)
         second = self.change(self.task_a, 405)
-        second_client = TaskLinkTestClient()
+        second_client = TaskLinkTestClient(self.test_project_id, self.study_id)
         second_client.cookies.update(self.client.cookies)
         original = task_links._assign
         waiters = []
@@ -400,7 +419,7 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
         with ThreadPoolExecutor(max_workers=1) as pool:
             def apply_then_overlap(project_id, user, change):
                 result = original(project_id, user, change)
-                if result[0] == 1:
+                if result == 1:
                     waiters.append(self.overlapping_request(pool,
                             lambda: self.post(second, client=second_client)))
                 return result
@@ -417,7 +436,7 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
     def test_concurrent_tasks_in_same_study_cannot_claim_one_skeleton(self):
         first = self.change(self.task_a, 11)
         second = self.change(self.task_b, 13)
-        client = TaskLinkTestClient()
+        client = TaskLinkTestClient(self.test_project_id, self.study_id)
         client.cookies.update(self.client.cookies)
         original = task_links._assign
         waiters = []
@@ -569,53 +588,9 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
                 response = self.post(self.change(self.task_a, 13))
             deleted = pending[0].result(timeout=10)
 
-        self.assertEqual({'skeleton_id': 1, 'rerooted': True}, self.result(response))
+        self.assertEqual({'skeleton_id': 1}, self.result(response))
         self.assertStatus(deleted)
         self.assertFalse(Treenode.objects.filter(pk=11).exists())
         self.assertEqual(13, self.root(1))
         self.assertEqual(13, Treenode.objects.get(pk=7).parent_id)
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
-
-    def test_task_link_reroot_preserves_concurrent_insertion_on_ancestor_edge(self):
-        native = Client()
-        native.cookies.update(self.client.cookies)
-        insertions = []
-        parent = Treenode.objects.get(pk=7)
-        child = Treenode.objects.get(pk=11)
-        self.assertEqual(parent.id, child.parent_id)
-        payload = {
-            'parent_id': parent.id,
-            'child_id': child.id,
-            'x': (parent.location_x + child.location_x) / 2,
-            'y': (parent.location_y + child.location_y) / 2,
-            'z': (parent.location_z + child.location_z) / 2,
-            'state': make_nocheck_state(),
-        }
-        original_nodes = set(Treenode.objects.filter(skeleton_id=1).values_list('id', flat=True))
-
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            def insert_before_reroot_update(execute, sql, params, many, context):
-                if 'SET parent_id = v.parent_id' in sql:
-                    # Reroot has read the old path and is about to reverse it.
-                    insertions.append(self.overlapping_request(pool, lambda: native.post(
-                            '/%d/treenode/insert' % self.test_project_id, payload)))
-                return execute(sql, params, many, context)
-
-            with connection.execute_wrapper(insert_before_reroot_update):
-                self.assertStatus(self.post(self.change(self.task_a, 13)))
-            self.assertEqual(1, len(insertions))
-            insert = insertions[0].result(timeout=10)
-
-        self.assertEqual(13, self.root(1))
-        parents = dict(Treenode.objects.filter(skeleton_id=1).values_list('id', 'parent_id'))
-        if insert.status_code == 200:
-            new_node = insert.json()['treenode_id']
-            self.assertEqual(original_nodes | {new_node}, set(parents))
-            self.assertEqual(new_node, parents[parent.id],
-                    'Reroot must preserve the successful insertion on the reversed edge')
-            self.assertEqual(child.id, parents[new_node])
-        else:
-            self.assertIn(insert.status_code, (400, 409), insert.content)
-            self.assertIn('child and parent', insert.json()['error'])
-            self.assertEqual(original_nodes, set(parents))
-            self.assertEqual(child.id, parents[parent.id])

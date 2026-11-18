@@ -4,11 +4,13 @@
 
 from dataclasses import dataclass
 import math
+import re
 import sys
 
 from django.db import connection, transaction
 from django.http import HttpRequest, HttpResponseBadRequest, JsonResponse
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, parser_classes
+from rest_framework.parsers import JSONParser
 
 from catmaid.control import annotation, skeleton
 from catmaid.control.authentication import PermissionError, requires_user_role, user_domain
@@ -47,7 +49,7 @@ def _parse_link(data) -> TaskLink:
     if not isinstance(data, dict) or data.keys() != {'annotation', 'coordinate', 'radius'}:
         raise ValueError('Expected an annotation, one coordinate and a radius')
     name = data['annotation']
-    match = TASK_ANNOTATION.fullmatch(name) if isinstance(name, str) else None
+    match = re.fullmatch(TASK_ANNOTATION.pattern, name) if isinstance(name, str) else None
     if match is None:
         raise ValueError('Expected a NeuroGlass task annotation')
     coordinate = data['coordinate']
@@ -161,7 +163,7 @@ def _neuron_annotation_links(project_id: int):
     )
 
 
-def _assign(project_id: int, user, change: TaskLink) -> tuple[int, bool]:
+def _assign(project_id: int, user, change: TaskLink) -> int:
     lock_task_annotation(project_id, change.annotation)
     if _neuron_annotation_links(project_id).filter(class_instance_b__name__iexact=change.annotation).exists():
         raise TaskLinkConflict('The task already has a skeleton')
@@ -216,25 +218,31 @@ def _link_candidate(project_id, user, change, study_annotations, skeleton_id, tr
             [neuron_id], {change.annotation: {'user_id': user.id}})
     if not any(neuron_id in entities for entities in added.values()):
         raise TaskLinkConflict('The task annotation could not be added')
-    return skeleton_id, bool(skeleton._reroot_skeleton_locked(treenode_id, project_id, skeleton_id))
+    skeleton._reroot_skeleton_locked(treenode_id, project_id, skeleton_id)
+    return skeleton_id
 
 
 @api_view(['POST'])
+@parser_classes([JSONParser])
 @requires_user_role(UserRole.Annotate)
 def link_task(request: HttpRequest, project_id=None) -> JsonResponse:
     """Assign an unlinked NeuroGlass task and reroot the skeleton atomically.
 
     Send one task annotation, an [x, y, z] coordinate and a radius in project nanometres.
     CATMAID chooses the closest eligible skeleton and makes its closest node the root.
-    A successful response includes the assigned skeleton ID and whether its root changed.
+    A successful response includes the assigned skeleton ID.
     """
-    if getattr(request, '_neuroglass_task_link_authorized', False) is not True:
-        raise PermissionError('Task linking requires authorization from NeuroGlass')
+    project_id = int(project_id)
+    scope = getattr(request, '_neuroglass_task_link_scope', None)
+    if scope is None or scope[0] != project_id:
+        raise PermissionError('Task linking requires authorization for this project from NeuroGlass')
     try:
         change = _parse_link(request.data)
     except ValueError as error:
         return HttpResponseBadRequest(str(error))
+    if change.study_id != scope[1]:
+        raise PermissionError('The task annotation does not match the signed study')
 
     with transaction.atomic():
-        skeleton_id, rerooted = _assign(int(project_id), request.user, change)
-    return JsonResponse({'skeleton_id': skeleton_id, 'rerooted': rerooted})
+        skeleton_id = _assign(project_id, request.user, change)
+    return JsonResponse({'skeleton_id': skeleton_id})

@@ -11,7 +11,7 @@ included in this changelog.
   `coordinate` (`[x, y, z]`), and a positive `radius` in project nanometres.
   CATMAID picks the nearest available skeleton, breaking ties by skeleton ID and
   then treenode ID. It assigns an unlinked task and makes the closest node the
-  root in one transaction. The response contains `skeleton_id` and `rerooted`.
+  root in one transaction. The response contains `skeleton_id`.
   A search with no eligible skeleton returns 409 with
   `meta.code: "task_link_no_match"`. A conflicting link or target change also
   returns 409.
