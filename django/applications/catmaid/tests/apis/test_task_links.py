@@ -238,6 +238,17 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
         self.assertEqual(7, self.root(1))
         self.assertEqual(377, self.root(373))
 
+    def test_already_linked_task_reports_conflict_when_no_other_skeleton_is_in_range(self):
+        self.move_node_near(405, 11, dx=40)
+        self.link(self.task_a, SKELETON_1_NEURON)
+
+        response = self.post(self.change(self.task_a, 11, radius=39))
+
+        self.assertEqual(409, response.status_code)
+        self.assertEqual('TaskLinkConflict', response.json()['type'])
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+        self.assertEqual(7, self.root(1))
+
     def test_chooses_next_skeleton_if_closest_is_held_by_same_study(self):
         self.move_node_near(405, 11, dx=40)
         self.link(self.task_b, SKELETON_1_NEURON)

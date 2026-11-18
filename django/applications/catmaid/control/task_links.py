@@ -159,12 +159,22 @@ def lock_task_annotation(project_id: int, name: str) -> None:
         cursor.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))', [key])
 
 
+def _neuron_annotation_links(project_id: int):
+    return ClassInstanceClassInstance.objects.filter(
+        project_id=project_id, relation__relation_name='annotated_with',
+        class_instance_a__class_column__class_name='neuron',
+        class_instance_b__project_id=project_id, class_instance_b__class_column__class_name='annotation',
+    )
+
+
 def _assign(project_id: int, user, change: TaskLink) -> tuple[int, bool]:
     lock_task_annotation(project_id, change.annotation)
     # A deletion can drain admitted writes under this lock. A request still
     # waiting here must check its deadline after the wait.
     if task_link_clock_ms() >= change.cutoff_ms:
         raise TaskLinkConflict('The task link request has expired. Try starting again.')
+    if _neuron_annotation_links(project_id).filter(class_instance_b__name__iexact=change.annotation).exists():
+        raise TaskLinkConflict('The task already has a skeleton')
     study_annotations = r'^neuroglass:study:%s:task:%s$' % (change.study_id, UUID_PATTERN)
     skipped_skeletons = []
     while True:
@@ -202,11 +212,7 @@ def _link_candidate(project_id, user, change, study_annotations, skeleton_id, tr
     if math.dist(locked_coordinate, change.coordinate) > change.radius:
         raise TaskLinkConflict('The nearest node moved during assignment. Try starting again.')
 
-    links = ClassInstanceClassInstance.objects.filter(
-        project_id=project_id, relation__relation_name='annotated_with',
-        class_instance_a__class_column__class_name='neuron',
-        class_instance_b__project_id=project_id, class_instance_b__class_column__class_name='annotation',
-    )
+    links = _neuron_annotation_links(project_id)
     if links.filter(class_instance_b__name__iexact=change.annotation).exists():
         raise TaskLinkConflict('The task already has a skeleton')
     if links.filter(class_instance_a_id=neuron_id, class_instance_b__name__iregex=study_annotations).exists():
