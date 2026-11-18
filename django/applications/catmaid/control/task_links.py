@@ -11,7 +11,7 @@ from django.http import HttpRequest, HttpResponseBadRequest, JsonResponse
 from rest_framework.decorators import api_view
 
 from catmaid.control import annotation, skeleton
-from catmaid.control.authentication import PermissionError, requires_user_role
+from catmaid.control.authentication import PermissionError, requires_user_role, user_domain
 from catmaid.control.common import get_class_to_id_map, get_relation_to_id_map
 from catmaid.error import ClientError
 from catmaid.models import ClassInstance, ClassInstanceClassInstance, Treenode, UserRole
@@ -61,9 +61,10 @@ def _parse_link(data, cutoff_ms: int) -> TaskLink:
     return TaskLink(name, match.group(1), (x, y, z), radius, cutoff_ms)
 
 
-def _nearest_candidate(project_id, coordinate, radius, study_annotations):
+def _nearest_candidate(project_id, coordinate, radius, study_annotations, user, skipped_skeletons):
     x, y, z = coordinate
     with connection.cursor() as cursor:
+        editable_user_ids = [] if user.is_superuser else list(user_domain(cursor, user.id))
         relations = get_relation_to_id_map(project_id, ['model_of', 'annotated_with'], cursor)
         classes = get_class_to_id_map(project_id, ['neuron', 'skeleton', 'annotation'], cursor)
         # The indexed edge bounds narrow the search before measuring distances to nodes.
@@ -89,7 +90,8 @@ def _nearest_candidate(project_id, coordinate, radius, study_annotations):
                 AND model.project_id = %(project)s AND model.relation_id = %(model_of)s
             JOIN class_instance neuron ON neuron.id = model.class_instance_b
                 AND neuron.project_id = %(project)s AND neuron.class_id = %(neuron_class)s
-            WHERE NOT EXISTS (
+            WHERE NOT (sk.id = ANY(%(skipped_skeletons)s))
+            AND NOT EXISTS (
                 SELECT 1 FROM class_instance_class_instance other_model
                 WHERE other_model.project_id = %(project)s AND other_model.relation_id = %(model_of)s
                   AND other_model.id <> model.id
@@ -103,6 +105,15 @@ def _nearest_candidate(project_id, coordinate, radius, study_annotations):
                 WHERE link.project_id = %(project)s AND link.relation_id = %(annotated_with)s
                   AND link.class_instance_a = neuron.id AND label.name ~* %(study_annotations)s
             )
+            AND (%(is_superuser)s OR NOT EXISTS (
+                SELECT 1
+                FROM class_instance_class_instance link
+                JOIN class_instance label ON label.id = link.class_instance_b
+                    AND label.project_id = %(project)s AND label.class_id = %(annotation_class)s
+                WHERE link.project_id = %(project)s AND link.relation_id = %(annotated_with)s
+                  AND link.class_instance_a = neuron.id AND label.name = 'locked'
+                  AND NOT (link.user_id = ANY(%(editable_user_ids)s))
+            ))
             ORDER BY candidate.distance, candidate.skeleton_id, candidate.treenode_id
             LIMIT 1
         """, {
@@ -113,6 +124,8 @@ def _nearest_candidate(project_id, coordinate, radius, study_annotations):
             'model_of': relations['model_of'], 'annotated_with': relations['annotated_with'],
             'neuron_class': classes['neuron'], 'skeleton_class': classes['skeleton'],
             'annotation_class': classes['annotation'], 'study_annotations': study_annotations,
+            'is_superuser': user.is_superuser, 'editable_user_ids': editable_user_ids,
+            'skipped_skeletons': skipped_skeletons,
         })
         return cursor.fetchone()
 
@@ -153,13 +166,33 @@ def _assign(project_id: int, user, change: TaskLink) -> tuple[int, bool]:
     if task_link_clock_ms() >= change.cutoff_ms:
         raise TaskLinkConflict('The task link request has expired. Try starting again.')
     study_annotations = r'^neuroglass:study:%s:task:%s$' % (change.study_id, UUID_PATTERN)
-    candidate = _nearest_candidate(project_id, change.coordinate, change.radius, study_annotations)
-    if candidate is None:
-        raise TaskLinkNoMatch('No eligible skeleton within the requested radius')
-    skeleton_id, treenode_id = candidate
+    skipped_skeletons = []
+    while True:
+        candidate = _nearest_candidate(project_id, change.coordinate, change.radius,
+                study_annotations, user, skipped_skeletons)
+        if candidate is None:
+            raise TaskLinkNoMatch('No eligible skeleton within the requested radius')
+        skeleton_id, treenode_id = candidate
+        try:
+            # Roll back any label and release this candidate's locks if its
+            # sampler prevents rerooting before trying a different skeleton.
+            with transaction.atomic():
+                return _link_candidate(project_id, user, change, study_annotations, skeleton_id, treenode_id)
+        except skeleton.RerootSamplerConflict:
+            skipped_skeletons.append(skeleton_id)
+
+
+def _link_candidate(project_id, user, change, study_annotations, skeleton_id, treenode_id):
     skeleton._lock_skeletons_for_reroot(project_id, [skeleton_id])
 
-    # Match the task deletion guard's lock order. Check the final association under both locks.
+    # Lock the neuron before the treenode, as whole-skeleton deletion does.
+    # Single-node deletion is serialized by the topology lock above.
+    neuron_id = _target_neuron(project_id, skeleton_id)
+    if not ClassInstance.objects.select_for_update().filter(project_id=project_id, id=neuron_id).exists():
+        raise TaskLinkConflict('The target neuron no longer exists')
+    if _target_neuron(project_id, skeleton_id) != neuron_id:
+        raise TaskLinkConflict('The target skeleton changed during assignment')
+
     try:
         locked_coordinate = Treenode.objects.select_for_update().values_list(
                 'location_x', 'location_y', 'location_z').get(
@@ -168,12 +201,6 @@ def _assign(project_id: int, user, change: TaskLink) -> tuple[int, bool]:
         raise TaskLinkConflict('The reroot node is no longer on the target skeleton')
     if math.dist(locked_coordinate, change.coordinate) > change.radius:
         raise TaskLinkConflict('The nearest node moved during assignment. Try starting again.')
-
-    neuron_id = _target_neuron(project_id, skeleton_id)
-    if not ClassInstance.objects.select_for_update().filter(project_id=project_id, id=neuron_id).exists():
-        raise TaskLinkConflict('The target neuron no longer exists')
-    if _target_neuron(project_id, skeleton_id) != neuron_id:
-        raise TaskLinkConflict('The target skeleton changed during assignment')
 
     links = ClassInstanceClassInstance.objects.filter(
         project_id=project_id, relation__relation_name='annotated_with',

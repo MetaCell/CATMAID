@@ -2298,6 +2298,10 @@ def _lock_skeletons_for_reroot(project_id, skeleton_ids):
         ''', [int(project_id), sorted(set(skeleton_ids))])
 
 
+class RerootSamplerConflict(ValueError):
+    """The requested root would invalidate a sampler domain."""
+
+
 @transaction.atomic
 def _reroot_skeleton(treenode_id, project_id):
     """ Returns the treenode instance that is now root,
@@ -2348,9 +2352,10 @@ def _reroot_skeleton(treenode_id, project_id):
                 # samplers.
                 for domain in sampler.samplerdomain_set.all():
                     if not is_same_or_downstream(domain.start_node_id, rootnode.id):
-                        response_on_error = 'Neuron is used in a sampler, which is affected by the new root'
-                        raise ValueError(f'Skeleton {rootnode.skeleton_id} '
-                                    f'is used in {n_samplers} sampler(s), can\'t reeroot')
+                        raise RerootSamplerConflict(
+                                'Neuron is used in a sampler, which is affected by the new root: '
+                                f'Skeleton {rootnode.skeleton_id} is used in {n_samplers} sampler(s), '
+                                "can't reroot")
 
         # Traverse up the chain of parents, reversing the parent relationships so
         # that the selected treenode (with ID treenode_id) becomes the root.
@@ -2390,6 +2395,8 @@ def _reroot_skeleton(treenode_id, project_id):
 
         return rootnode
 
+    except RerootSamplerConflict:
+        raise
     except Exception as e:
         raise ValueError(f'{response_on_error}: {e}')
 

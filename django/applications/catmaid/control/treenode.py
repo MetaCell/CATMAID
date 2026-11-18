@@ -637,6 +637,17 @@ def delete_treenode(request:HttpRequest, project_id=None) -> JsonResponse:
     # Raise an exception if the user doesn't have permission to edit the
     # treenode.
     can_edit_or_fail(request.user, treenode_id, 'treenode')
+
+    # Reroot locks the skeleton before any treenode rows. Deletion can also
+    # change those parent links, so it must take the locks in the same order.
+    from catmaid.control.skeleton import _lock_skeletons_for_reroot
+
+    skeleton_id = Treenode.objects.values_list('skeleton_id', flat=True).get(
+            id=treenode_id, project_id=project_id)
+    _lock_skeletons_for_reroot(project_id, [skeleton_id])
+    if not Treenode.objects.filter(id=treenode_id, project_id=project_id, skeleton_id=skeleton_id).exists():
+        raise ValueError('The treenode changed skeletons during deletion, please retry')
+
     # Raise an Exception if the user doesn't have permission to edit the neuron
     # the skeleton of the treenode is modeling.
     can_edit_treenode_or_fail(request.user, project_id, treenode_id)

@@ -12,7 +12,8 @@ from django.test import Client
 from django.test.client import ClientHandler
 
 from catmaid.control import annotation, skeleton, task_links
-from catmaid.models import Class, ClassInstance, ClassInstanceClassInstance, Treenode
+from catmaid.models import (Class, ClassInstance, ClassInstanceClassInstance,
+        Sampler, SamplerDomain, SamplerDomainType, SamplerState, Treenode, User)
 from catmaid.source_fragments import SOURCE_FRAGMENT_ANNOTATION_PREFIX
 from catmaid.state import make_nocheck_state
 
@@ -249,6 +250,48 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
         self.assertEqual(405, self.root(373))
         self.assertEqual(7, self.root(1))
 
+    def test_chooses_next_skeleton_if_closest_is_locked_by_another_user(self):
+        self.move_node_near(405, 11, dx=40)
+        lock_owner = User.objects.get(username='test0')
+        annotation._annotate_entities(self.test_project_id, [SKELETON_1_NEURON],
+                {'locked': {'user_id': lock_owner.id}})
+
+        result = self.result(self.post(self.change(self.task_a, 11, radius=100)))
+
+        self.assertEqual({'skeleton_id': 373, 'rerooted': True}, result)
+        self.assertEqual({SKELETON_373_NEURON}, self.neurons_with(self.task_a))
+        self.assertEqual(7, self.root(1))
+        self.assertEqual(405, self.root(373))
+
+    def test_can_assign_a_skeleton_locked_by_a_user_in_the_edit_domain(self):
+        lock_owner = User.objects.get(username='test1')
+        annotation._annotate_entities(self.test_project_id, [SKELETON_1_NEURON],
+                {'locked': {'user_id': lock_owner.id}})
+
+        result = self.result(self.post(self.change(self.task_a, 11)))
+
+        self.assertEqual({'skeleton_id': 1, 'rerooted': True}, result)
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+
+    def test_skips_a_candidate_whose_new_root_would_break_a_sampler(self):
+        self.move_node_near(405, 13, dx=40)
+        sampler = Sampler.objects.create(
+                project_id=self.test_project_id, user_id=self.test_user_id, skeleton_id=1,
+                interval_length=10, interval_error=0,
+                sampler_state=SamplerState.objects.create(name='Test sampler'))
+        # Moving the root to node 13 puts the domain start on the wrong side.
+        SamplerDomain.objects.create(
+                project_id=self.test_project_id, user_id=self.test_user_id,
+                sampler=sampler, start_node_id=11,
+                domain_type=SamplerDomainType.objects.create(name='Test domain'))
+
+        result = self.result(self.post(self.change(self.task_a, 13, radius=100)))
+
+        self.assertEqual({'skeleton_id': 373, 'rerooted': True}, result)
+        self.assertEqual({SKELETON_373_NEURON}, self.neurons_with(self.task_a))
+        self.assertEqual(7, self.root(1))
+        self.assertEqual(405, self.root(373))
+
     def test_breaks_distance_ties_by_skeleton_then_node_id(self):
         self.move_node_near(405, 11)
         self.move_node_near(13, 11)
@@ -474,6 +517,59 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
         self.assertIn('moved during assignment', response.json()['error'])
         self.assertEqual(set(), self.neurons_with(self.task_a))
         self.assertEqual(7, self.root(1))
+
+    def test_task_link_refuses_skeleton_deleted_before_neuron_lock(self):
+        native = Client()
+        native.force_login(User.objects.get(username='admin'))
+        target_neuron = task_links._target_neuron
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = []
+
+            def delete_before_neuron_lock(*args):
+                if not pending:
+                    pending.append(self.overlapping_request(pool, lambda: native.post(
+                            '/%d/skeletons/1/delete' % self.test_project_id)))
+                return target_neuron(*args)
+
+            with patch.object(task_links, '_target_neuron', side_effect=delete_before_neuron_lock):
+                response = self.post(self.change(self.task_a, 13))
+            deleted = pending[0].result(timeout=10)
+
+        self.assertStatus(deleted)
+        self.assertEqual(409, response.status_code, response.content)
+        self.assertIn('must model exactly one neuron', response.json()['error'])
+        self.assertEqual(set(), self.neurons_with(self.task_a))
+        self.assertFalse(Treenode.objects.filter(skeleton_id=1).exists())
+
+    def test_node_deletion_waits_for_task_link_reroot(self):
+        self.assertEqual(11, Treenode.objects.get(pk=13).parent_id)
+        self.assertEqual(7, Treenode.objects.get(pk=11).parent_id)
+        native = Client()
+        native.cookies.update(self.client.cookies)
+        reroot = skeleton._reroot_skeleton
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = []
+
+            def delete_while_reroot_holds_the_child(*args):
+                pending.append(self.overlapping_request(pool, lambda: native.post(
+                        '/%d/treenode/delete' % self.test_project_id, {
+                            'treenode_id': 11, 'state': make_nocheck_state(),
+                        })))
+                return reroot(*args)
+
+            with patch.object(skeleton, '_reroot_skeleton',
+                    side_effect=delete_while_reroot_holds_the_child):
+                response = self.post(self.change(self.task_a, 13))
+            deleted = pending[0].result(timeout=10)
+
+        self.assertEqual({'skeleton_id': 1, 'rerooted': True}, self.result(response))
+        self.assertStatus(deleted)
+        self.assertFalse(Treenode.objects.filter(pk=11).exists())
+        self.assertEqual(13, self.root(1))
+        self.assertEqual(13, Treenode.objects.get(pk=7).parent_id)
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
 
     def test_task_link_reroot_preserves_concurrent_insertion_on_ancestor_edge(self):
         native = Client()
