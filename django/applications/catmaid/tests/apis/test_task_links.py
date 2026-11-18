@@ -342,11 +342,18 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
         self.assertEqual(set(), self.neurons_with(self.task_a))
 
     def test_search_result_must_still_belong_to_the_target_at_write(self):
-        coordinate = self.change(self.task_a, 405)['coordinate']
-        with patch.object(task_links, '_nearest_candidate', return_value=(1, 405, *coordinate)):
-            self.assertEqual(409, self.post(self.change(self.task_a, 11)).status_code)
-        self.assertEqual(set(), self.neurons_with(self.task_a))
-        self.assertEqual(7, self.root(1))
+        for node_id, neuron_id, error in (
+                (405, SKELETON_1_NEURON, 'reroot node is no longer on the target skeleton'),
+                (11, SKELETON_373_NEURON, 'target skeleton changed during assignment')):
+            with self.subTest(node_id=node_id, neuron_id=neuron_id):
+                coordinate = self.change(self.task_a, node_id)['coordinate']
+                candidate = (1, node_id, neuron_id, *coordinate)
+                with patch.object(task_links, '_nearest_candidate', return_value=candidate):
+                    response = self.post(self.change(self.task_a, 11))
+                self.assertEqual(409, response.status_code, response.content)
+                self.assertIn(error, response.json()['error'])
+                self.assertEqual(set(), self.neurons_with(self.task_a))
+                self.assertEqual(7, self.root(1))
 
     def test_reroot_error_rolls_back_annotation(self):
         original = skeleton._reroot_skeleton_locked
@@ -545,24 +552,24 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
     def test_task_link_refuses_skeleton_deleted_before_neuron_lock(self):
         native = Client()
         native.force_login(User.objects.get(username='admin'))
-        target_neuron = task_links._target_neuron
+        nearest_candidate = task_links._nearest_candidate
 
         with ThreadPoolExecutor(max_workers=1) as pool:
             pending = []
 
-            def delete_before_neuron_lock(*args):
-                if not pending:
-                    pending.append(self.overlapping_request(pool, lambda: native.post(
-                            '/%d/skeletons/1/delete' % self.test_project_id)))
-                return target_neuron(*args)
+            def choose_then_delete(*args):
+                candidate = nearest_candidate(*args)
+                pending.append(self.overlapping_request(pool, lambda: native.post(
+                        '/%d/skeletons/1/delete' % self.test_project_id)))
+                return candidate
 
-            with patch.object(task_links, '_target_neuron', side_effect=delete_before_neuron_lock):
+            with patch.object(task_links, '_nearest_candidate', side_effect=choose_then_delete):
                 response = self.post(self.change(self.task_a, 13))
             deleted = pending[0].result(timeout=10)
 
         self.assertStatus(deleted)
         self.assertEqual(409, response.status_code, response.content)
-        self.assertIn('must model exactly one neuron', response.json()['error'])
+        self.assertIn('target neuron no longer exists', response.json()['error'])
         self.assertEqual(set(), self.neurons_with(self.task_a))
         self.assertFalse(Treenode.objects.filter(skeleton_id=1).exists())
 

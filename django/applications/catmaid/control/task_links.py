@@ -84,7 +84,7 @@ def _nearest_candidate(project_id, coordinate, radius, study_annotations, user, 
                   AND ST_3DDWithin(ST_StartPoint(e.edge), ST_MakePoint(%(x)s, %(y)s, %(z)s), %(radius)s)
                 ORDER BY t.skeleton_id, distance, t.id
             )
-            SELECT candidate.skeleton_id, candidate.treenode_id,
+            SELECT candidate.skeleton_id, candidate.treenode_id, neuron.id,
                 candidate.location_x, candidate.location_y, candidate.location_z
             FROM nearby candidate
             JOIN class_instance sk ON sk.id = candidate.skeleton_id
@@ -174,24 +174,23 @@ def _assign(project_id: int, user, change: TaskLink) -> int:
                 study_annotations, user, skipped_skeletons)
         if candidate is None:
             raise TaskLinkNoMatch('No eligible skeleton within the requested radius')
-        skeleton_id, treenode_id, x, y, z = candidate
+        skeleton_id, treenode_id, neuron_id, x, y, z = candidate
         try:
             # Roll back any label and release this candidate's locks if its
             # sampler prevents rerooting before trying a different skeleton.
             with transaction.atomic():
                 return _link_candidate(project_id, user, change, study_annotations,
-                        skeleton_id, treenode_id, (x, y, z))
+                        skeleton_id, treenode_id, neuron_id, (x, y, z))
         except skeleton.RerootSamplerConflict:
             skipped_skeletons.append(skeleton_id)
 
 
 def _link_candidate(project_id, user, change, study_annotations, skeleton_id, treenode_id,
-        candidate_coordinate):
+        neuron_id, candidate_coordinate):
     skeleton._lock_skeletons_for_reroot(project_id, [skeleton_id])
 
     # Lock the neuron before the treenode, as whole-skeleton deletion does.
     # Single-node deletion is serialized by the topology lock above.
-    neuron_id = _target_neuron(project_id, skeleton_id)
     if not ClassInstance.objects.select_for_update().filter(project_id=project_id, id=neuron_id).exists():
         raise TaskLinkConflict('The target neuron no longer exists')
     if _target_neuron(project_id, skeleton_id) != neuron_id:
