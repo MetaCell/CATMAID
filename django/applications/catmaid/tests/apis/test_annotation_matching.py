@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 
 import json
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 from time import monotonic, sleep
@@ -9,9 +8,8 @@ from unittest.mock import patch
 
 from django.db import connection, connections
 from django.test import Client
-from django.test.client import ClientHandler
 
-from catmaid.control import annotation, skeleton, task_links
+from catmaid.control import annotation, skeleton, annotation_matching
 from catmaid.models import (Class, ClassInstance, ClassInstanceClassInstance,
         Sampler, SamplerDomain, SamplerDomainType, SamplerState, Treenode, User)
 from catmaid.source_fragments import SOURCE_FRAGMENT_ANNOTATION_PREFIX
@@ -24,32 +22,18 @@ SKELETON_1_NEURON = 2
 SKELETON_373_NEURON = 374
 
 
-def task_annotation(study_id):
-    return 'neuroglass:study:%s:task:%s' % (study_id, uuid.uuid4())
+def annotation_name(group):
+    return 'experiment:%s:target' % group
 
 
-class TrustedTaskLinkHandler(ClientHandler):
-    def get_response(self, request):
-        # Stand in for the installed overlay's server-side grant.
-        request._neuroglass_task_link_scope = self.task_link_scope
-        return super().get_response(request)
-
-
-class TaskLinkTestClient(Client):
-    def __init__(self, project_id, study_id):
-        super().__init__()
-        self.handler = TrustedTaskLinkHandler(enforce_csrf_checks=False)
-        self.handler.task_link_scope = (project_id, str(study_id))
-
-
-class TaskLinksFixtures:
+class AnnotationMatchingFixtures:
     def setUp(self):
         super().setUp()
-        self.study_id = uuid.uuid4()
-        self.client = TaskLinkTestClient(self.test_project_id, self.study_id)
-        self.url = '/%d/skeletons/task-link' % self.test_project_id
-        self.task_a = task_annotation(self.study_id)
-        self.task_b = task_annotation(self.study_id)
+        self.annotation_group = 'experiment-A'
+        self.client = Client()
+        self.url = '/%d/skeletons/annotate-nearest' % self.test_project_id
+        self.annotation_a = annotation_name(self.annotation_group)
+        self.annotation_b = 'experiment:experiment-A:other'
         self.fake_authentication()
 
     def link(self, name, neuron_id):
@@ -75,10 +59,11 @@ class TaskLinksFixtures:
             'annotation': name,
             'coordinate': [node.location_x, node.location_y, node.location_z],
             'radius': radius,
+            'exclude_annotation_pattern': r'^experiment:experiment-A:',
         }
 
     def move_node_near(self, node_id, reference_id, dx=0):
-        x, y, z = self.change(self.task_a, reference_id)['coordinate']
+        x, y, z = self.change(self.annotation_a, reference_id)['coordinate']
         Treenode.objects.filter(pk=node_id).update(location_x=x + dx, location_y=y, location_z=z)
 
     def post(self, change, client=None):
@@ -89,63 +74,63 @@ class TaskLinksFixtures:
         return response.json()
 
 
-class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
-    def test_native_annotator_cannot_link_task(self):
-        native = Client()
-        native.cookies.update(self.client.cookies)
-        self.assertEqual(403, self.post(self.change(self.task_a, 11), client=native).status_code)
-        self.assertEqual(set(), self.neurons_with(self.task_a))
+class AnnotationMatchingApiTests(AnnotationMatchingFixtures, CatmaidApiTestCase):
+    def test_native_annotator_can_annotate_an_arbitrary_name(self):
+        payload = self.change('My annotation', 11)
+        payload.pop('exclude_annotation_pattern')
+        result = self.result(self.post(payload))
+        self.assertEqual({'skeleton_id': 1}, result)
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with('My annotation'))
+        self.assertEqual(11, self.root(1))
+
+    def test_annotating_nearest_requires_project_annotate_permission(self):
+        from guardian.shortcuts import remove_perm
+        remove_perm('can_annotate', self.test_user, self.test_project)
+        response = self.post(self.change(self.annotation_a, 11))
+        self.assertEqual(403, response.status_code, response.content)
+        self.assertEqual(set(), self.neurons_with(self.annotation_a))
         self.assertEqual(7, self.root(1))
 
-    def test_rejects_task_links_outside_the_signed_project_or_study(self):
-        for project_id, study_id in (
-                (self.test_project_id + 1, str(self.study_id)),
-                (self.test_project_id, str(uuid.uuid4()))):
-            with self.subTest(project_id=project_id, study_id=study_id):
-                self.client.handler.task_link_scope = (project_id, study_id)
-                response = self.post(self.change(self.task_a, 11))
-                self.assertEqual(403, response.status_code, response.content)
-                self.assertEqual(set(), self.neurons_with(self.task_a))
-                self.assertEqual(7, self.root(1))
+    def test_existing_annotation_is_checked_before_search(self):
+        self.link(self.annotation_a, SKELETON_1_NEURON)
+        with patch.object(annotation_matching, '_nearest_candidate',
+                side_effect=AssertionError('An existing annotation must not trigger a search')):
+            response = self.post(self.change(self.annotation_a, 405))
+        self.assertEqual(409, response.status_code, response.content)
+        self.assertEqual(377, self.root(373))
 
-    def test_task_link_requires_json(self):
-        response = self.client.post(self.url, self.change(self.task_a, 11))
+    def test_annotation_exclusions_are_optional(self):
+        self.link(self.annotation_b, SKELETON_1_NEURON)
+        payload = self.change(self.annotation_a, 11)
+        payload.pop('exclude_annotation_pattern')
+        self.assertEqual({'skeleton_id': 1}, self.result(self.post(payload)))
+
+    def test_invalid_annotation_pattern_leaves_no_annotation_or_reroot(self):
+        payload = dict(self.change(self.annotation_a, 11), exclude_annotation_pattern='[')
+        response = self.post(payload)
+        self.assertEqual(400, response.status_code, response.content)
+        self.assertEqual(set(), self.neurons_with(self.annotation_a))
+        self.assertEqual(7, self.root(1))
+
+    def test_annotation_match_requires_json(self):
+        response = self.client.post(self.url, self.change(self.annotation_a, 11))
         self.assertEqual(415, response.status_code, response.content)
-        self.assertEqual(set(), self.neurons_with(self.task_a))
+        self.assertEqual(set(), self.neurons_with(self.annotation_a))
         self.assertEqual(7, self.root(1))
 
     def test_assignment_adds_link_and_reroots(self):
         self.move_node_near(405, 11, dx=40)
-        result = self.result(self.post(self.change(self.task_a, 11, radius=100)))
+        result = self.result(self.post(self.change(self.annotation_a, 11, radius=100)))
         self.assertEqual({'skeleton_id': 1}, result)
-        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
         self.assertEqual(11, self.root(1))
 
     def test_already_root_only_links(self):
-        result = self.result(self.post(self.change(self.task_a, 7)))
+        result = self.result(self.post(self.change(self.annotation_a, 7)))
         self.assertEqual({'skeleton_id': 1}, result)
-        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
         self.assertEqual(7, self.root(1))
 
-    def test_fast_split_keeps_task_link_on_the_original_skeleton(self):
-        self.assertEqual(1, self.result(self.post(self.change(self.task_a, 7)))['skeleton_id'])
-        provenance = SOURCE_FRAGMENT_ANNOTATION_PREFIX + 'imported-fragment'
-        annotation._annotate_entities(self.test_project_id, [SKELETON_1_NEURON],
-                {name: {'user_id': self.test_user_id}
-                    for name in ('ordinary annotation', provenance)}, allow_reserved=True)
-
-        result = self.result(self.client.post('/%d/skeleton/split' % self.test_project_id,
-                {'treenode_id': 11}))
-
-        self.assertEqual(1, result['existing_skeleton_id'])
-        new_skeleton = result['new_skeleton_id']
-        self.assertNotEqual(1, new_skeleton)
-        self.assertEqual(7, self.root(1))
-        self.assertEqual(11, self.root(new_skeleton))
-        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
-        for skeleton_id in (1, new_skeleton):
-            self.assertLessEqual({'ordinary annotation', provenance},
-                    annotation.annotations_for_skeleton(self.test_project_id, skeleton_id).keys())
 
     def test_split_moves_ordinary_annotations_off_original_when_its_map_is_empty(self):
         self.link('ordinary label', SKELETON_1_NEURON)
@@ -167,7 +152,7 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
     def test_split_refuses_a_preview_whose_parent_changed_during_start(self):
         self.assertEqual(7, Treenode.objects.get(pk=11).parent_id)
         self.assertEqual(11, Treenode.objects.get(pk=13).parent_id)
-        self.assertStatus(self.post(self.change(self.task_a, 13)))
+        self.assertStatus(self.post(self.change(self.annotation_a, 13)))
         self.assertEqual(13, Treenode.objects.get(pk=11).parent_id)
         original_nodes = set(Treenode.objects.filter(skeleton_id=1).values_list('id', flat=True))
 
@@ -183,86 +168,40 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
         self.assertEqual(original_nodes, set(Treenode.objects.filter(skeleton_id=1)
                 .values_list('id', flat=True)))
         self.assertEqual(13, self.root(1))
-        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
 
-    def test_confirmed_split_does_not_duplicate_the_task_link(self):
-        self.link(self.task_a, SKELETON_1_NEURON)
-        self.link('shared label', SKELETON_1_NEURON)
-        selected = json.dumps({self.task_a: self.test_user_id, 'shared label': self.test_user_id})
 
-        result = self.result(self.client.post('/%d/skeleton/split' % self.test_project_id, {
-            'treenode_id': 11,
-            'expected_parent_id': 7,
-            'upstream_annotation_map': selected,
-            'downstream_annotation_map': selected,
-        }))
 
-        self.assertEqual(1, result['existing_skeleton_id'])
-        self.assertEqual(7, self.root(1))
-        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
-        self.assertEqual({'shared label': self.test_user_id},
-                annotation.annotations_for_skeleton(self.test_project_id, result['new_skeleton_id']))
 
-    def test_confirmed_split_keeps_task_link_when_all_ordinary_labels_go_to_new_skeleton(self):
-        self.link(self.task_a, SKELETON_1_NEURON)
-        self.link('selected label', SKELETON_1_NEURON)
-
-        result = self.result(self.client.post('/%d/skeleton/split' % self.test_project_id, {
-            'treenode_id': 11,
-            'upstream_annotation_map': '{}',
-            'downstream_annotation_map': json.dumps({
-                self.task_a: self.test_user_id,
-                self.task_b: self.test_user_id,
-                'selected label': self.test_user_id,
-            }),
-        }))
-
-        self.assertEqual({self.task_a: self.test_user_id},
-                annotation.annotations_for_skeleton(self.test_project_id, 1))
-        self.assertEqual({'selected label': self.test_user_id},
-                annotation.annotations_for_skeleton(self.test_project_id, result['new_skeleton_id']))
-        self.assertEqual(set(), self.neurons_with(self.task_b))
-
-    def test_confirmed_split_keeps_task_link_omitted_from_both_maps(self):
-        self.link(self.task_a, SKELETON_1_NEURON)
-
-        self.result(self.client.post('/%d/skeleton/split' % self.test_project_id, {
-            'treenode_id': 11,
-            'upstream_annotation_map': '{}',
-            'downstream_annotation_map': '{}',
-        }))
-
-        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
-
-    def test_assigned_task_cannot_move_or_reroot(self):
-        self.link(self.task_a, SKELETON_1_NEURON)
+    def test_assigned_annotation_cannot_move_or_reroot(self):
+        self.link(self.annotation_a, SKELETON_1_NEURON)
         for skeleton_id, node in ((1, 11), (373, 405)):
             with self.subTest(skeleton_id=skeleton_id):
-                self.assertEqual(409, self.post(self.change(self.task_a, node)).status_code)
-        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+                self.assertEqual(409, self.post(self.change(self.annotation_a, node)).status_code)
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
         self.assertEqual(7, self.root(1))
         self.assertEqual(377, self.root(373))
 
-    def test_already_linked_task_reports_conflict_when_no_other_skeleton_is_in_range(self):
+    def test_already_assigned_annotation_reports_conflict_when_no_other_skeleton_is_in_range(self):
         self.move_node_near(405, 11, dx=40)
-        self.link(self.task_a, SKELETON_1_NEURON)
+        self.link(self.annotation_a, SKELETON_1_NEURON)
 
-        response = self.post(self.change(self.task_a, 11, radius=39))
+        response = self.post(self.change(self.annotation_a, 11, radius=39))
 
         self.assertEqual(409, response.status_code)
-        self.assertEqual('TaskLinkConflict', response.json()['type'])
-        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+        self.assertEqual('AnnotationMatchConflict', response.json()['type'])
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
         self.assertEqual(7, self.root(1))
 
-    def test_chooses_next_skeleton_if_closest_is_held_by_same_study(self):
+    def test_chooses_next_skeleton_if_closest_is_excluded_by_pattern(self):
         self.move_node_near(405, 11, dx=40)
-        self.link(self.task_b, SKELETON_1_NEURON)
+        self.link(self.annotation_b, SKELETON_1_NEURON)
 
-        result = self.result(self.post(self.change(self.task_a, 11, radius=100)))
+        result = self.result(self.post(self.change(self.annotation_a, 11, radius=100)))
 
         self.assertEqual({'skeleton_id': 373}, result)
-        self.assertEqual({SKELETON_373_NEURON}, self.neurons_with(self.task_a))
-        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_b))
+        self.assertEqual({SKELETON_373_NEURON}, self.neurons_with(self.annotation_a))
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_b))
         self.assertEqual(405, self.root(373))
         self.assertEqual(7, self.root(1))
 
@@ -272,10 +211,10 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
         annotation._annotate_entities(self.test_project_id, [SKELETON_1_NEURON],
                 {'locked': {'user_id': lock_owner.id}})
 
-        result = self.result(self.post(self.change(self.task_a, 11, radius=100)))
+        result = self.result(self.post(self.change(self.annotation_a, 11, radius=100)))
 
         self.assertEqual({'skeleton_id': 373}, result)
-        self.assertEqual({SKELETON_373_NEURON}, self.neurons_with(self.task_a))
+        self.assertEqual({SKELETON_373_NEURON}, self.neurons_with(self.annotation_a))
         self.assertEqual(7, self.root(1))
         self.assertEqual(405, self.root(373))
 
@@ -284,10 +223,10 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
         annotation._annotate_entities(self.test_project_id, [SKELETON_1_NEURON],
                 {'locked': {'user_id': lock_owner.id}})
 
-        result = self.result(self.post(self.change(self.task_a, 11)))
+        result = self.result(self.post(self.change(self.annotation_a, 11)))
 
         self.assertEqual({'skeleton_id': 1}, result)
-        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
 
     def test_skips_a_candidate_whose_new_root_would_break_a_sampler(self):
         self.move_node_near(405, 13, dx=40)
@@ -301,10 +240,10 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
                 sampler=sampler, start_node_id=11,
                 domain_type=SamplerDomainType.objects.create(name='Test domain'))
 
-        result = self.result(self.post(self.change(self.task_a, 13, radius=100)))
+        result = self.result(self.post(self.change(self.annotation_a, 13, radius=100)))
 
         self.assertEqual({'skeleton_id': 373}, result)
-        self.assertEqual({SKELETON_373_NEURON}, self.neurons_with(self.task_a))
+        self.assertEqual({SKELETON_373_NEURON}, self.neurons_with(self.annotation_a))
         self.assertEqual(7, self.root(1))
         self.assertEqual(405, self.root(373))
 
@@ -312,7 +251,7 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
         self.move_node_near(405, 11)
         self.move_node_near(13, 11)
 
-        result = self.result(self.post(self.change(self.task_a, 11)))
+        result = self.result(self.post(self.change(self.annotation_a, 11)))
 
         self.assertEqual(1, result['skeleton_id'])
         self.assertEqual(11, self.root(1))
@@ -320,39 +259,39 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
 
     def test_reports_no_match_when_radius_excludes_free_candidates(self):
         self.move_node_near(405, 11, dx=40)
-        self.link(self.task_b, SKELETON_1_NEURON)
+        self.link(self.annotation_b, SKELETON_1_NEURON)
 
-        response = self.post(self.change(self.task_a, 11, radius=39))
+        response = self.post(self.change(self.annotation_a, 11, radius=39))
 
         self.assertEqual(409, response.status_code)
-        self.assertEqual({'code': 'task_link_no_match'}, response.json()['meta'])
-        self.assertEqual(set(), self.neurons_with(self.task_a))
+        self.assertEqual({'code': 'annotation_match_no_match'}, response.json()['meta'])
+        self.assertEqual(set(), self.neurons_with(self.annotation_a))
         self.assertEqual(7, self.root(1))
         self.assertEqual(377, self.root(373))
 
-    def test_target_held_by_other_study_is_available(self):
-        self.link(task_annotation(uuid.uuid4()), SKELETON_1_NEURON)
-        self.assertEqual(1, self.result(self.post(self.change(self.task_a, 11)))['skeleton_id'])
+    def test_target_with_nonmatching_annotation_is_available(self):
+        self.link(annotation_name('experiment-B'), SKELETON_1_NEURON)
+        self.assertEqual(1, self.result(self.post(self.change(self.annotation_a, 11)))['skeleton_id'])
 
     def test_target_neuron_requires_exactly_one_skeleton(self):
         ClassInstanceClassInstance.objects.filter(
                 project_id=self.test_project_id, relation__relation_name='model_of',
                 class_instance_a_id=373).update(class_instance_b_id=SKELETON_1_NEURON)
-        self.assertEqual(409, self.post(self.change(self.task_a, 11)).status_code)
-        self.assertEqual(set(), self.neurons_with(self.task_a))
+        self.assertEqual(409, self.post(self.change(self.annotation_a, 11)).status_code)
+        self.assertEqual(set(), self.neurons_with(self.annotation_a))
 
     def test_search_result_must_still_belong_to_the_target_at_write(self):
         for node_id, neuron_id, error in (
                 (405, SKELETON_1_NEURON, 'reroot node is no longer on the target skeleton'),
                 (11, SKELETON_373_NEURON, 'target skeleton changed during assignment')):
             with self.subTest(node_id=node_id, neuron_id=neuron_id):
-                coordinate = self.change(self.task_a, node_id)['coordinate']
+                coordinate = self.change(self.annotation_a, node_id)['coordinate']
                 candidate = (1, node_id, neuron_id, *coordinate)
-                with patch.object(task_links, '_nearest_candidate', return_value=candidate):
-                    response = self.post(self.change(self.task_a, 11))
+                with patch.object(annotation_matching, '_nearest_candidate', return_value=candidate):
+                    response = self.post(self.change(self.annotation_a, 11))
                 self.assertEqual(409, response.status_code, response.content)
                 self.assertIn(error, response.json()['error'])
-                self.assertEqual(set(), self.neurons_with(self.task_a))
+                self.assertEqual(set(), self.neurons_with(self.annotation_a))
                 self.assertEqual(7, self.root(1))
 
     def test_reroot_error_rolls_back_annotation(self):
@@ -363,25 +302,26 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
             raise ValueError('Simulated failure after changing the root')
 
         with patch.object(skeleton, '_reroot_skeleton_locked', side_effect=fail_after_reroot):
-            self.assertEqual(400, self.post(self.change(self.task_a, 11)).status_code)
-        self.assertEqual(set(), self.neurons_with(self.task_a))
+            self.assertEqual(400, self.post(self.change(self.annotation_a, 11)).status_code)
+        self.assertEqual(set(), self.neurons_with(self.annotation_a))
         self.assertEqual(7, self.root(1))
 
-    def test_malformed_requests_leave_task_unlinked(self):
-        valid = self.change(self.task_a, 11)
-        old = {'annotation': self.task_a, 'skeleton_id': 1, 'reroot_treenode_id': 11}
-        for payload in (old, {'changes': [valid]}, dict(valid, annotation='ordinary'),
-                dict(valid, annotation=self.task_a.upper()),
+    def test_malformed_requests_leave_annotation_unassigned(self):
+        valid = self.change(self.annotation_a, 11)
+        old = {'annotation': self.annotation_a, 'skeleton_id': 1, 'reroot_treenode_id': 11}
+        for payload in (old, {'changes': [valid]}, dict(valid, annotation=''), dict(valid, annotation='   '),
+                dict(valid, annotation=23), dict(valid, annotation='label{n}'),
+                dict(valid, exclude_annotation_pattern=23),
                 dict(valid, coordinate=[[1, 2, 3], [4, 5, 6]]),
                 dict(valid, coordinate=[1, 2]), dict(valid, coordinate=[1, 'two', 3]),
                 dict(valid, coordinate=[True, 0, 0]), dict(valid, coordinate=[10**400, 0, 0]),
                 dict(valid, radius=0), dict(valid, radius=-1), dict(valid, radius=1e308)):
             with self.subTest(payload=payload):
                 self.assertEqual(400, self.post(payload).status_code)
-        self.assertEqual(set(), self.neurons_with(self.task_a))
+        self.assertEqual(set(), self.neurons_with(self.annotation_a))
 
 
-class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase):
+class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiTransactionTestCase):
     def overlapping_request(self, pool, call):
         backend_ids = Queue()
 
@@ -409,18 +349,18 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
                 sleep(0.01)
         return waiting
 
-    def test_independent_applies_cannot_link_one_task_to_different_skeletons(self):
+    def test_independent_applies_cannot_link_one_annotation_to_different_skeletons(self):
         # An existing annotation without a holder avoids serialization during
         # creation of the annotation object itself.
         annotation_class = Class.objects.get(project_id=self.test_project_id,
                 class_name='annotation')
         ClassInstance.objects.create(project_id=self.test_project_id,
-                class_column=annotation_class, user_id=self.test_user_id, name=self.task_a)
-        first = self.change(self.task_a, 11)
-        second = self.change(self.task_a, 405)
-        second_client = TaskLinkTestClient(self.test_project_id, self.study_id)
+                class_column=annotation_class, user_id=self.test_user_id, name=self.annotation_a)
+        first = self.change(self.annotation_a, 11)
+        second = self.change(self.annotation_a, 405)
+        second_client = Client()
         second_client.cookies.update(self.client.cookies)
-        original = task_links._assign
+        original = annotation_matching._assign
         waiters = []
 
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -431,44 +371,44 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
                             lambda: self.post(second, client=second_client)))
                 return result
 
-            with patch.object(task_links, '_assign', side_effect=apply_then_overlap):
+            with patch.object(annotation_matching, '_assign', side_effect=apply_then_overlap):
                 first_response = self.post(first)
                 self.assertStatus(first_response)
                 second_response = waiters[0].result(timeout=10)
         self.assertEqual(1, self.result(first_response)['skeleton_id'])
         self.assertEqual(409, second_response.status_code)
-        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
         self.assertEqual(377, self.root(373))
 
-    def test_concurrent_tasks_in_same_study_cannot_claim_one_skeleton(self):
-        first = self.change(self.task_a, 11)
-        second = self.change(self.task_b, 13)
-        client = TaskLinkTestClient(self.test_project_id, self.study_id)
+    def test_concurrent_annotations_with_same_exclusion_cannot_claim_one_skeleton(self):
+        first = self.change(self.annotation_a, 11)
+        second = self.change(self.annotation_b, 13)
+        client = Client()
         client.cookies.update(self.client.cookies)
-        original = task_links._assign
+        original = annotation_matching._assign
         waiters = []
 
         with ThreadPoolExecutor(max_workers=1) as pool:
             def apply_then_overlap(project_id, user, change):
                 result = original(project_id, user, change)
-                if change.annotation == self.task_a:
+                if change.annotation == self.annotation_a:
                     waiters.append(self.overlapping_request(pool, lambda: self.post(second, client=client)))
                 return result
 
-            with patch.object(task_links, '_assign', side_effect=apply_then_overlap):
+            with patch.object(annotation_matching, '_assign', side_effect=apply_then_overlap):
                 self.assertStatus(self.post(first))
                 response = waiters[0].result(timeout=10)
 
         self.assertEqual(409, response.status_code)
-        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
-        self.assertEqual(set(), self.neurons_with(self.task_b))
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
+        self.assertEqual(set(), self.neurons_with(self.annotation_b))
         self.assertEqual(11, self.root(1))
 
-    def test_native_reroot_reads_topology_after_concurrent_task_link_commits(self):
-        change = self.change(self.task_a, 407)
+    def test_native_reroot_reads_topology_after_concurrent_annotation_match_commits(self):
+        change = self.change(self.annotation_a, 407)
         native = Client()
         native.cookies.update(self.client.cookies)
-        original = task_links._assign
+        original = annotation_matching._assign
         waiters = []
 
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -478,7 +418,7 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
                         '/%d/skeleton/reroot' % self.test_project_id, {'treenode_id': 405})))
                 return result
 
-            with patch.object(task_links, '_assign', side_effect=apply_then_overlap):
+            with patch.object(annotation_matching, '_assign', side_effect=apply_then_overlap):
                 apply_response = self.post(change)
                 self.assertStatus(apply_response)
             reroot_response = waiters[0].result(timeout=10)
@@ -489,11 +429,11 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
         self.assertEqual(405, parents[377])
 
 
-    def test_split_rechecks_parent_after_task_link_reroots_same_node(self):
+    def test_split_rechecks_parent_after_annotation_match_reroots_same_node(self):
         original_nodes = set(Treenode.objects.filter(skeleton_id=1).values_list('id', flat=True))
         native = Client()
         native.cookies.update(self.client.cookies)
-        original = task_links._assign
+        original = annotation_matching._assign
         splits = []
 
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -505,27 +445,27 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
                         '/%d/skeleton/split' % self.test_project_id, {'treenode_id': 11})))
                 return result
 
-            with patch.object(task_links, '_assign', side_effect=assign_then_split):
-                self.assertStatus(self.post(self.change(self.task_a, 11)))
+            with patch.object(annotation_matching, '_assign', side_effect=assign_then_split):
+                self.assertStatus(self.post(self.change(self.annotation_a, 11)))
             split = splits[0].result(timeout=10)
 
-        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a),
-                'Splitting at the new root must not duplicate the task annotation')
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a),
+                'Splitting at the new root must not duplicate the assigned annotation')
         self.assertEqual(original_nodes,
                 set(Treenode.objects.filter(skeleton_id=1).values_list('id', flat=True)),
                 'The linked skeleton must retain its nodes')
         self.assertEqual(11, self.root(1))
         self.assertIn(split.status_code, (400, 409), split.content)
 
-    def test_task_link_refuses_candidate_moved_outside_the_radius_before_lock(self):
-        self.assert_task_link_refuses_moved_candidate(radius=1)
+    def test_annotation_match_refuses_candidate_moved_outside_the_radius_before_lock(self):
+        self.assert_annotation_match_refuses_moved_candidate(radius=1)
 
-    def test_task_link_refuses_candidate_moved_within_the_radius_before_lock(self):
-        self.assert_task_link_refuses_moved_candidate(radius=101)
+    def test_annotation_match_refuses_candidate_moved_within_the_radius_before_lock(self):
+        self.assert_annotation_match_refuses_moved_candidate(radius=101)
 
-    def assert_task_link_refuses_moved_candidate(self, radius):
-        payload = self.change(self.task_a, 11, radius=radius)
-        nearest_candidate = task_links._nearest_candidate
+    def assert_annotation_match_refuses_moved_candidate(self, radius):
+        payload = self.change(self.annotation_a, 11, radius=radius)
+        nearest_candidate = annotation_matching._nearest_candidate
 
         def move_node(node_id):
             try:
@@ -541,18 +481,18 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
                 self.assertEqual(1, pool.submit(move_node, 11).result(timeout=5))
                 return candidate
 
-            with patch.object(task_links, '_nearest_candidate', side_effect=choose_then_move):
+            with patch.object(annotation_matching, '_nearest_candidate', side_effect=choose_then_move):
                 response = self.post(payload)
 
         self.assertEqual(409, response.status_code, response.content)
-        self.assertIn('moved during assignment', response.json()['error'])
-        self.assertEqual(set(), self.neurons_with(self.task_a))
+        self.assertIn('moved during annotation', response.json()['error'])
+        self.assertEqual(set(), self.neurons_with(self.annotation_a))
         self.assertEqual(7, self.root(1))
 
-    def test_task_link_refuses_skeleton_deleted_before_neuron_lock(self):
+    def test_annotation_match_refuses_skeleton_deleted_before_neuron_lock(self):
         native = Client()
         native.force_login(User.objects.get(username='admin'))
-        nearest_candidate = task_links._nearest_candidate
+        nearest_candidate = annotation_matching._nearest_candidate
 
         with ThreadPoolExecutor(max_workers=1) as pool:
             pending = []
@@ -563,17 +503,17 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
                         '/%d/skeletons/1/delete' % self.test_project_id)))
                 return candidate
 
-            with patch.object(task_links, '_nearest_candidate', side_effect=choose_then_delete):
-                response = self.post(self.change(self.task_a, 13))
+            with patch.object(annotation_matching, '_nearest_candidate', side_effect=choose_then_delete):
+                response = self.post(self.change(self.annotation_a, 13))
             deleted = pending[0].result(timeout=10)
 
         self.assertStatus(deleted)
         self.assertEqual(409, response.status_code, response.content)
         self.assertIn('target neuron no longer exists', response.json()['error'])
-        self.assertEqual(set(), self.neurons_with(self.task_a))
+        self.assertEqual(set(), self.neurons_with(self.annotation_a))
         self.assertFalse(Treenode.objects.filter(skeleton_id=1).exists())
 
-    def test_node_deletion_waits_for_task_link_reroot(self):
+    def test_node_deletion_waits_for_annotation_match_reroot(self):
         self.assertEqual(11, Treenode.objects.get(pk=13).parent_id)
         self.assertEqual(7, Treenode.objects.get(pk=11).parent_id)
         native = Client()
@@ -592,7 +532,7 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
 
             with patch.object(skeleton, '_reroot_skeleton_locked',
                     side_effect=delete_while_reroot_holds_the_child):
-                response = self.post(self.change(self.task_a, 13))
+                response = self.post(self.change(self.annotation_a, 13))
             deleted = pending[0].result(timeout=10)
 
         self.assertEqual({'skeleton_id': 1}, self.result(response))
@@ -600,4 +540,4 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
         self.assertFalse(Treenode.objects.filter(pk=11).exists())
         self.assertEqual(13, self.root(1))
         self.assertEqual(13, Treenode.objects.get(pk=7).parent_id)
-        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))

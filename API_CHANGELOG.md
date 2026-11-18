@@ -6,15 +6,18 @@ included in this changelog.
 
 ### Additions
 
-- `POST /{project_id}/skeletons/task-link`:
-  Send a task `annotation` (`neuroglass:study:<uuid>:task:<uuid>`), one
-  `coordinate` (`[x, y, z]`), and a positive `radius` in project nanometres.
-  CATMAID picks the nearest available skeleton, breaking ties by skeleton ID and
-  then treenode ID. It assigns an unlinked task and makes the closest node the
+- `POST /{project_id}/skeletons/annotate-nearest`:
+  Send an unused literal `annotation` name, one `coordinate` (`[x, y, z]`), and
+  a positive `radius` in project nanometres. An optional
+  `exclude_annotation_pattern` skips neurons carrying annotations matching
+  a case-insensitive PostgreSQL regular expression.
+  CATMAID picks the nearest eligible skeleton, breaking ties by skeleton ID
+  and then treenode ID, adds the annotation, and makes the selected node the
   root in one transaction. The response contains `skeleton_id`.
+  Access requires the project's Annotate role and respects neuron edit locks.
   A search with no eligible skeleton returns 409 with
-  `meta.code: "task_link_no_match"`. A conflicting link or target change also
-  returns 409.
+  `meta.code: "annotation_match_no_match"`. An annotation already assigned
+  to a neuron or a target that changed during selection also returns 409.
 
 - `POST /{project_id}/skeletons/{skeleton_id}/delete`:
   Delete a skeleton along with its neuron (like calling /delete on the neuron).

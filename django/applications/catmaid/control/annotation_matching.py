@@ -1,40 +1,39 @@
 # -*- coding: utf-8 -*-
 
-"""Find and atomically assign the closest eligible skeleton to a NeuroGlass task."""
+"""Annotate and reroot the closest eligible skeleton in one transaction."""
 
 from dataclasses import dataclass
 import math
 import re
 import sys
 
-from django.db import connection, transaction
+from django.db import DataError, connection, transaction
 from django.http import HttpRequest, HttpResponseBadRequest, JsonResponse
 from rest_framework.decorators import api_view, parser_classes
 from rest_framework.parsers import JSONParser
 
 from catmaid.control import annotation, skeleton
-from catmaid.control.authentication import PermissionError, requires_user_role, user_domain
+from catmaid.control.authentication import can_edit_class_instance_or_fail, requires_user_role, user_domain
 from catmaid.control.common import get_class_to_id_map, get_relation_to_id_map
 from catmaid.error import ClientError
 from catmaid.models import ClassInstance, ClassInstanceClassInstance, Treenode, UserRole
-from catmaid.task_annotations import TASK_ANNOTATION, UUID_PATTERN
 
 # Leave room for the search bounds and squared 3D distances in double precision.
 MAX_SPATIAL_MAGNITUDE = math.sqrt(sys.float_info.max) / 4
 
 
-class TaskLinkConflict(ClientError):
+class AnnotationMatchConflict(ClientError):
     status_code = 409
 
 
-class TaskLinkNoMatch(TaskLinkConflict):
-    meta = {'code': 'task_link_no_match'}
+class AnnotationMatchNoMatch(AnnotationMatchConflict):
+    meta = {'code': 'annotation_match_no_match'}
 
 
 @dataclass(frozen=True)
-class TaskLink:
+class NearestAnnotation:
     annotation: str
-    study_id: str
+    exclude_annotation_pattern: str | None
     coordinate: tuple[float, float, float]
     radius: float
 
@@ -45,13 +44,24 @@ def _spatial_number(value) -> float:
     return float(value)
 
 
-def _parse_link(data) -> TaskLink:
-    if not isinstance(data, dict) or data.keys() != {'annotation', 'coordinate', 'radius'}:
+def _parse_request(data) -> NearestAnnotation:
+    if (not isinstance(data, dict) or not {'annotation', 'coordinate', 'radius'} <= data.keys()
+            or data.keys() - {'annotation', 'coordinate', 'radius', 'exclude_annotation_pattern'}):
         raise ValueError('Expected an annotation, one coordinate and a radius')
     name = data['annotation']
-    match = re.fullmatch(TASK_ANNOTATION.pattern, name) if isinstance(name, str) else None
-    if match is None:
-        raise ValueError('Expected a NeuroGlass task annotation')
+    if not isinstance(name, str) or not name.strip() or '\x00' in name:
+        raise ValueError('Expected a nonempty annotation name')
+    if re.search(r'\{n(?:\d+)?\}', name):
+        raise ValueError('Annotation counting patterns are not supported')
+    pattern = data.get('exclude_annotation_pattern')
+    if pattern is not None:
+        if not isinstance(pattern, str):
+            raise ValueError('Expected an annotation exclusion pattern')
+        try:
+            with transaction.atomic(), connection.cursor() as cursor:
+                cursor.execute("SELECT '' ~* %s", [pattern])
+        except DataError as error:
+            raise ValueError('Invalid annotation exclusion pattern') from error
     coordinate = data['coordinate']
     if not isinstance(coordinate, list) or len(coordinate) != 3:
         raise ValueError('Expected one [x, y, z] coordinate triplet')
@@ -59,10 +69,10 @@ def _parse_link(data) -> TaskLink:
     radius = _spatial_number(data['radius'])
     if radius <= 0:
         raise ValueError('The radius must be positive')
-    return TaskLink(name, match.group(1), (x, y, z), radius)
+    return NearestAnnotation(name, pattern, (x, y, z), radius)
 
 
-def _nearest_candidate(project_id, coordinate, radius, study_annotations, user, skipped_skeletons):
+def _nearest_candidate(project_id, coordinate, radius, exclude_annotation_pattern, user, skipped_skeletons):
     x, y, z = coordinate
     with connection.cursor() as cursor:
         editable_user_ids = [] if user.is_superuser else list(user_domain(cursor, user.id))
@@ -106,7 +116,7 @@ def _nearest_candidate(project_id, coordinate, radius, study_annotations, user, 
                 JOIN class_instance label ON label.id = link.class_instance_b
                     AND label.project_id = %(project)s AND label.class_id = %(annotation_class)s
                 WHERE link.project_id = %(project)s AND link.relation_id = %(annotated_with)s
-                  AND link.class_instance_a = neuron.id AND label.name ~* %(study_annotations)s
+                  AND link.class_instance_a = neuron.id AND label.name ~* %(exclude_annotation_pattern)s
             )
             AND (%(is_superuser)s OR NOT EXISTS (
                 SELECT 1
@@ -126,7 +136,7 @@ def _nearest_candidate(project_id, coordinate, radius, study_annotations, user, 
             'max_x': x + radius, 'max_y': y + radius, 'max_z': z + radius,
             'model_of': relations['model_of'], 'annotated_with': relations['annotated_with'],
             'neuron_class': classes['neuron'], 'skeleton_class': classes['skeleton'],
-            'annotation_class': classes['annotation'], 'study_annotations': study_annotations,
+            'annotation_class': classes['annotation'], 'exclude_annotation_pattern': exclude_annotation_pattern,
             'is_superuser': user.is_superuser, 'editable_user_ids': editable_user_ids,
             'skipped_skeletons': skipped_skeletons,
         })
@@ -142,15 +152,15 @@ def _target_neuron(project_id: int, skeleton_id: int) -> int:
     targets = list(models.filter(class_instance_a_id=skeleton_id)
             .values_list('class_instance_b_id', flat=True)[:2])
     if len(targets) != 1:
-        raise TaskLinkConflict('The target skeleton must model exactly one neuron')
+        raise AnnotationMatchConflict('The target skeleton must model exactly one neuron')
     if models.filter(class_instance_b_id=targets[0]).exclude(class_instance_a_id=skeleton_id).exists():
-        raise TaskLinkConflict('The target neuron must be modeled by exactly one skeleton')
+        raise AnnotationMatchConflict('The target neuron must be modeled by exactly one skeleton')
     return targets[0]
 
 
-def lock_task_annotation(project_id: int, name: str) -> None:
-    """Serialize writes for a task whose annotation might not exist yet."""
-    key = 'catmaid-task-link:%s:%s' % (project_id, name.lower())
+def lock_annotation(project_id: int, name: str) -> None:
+    """Serialize assignment of an annotation that might not exist yet."""
+    key = 'catmaid-annotation-match:%s:%s' % (project_id, name.lower())
     with connection.cursor() as cursor:
         cursor.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))', [key])
 
@@ -163,59 +173,61 @@ def _neuron_annotation_links(project_id: int):
     )
 
 
-def _assign(project_id: int, user, change: TaskLink) -> int:
-    lock_task_annotation(project_id, change.annotation)
+def _assign(project_id: int, user, change: NearestAnnotation) -> int:
+    lock_annotation(project_id, change.annotation)
     if _neuron_annotation_links(project_id).filter(class_instance_b__name__iexact=change.annotation).exists():
-        raise TaskLinkConflict('The task already has a skeleton')
-    study_annotations = r'^neuroglass:study:%s:task:%s$' % (change.study_id, UUID_PATTERN)
+        raise AnnotationMatchConflict('The annotation already belongs to a skeleton')
     skipped_skeletons = []
     while True:
         candidate = _nearest_candidate(project_id, change.coordinate, change.radius,
-                study_annotations, user, skipped_skeletons)
+                change.exclude_annotation_pattern, user, skipped_skeletons)
         if candidate is None:
-            raise TaskLinkNoMatch('No eligible skeleton within the requested radius')
+            raise AnnotationMatchNoMatch('No eligible skeleton within the requested radius')
         skeleton_id, treenode_id, neuron_id, x, y, z = candidate
         try:
             # Roll back any label and release this candidate's locks if its
             # sampler prevents rerooting before trying a different skeleton.
             with transaction.atomic():
-                return _link_candidate(project_id, user, change, study_annotations,
+                return _link_candidate(project_id, user, change,
                         skeleton_id, treenode_id, neuron_id, (x, y, z))
         except skeleton.RerootSamplerConflict:
             skipped_skeletons.append(skeleton_id)
 
 
-def _link_candidate(project_id, user, change, study_annotations, skeleton_id, treenode_id,
+def _link_candidate(project_id, user, change, skeleton_id, treenode_id,
         neuron_id, candidate_coordinate):
     skeleton._lock_skeletons_for_reroot(project_id, [skeleton_id])
 
     # Lock the neuron before the treenode, as whole-skeleton deletion does.
     # Single-node deletion is serialized by the topology lock above.
     if not ClassInstance.objects.select_for_update().filter(project_id=project_id, id=neuron_id).exists():
-        raise TaskLinkConflict('The target neuron no longer exists')
+        raise AnnotationMatchConflict('The target neuron no longer exists')
     if _target_neuron(project_id, skeleton_id) != neuron_id:
-        raise TaskLinkConflict('The target skeleton changed during assignment')
+        raise AnnotationMatchConflict('The target skeleton changed during assignment')
 
     try:
         locked_coordinate = Treenode.objects.select_for_update().values_list(
                 'location_x', 'location_y', 'location_z').get(
                         project_id=project_id, id=treenode_id, skeleton_id=skeleton_id)
     except Treenode.DoesNotExist:
-        raise TaskLinkConflict('The reroot node is no longer on the target skeleton')
+        raise AnnotationMatchConflict('The reroot node is no longer on the target skeleton')
     # Moving within the radius can also change which candidate is nearest.
     if locked_coordinate != candidate_coordinate:
-        raise TaskLinkConflict('The nearest node moved during assignment. Try starting again.')
+        raise AnnotationMatchConflict('The nearest node moved during annotation. Retry the request.')
 
     links = _neuron_annotation_links(project_id)
     if links.filter(class_instance_b__name__iexact=change.annotation).exists():
-        raise TaskLinkConflict('The task already has a skeleton')
-    if links.filter(class_instance_a_id=neuron_id, class_instance_b__name__iregex=study_annotations).exists():
-        raise TaskLinkConflict('The skeleton already belongs to another task in this study')
+        raise AnnotationMatchConflict('The annotation already belongs to a skeleton')
+    if (change.exclude_annotation_pattern is not None and links.filter(
+            class_instance_a_id=neuron_id,
+            class_instance_b__name__iregex=change.exclude_annotation_pattern).exists()):
+        raise AnnotationMatchConflict('The skeleton carries an excluded annotation')
 
+    can_edit_class_instance_or_fail(user, neuron_id, 'neuron')
     added, _, _ = annotation._annotate_entities(project_id,
             [neuron_id], {change.annotation: {'user_id': user.id}})
     if not any(neuron_id in entities for entities in added.values()):
-        raise TaskLinkConflict('The task annotation could not be added')
+        raise AnnotationMatchConflict('The annotation could not be added')
     skeleton._reroot_skeleton_locked(treenode_id, project_id, skeleton_id)
     return skeleton_id
 
@@ -223,23 +235,19 @@ def _link_candidate(project_id, user, change, study_annotations, skeleton_id, tr
 @api_view(['POST'])
 @parser_classes([JSONParser])
 @requires_user_role(UserRole.Annotate)
-def link_task(request: HttpRequest, project_id=None) -> JsonResponse:
-    """Assign an unlinked NeuroGlass task and reroot the skeleton atomically.
+def annotate_nearest(request: HttpRequest, project_id=None) -> JsonResponse:
+    """Annotate the nearest eligible skeleton and reroot it atomically.
 
-    Send one task annotation, an [x, y, z] coordinate and a radius in project nanometres.
-    CATMAID chooses the closest eligible skeleton and makes its closest node the root.
-    A successful response includes the assigned skeleton ID.
+    Send an annotation, an [x, y, z] coordinate and a positive radius in project
+    nanometres. An optional exclude_annotation_pattern skips neurons carrying
+    matching annotations (case-insensitive PostgreSQL regular expression).
+    The annotation must be unused on neurons in this project.
     """
     project_id = int(project_id)
-    scope = getattr(request, '_neuroglass_task_link_scope', None)
-    if scope is None or scope[0] != project_id:
-        raise PermissionError('Task linking requires authorization for this project from NeuroGlass')
     try:
-        change = _parse_link(request.data)
+        change = _parse_request(request.data)
     except ValueError as error:
         return HttpResponseBadRequest(str(error))
-    if change.study_id != scope[1]:
-        raise PermissionError('The task annotation does not match the signed study')
 
     with transaction.atomic():
         skeleton_id = _assign(project_id, request.user, change)

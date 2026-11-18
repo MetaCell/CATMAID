@@ -32,7 +32,6 @@ from catmaid.history import add_log_entry
 from catmaid.source_fragments import (
     SOURCE_FRAGMENT_ANNOTATION_PREFIX, is_source_fragment_annotation_name,
     reject_reserved_annotation_names)
-from catmaid.task_annotations import TASK_ANNOTATION
 from catmaid.control import tracing
 from catmaid.models import (Project, UserRole, Class, ClassInstance, Review,
         ClassInstanceClassInstance, Relation, Sampler, Treenode,
@@ -1264,8 +1263,7 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     neuron are updated to refer to the new skeleton.
 
     If upstream_annotation_map or downstream_annotation_map are not defined,
-    ordinary annotations are copied to the respective skeleton. NeuroGlass task
-    links stay on the original skeleton, which retains its ID and root.
+    ordinary annotations are copied to the respective skeleton.
     Imported source-fragment identifiers are always copied to both parts,
     independently of the requested distribution of ordinary annotations.
     A confirmed preview may send expected_parent_id to guard the cut edge.
@@ -1331,14 +1329,6 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     downstream_annotation_map = (json.loads(downstream_annotation_map)
             if downstream_annotation_map else current_annotations)
 
-    # Take task links from the locked source, since the preview may be stale.
-    task_annotations = {name: annotator for name, annotator in current_annotations.items()
-            if TASK_ANNOTATION.fullmatch(name)}
-    upstream_annotation_map = {name: annotator for name, annotator in upstream_annotation_map.items()
-            if not TASK_ANNOTATION.fullmatch(name)}
-    upstream_annotation_map.update(task_annotations)
-    downstream_annotation_map = {name: annotator for name, annotator in downstream_annotation_map.items()
-            if not TASK_ANNOTATION.fullmatch(name)}
     source_annotations = _source_fragment_annotations(project_id, [neuron.id], cursor)
     # These annotations record inherited origin, rather than per-node membership.
     # Both split results therefore retain the complete source set.
@@ -1348,7 +1338,7 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
             downstream_annotation_map, source_annotations)
 
     # Either piece can keep the complete set of distributable annotations.
-    distributable_annotations = current_annotations.keys() - task_annotations.keys()
+    distributable_annotations = set(current_annotations)
     if not (distributable_annotations.issubset(upstream_annotation_map)
             or distributable_annotations.issubset(downstream_annotation_map)):
         raise ValueError("Annotation distribution is not valid for splitting. "
@@ -2684,7 +2674,7 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
         cursor = connection.cursor()
 
         # Join also reroots one partner. Take the same locks as reroot and
-        # task links before either neuron or treenode row locks.
+        # annotation matching before either neuron or treenode row locks.
         _lock_skeletons_for_reroot(project_id, [from_skid, to_skid])
 
         # Acquire ownership locks before reading metadata that can change while

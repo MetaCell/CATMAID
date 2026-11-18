@@ -2,9 +2,6 @@
 
   "use strict";
 
-  const uuidPattern = '[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}';
-  const taskAnnotation = new RegExp('^neuroglass:study:' + uuidPattern + ':task:' + uuidPattern + '$', 'i');
-
   var SplitMergeDialog = function(options) {
     var model1 = options.model1;
     var model2 = options.model2;
@@ -207,11 +204,8 @@
                 var checked = pane.checked;
                 var disabled = false;
                 if (pane.upstream !== undefined) {
-                  // Task links and source-fragment annotations have fixed placement in a split.
-                  if (taskAnnotation.test(a_info.name)) {
-                    checked = pane.upstream;
-                    disabled = true;
-                  } else if (a_info.name.startsWith('source-fragment:')) {
+                  // Source-fragment annotations are inherited by both pieces.
+                  if (a_info.name.startsWith('source-fragment:')) {
                     checked = true;
                     disabled = true;
                   }
@@ -609,7 +603,7 @@
 
   /**
    * One split piece must keep all editable annotations. The server assigns
-   * the task link and source-fragment annotations independently.
+   * source-fragment annotations independently.
    */
   SplitMergeDialog.prototype.check_split_annotations = function() {
     // Define a test function every checkbox should be tested against
