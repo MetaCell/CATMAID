@@ -141,6 +141,44 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
             self.assertLessEqual({'ordinary annotation', provenance},
                     annotation.annotations_for_skeleton(self.test_project_id, skeleton_id).keys())
 
+    def test_split_moves_ordinary_annotations_off_original_when_its_map_is_empty(self):
+        self.link('ordinary label', SKELETON_1_NEURON)
+        label = ClassInstance.objects.get(project_id=self.test_project_id, name='ordinary label')
+        self.link('meta label', label.id)
+
+        result = self.result(self.client.post('/%d/skeleton/split' % self.test_project_id, {
+            'treenode_id': 11,
+            'upstream_annotation_map': '{}',
+            'downstream_annotation_map': json.dumps({'ordinary label': self.test_user_id}),
+        }))
+
+        self.assertEqual({}, annotation.annotations_for_skeleton(self.test_project_id, 1))
+        self.assertEqual({'ordinary label': self.test_user_id},
+                annotation.annotations_for_skeleton(self.test_project_id, result['new_skeleton_id']))
+        self.assertTrue(ClassInstance.objects.filter(pk=label.id).exists())
+        self.assertEqual({label.id}, self.neurons_with('meta label'))
+
+    def test_split_refuses_a_preview_whose_parent_changed_during_start(self):
+        self.assertEqual(7, Treenode.objects.get(pk=11).parent_id)
+        self.assertEqual(11, Treenode.objects.get(pk=13).parent_id)
+        self.assertStatus(self.post(self.change(self.task_a, 13)))
+        self.assertEqual(13, Treenode.objects.get(pk=11).parent_id)
+        original_nodes = set(Treenode.objects.filter(skeleton_id=1).values_list('id', flat=True))
+
+        split = self.client.post('/%d/skeleton/split' % self.test_project_id, {
+            'treenode_id': 11,
+            'expected_parent_id': 7,
+            'upstream_annotation_map': '{}',
+            'downstream_annotation_map': '{}',
+        })
+
+        self.assertEqual(400, split.status_code, split.content)
+        self.assertIn('The split edge changed', split.json()['error'])
+        self.assertEqual(original_nodes, set(Treenode.objects.filter(skeleton_id=1)
+                .values_list('id', flat=True)))
+        self.assertEqual(13, self.root(1))
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
+
     def test_confirmed_split_does_not_duplicate_the_task_link(self):
         self.link(self.task_a, SKELETON_1_NEURON)
         self.link('shared label', SKELETON_1_NEURON)
@@ -148,6 +186,7 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
 
         result = self.result(self.client.post('/%d/skeleton/split' % self.test_project_id, {
             'treenode_id': 11,
+            'expected_parent_id': 7,
             'upstream_annotation_map': selected,
             'downstream_annotation_map': selected,
         }))
@@ -409,6 +448,32 @@ class TaskLinksConcurrencyTests(TaskLinksFixtures, CatmaidApiTransactionTestCase
                 'The linked skeleton must retain its nodes')
         self.assertEqual(11, self.root(1))
         self.assertIn(split.status_code, (400, 409), split.content)
+
+    def test_task_link_refuses_candidate_moved_outside_the_radius_before_lock(self):
+        payload = self.change(self.task_a, 11)
+        nearest_candidate = task_links._nearest_candidate
+
+        def move_node(node_id):
+            try:
+                return Treenode.objects.filter(pk=node_id).update(
+                        location_x=payload['coordinate'][0] + 100)
+            finally:
+                connections['default'].close()
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            def choose_then_move(*args):
+                candidate = nearest_candidate(*args)
+                self.assertEqual((1, 11), candidate)
+                self.assertEqual(1, pool.submit(move_node, 11).result(timeout=5))
+                return candidate
+
+            with patch.object(task_links, '_nearest_candidate', side_effect=choose_then_move):
+                response = self.post(payload)
+
+        self.assertEqual(409, response.status_code, response.content)
+        self.assertIn('moved during assignment', response.json()['error'])
+        self.assertEqual(set(), self.neurons_with(self.task_a))
+        self.assertEqual(7, self.root(1))
 
     def test_task_link_reroot_preserves_concurrent_insertion_on_ancestor_edge(self):
         native = Client()

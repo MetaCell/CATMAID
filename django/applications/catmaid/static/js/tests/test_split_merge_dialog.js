@@ -26,6 +26,7 @@ QUnit.test('Split preview matches the submitted annotations for either pane orde
       dialog.in_merge_mode = false;
       const skeleton = {
         createArbor: () => ({
+          edges: {4: 2},
           cableLength: () => 100,
           countNodes: () => 6,
           subArbor: () => ({cableLength: () => downstreamLength, countNodes: () => 3}),
@@ -78,7 +79,8 @@ QUnit.test('Split preview matches the submitted annotations for either pane orde
       assert.deepEqual(submit.firstCall.args, [
         {[task]: 3, [source]: 3},
         {[source]: 3, [ordinary]: 3},
-      ], 'Selections are sent in original-then-new order');
+        2,
+      ], 'Submit the selections and the parent shown in the preview');
     }
   } finally {
     sandbox.restore();

@@ -1268,6 +1268,7 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     links stay on the original skeleton, which retains its ID and root.
     Imported source-fragment identifiers are always copied to both parts,
     independently of the requested distribution of ordinary annotations.
+    A confirmed preview may send expected_parent_id to guard the cut edge.
     """
     treenode_id = int(request.POST['treenode_id'])
     project_id = int(project_id)
@@ -1277,6 +1278,10 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     treenode = Treenode.objects.select_related('parent').get(id=treenode_id, project_id=project_id)
     if treenode.skeleton_id != skeleton_id:
         raise ValueError('The treenode changed skeletons during split, please retry')
+
+    expected_parent_id = request.POST.get('expected_parent_id')
+    if expected_parent_id is not None and treenode.parent_id != int(expected_parent_id):
+        raise ValueError('The split edge changed. Open the Split preview again.')
 
     upstream_annotation_map = request.POST.get('upstream_annotation_map')
     downstream_annotation_map = request.POST.get('downstream_annotation_map')
@@ -1315,6 +1320,9 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     locked_nodes = cursor.fetchall()
     _check_fragment_source_nodes(project_id, {treenode_id: skeleton_id},
             {skeleton_id: neuron.id}, cursor)
+    locked_parent = next(parent for node, parent in locked_nodes if node == treenode_id)
+    if locked_parent != treenode.parent_id:
+        raise ValueError('The split edge changed. Open the Split preview again.')
 
     # Read metadata after serializing structural edits of the source neuron.
     current_annotations = annotations_for_skeleton(project_id, skeleton_id)
@@ -1411,14 +1419,12 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     # setting new root treenode's parent to null
     Treenode.objects.filter(id=treenode_id).update(parent=None, editor=request.user)
 
-    # Update annotations of existing neuron to have only over set
-    if upstream_annotation_map:
-        _update_neuron_annotations(project_id, neuron.id,
-                upstream_annotation_map, allow_reserved=True)
-
-    # Update annotations of under skeleton
+    # Link the new piece first so moving the last use of an annotation
+    # preserves its identity and meta-annotations.
     _annotate_entities(project_id, [new_neuron.id], downstream_annotation_map,
             allow_reserved=True)
+    _update_neuron_annotations(project_id, neuron.id,
+            upstream_annotation_map, allow_reserved=True)
 
     # If samplers reference this skeleton, make sure they are updated as well
     sampler_info = prune_samplers(skeleton_id, graph, treenode_parent, treenode)

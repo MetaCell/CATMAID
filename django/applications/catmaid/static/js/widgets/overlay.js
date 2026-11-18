@@ -2219,7 +2219,7 @@ var SkeletonAnnotations = {};
       var model = new CATMAID.SkeletonModel(node.skeleton_id, name,
           new THREE.Color(1, 1, 0), self.api);
 
-      let split = function(splitNode, upstreamAnnotationSet, downstreamAnnotationSet) {
+      let split = function(splitNode, upstreamAnnotationSet, downstreamAnnotationSet, expectedParentId) {
         // Call backend
         return self.submit.promise()
           .then(function() {
@@ -2227,7 +2227,7 @@ var SkeletonAnnotations = {};
           }).then(function(splitNodeId) {
             var command = new CATMAID.SplitSkeletonCommand(self.state,
                 self.projectId, splitNodeId, upstreamAnnotationSet,
-                downstreamAnnotationSet, self.api);
+                downstreamAnnotationSet, self.api, expectedParentId);
             return CATMAID.commands.execute(command)
               .then(function(result) {
                 return self.updateNodes(function () { self.selectNode(splitNodeId); });
@@ -2253,8 +2253,8 @@ var SkeletonAnnotations = {};
           var dialog = new CATMAID.SplitMergeDialog({
             model1: model,
             splitNodeId: nodeId,
-            split: function(upstreamAnnotations, downstreamAnnotations) {
-              return split(node, upstreamAnnotations, downstreamAnnotations)
+            split: function(upstreamAnnotations, downstreamAnnotations, expectedParentId) {
+              return split(node, upstreamAnnotations, downstreamAnnotations, expectedParentId)
                 .catch(CATMAID.handleError)
                 .finally(() => resolve());
             },

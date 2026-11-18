@@ -95,7 +95,7 @@
     } else {
       const upstreamInTopPane = !this.upstream_is_small;
       this.split(this.get_annotation_set(upstreamInTopPane),
-          this.get_annotation_set(!upstreamInTopPane));
+          this.get_annotation_set(!upstreamInTopPane), this.splitParentId);
     }
   };
 
@@ -364,6 +364,7 @@
           positions[this.splitNodeId] = new THREE.Vector3(x, y, z);
         }
 
+        this.splitParentId = arbor.edges[this.splitNodeId];
         var newArbor = arbor.subArbor(this.splitNodeId),
             length1 = newArbor.cableLength(positions),
             length2 = arbor.cableLength(positions) - length1,
@@ -638,6 +639,10 @@
   };
 
   SplitMergeDialog.prototype.confirm = function() {
+    if (!this.in_merge_mode && this.splitParentId == null) {
+      CATMAID.warn('The split edge is unavailable. Open the Split preview again.');
+      return false;
+    }
     var confirmed = true;
     if (self.in_merge_mode && !self.check_merge_annotations()) {
       CATMAID.warn("The selected annotation configuration isn't valid. " +

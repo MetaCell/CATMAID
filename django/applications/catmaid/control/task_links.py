@@ -160,10 +160,14 @@ def _assign(project_id: int, user, change: TaskLink) -> tuple[int, bool]:
     skeleton._lock_skeletons_for_reroot(project_id, [skeleton_id])
 
     # Match the task deletion guard's lock order. Check the final association under both locks.
-    if not Treenode.objects.select_for_update().filter(
-            project_id=project_id, id=treenode_id, skeleton_id=skeleton_id,
-            ).exists():
+    try:
+        locked_coordinate = Treenode.objects.select_for_update().values_list(
+                'location_x', 'location_y', 'location_z').get(
+                        project_id=project_id, id=treenode_id, skeleton_id=skeleton_id)
+    except Treenode.DoesNotExist:
         raise TaskLinkConflict('The reroot node is no longer on the target skeleton')
+    if math.dist(locked_coordinate, change.coordinate) > change.radius:
+        raise TaskLinkConflict('The nearest node moved during assignment. Try starting again.')
 
     neuron_id = _target_neuron(project_id, skeleton_id)
     if not ClassInstance.objects.select_for_update().filter(project_id=project_id, id=neuron_id).exists():

@@ -74,11 +74,12 @@
      * @param {object}  upstream_annot_map Map of annotation names vs annotator
      *                                     IDs for the downstream split part.
      * @param {API}      api       (optional) The CATMAID API to talk to.
+     * @param {integer} expectedParentId (optional) Parent shown in the split preview.
      *
      * @returns A new promise that is resolved once the skeleton is split.
      */
     split: function(state, projectId, treenodeId,
-        upstream_annot_map, downstream_annot_map, api = undefined) {
+        upstream_annot_map, downstream_annot_map, api = undefined, expectedParentId = undefined) {
 
       CATMAID.requirePermission(projectId, 'can_annotate',
           'You don\'t have have permission to split skeletons');
@@ -87,6 +88,7 @@
         treenode_id: treenodeId,
         upstream_annotation_map: JSON.stringify(upstream_annot_map),
         downstream_annotation_map: JSON.stringify(downstream_annot_map),
+        expected_parent_id: expectedParentId,
         state: state.makeNeighborhoodState(treenodeId)
       };
 
@@ -778,12 +780,13 @@
    * @param {API}     api         (optional) The CATMAID API to talk to.
    */
   CATMAID.SplitSkeletonCommand = CATMAID.makeCommand(
-      function(state, projectId, treenodeId, upstream_annot_map, downstream_annot_map, api = undefined) {
+      function(state, projectId, treenodeId, upstream_annot_map, downstream_annot_map,
+          api = undefined, expectedParentId = undefined) {
 
     var exec = function(done, command, map) {
       var split = CATMAID.Skeletons.split(state,
           project.id, treenodeId, upstream_annot_map, downstream_annot_map,
-          api);
+          api, expectedParentId);
       return split.then(function(result) {
         done();
         return result;
