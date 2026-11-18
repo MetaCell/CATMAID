@@ -72,7 +72,7 @@ def _parse_request(data) -> NearestAnnotation:
     return NearestAnnotation(name, pattern, (x, y, z), radius)
 
 
-def _nearest_candidate(project_id, coordinate, radius, exclude_annotation_pattern, user, skipped_skeletons):
+def _nearest_candidate(project_id, coordinate, radius, exclude_annotation_pattern, user):
     x, y, z = coordinate
     with connection.cursor() as cursor:
         editable_user_ids = [] if user.is_superuser else list(user_domain(cursor, user.id))
@@ -103,8 +103,7 @@ def _nearest_candidate(project_id, coordinate, radius, exclude_annotation_patter
                 AND model.project_id = %(project)s AND model.relation_id = %(model_of)s
             JOIN class_instance neuron ON neuron.id = model.class_instance_b
                 AND neuron.project_id = %(project)s AND neuron.class_id = %(neuron_class)s
-            WHERE NOT (sk.id = ANY(%(skipped_skeletons)s))
-            AND NOT EXISTS (
+            WHERE NOT EXISTS (
                 SELECT 1 FROM class_instance_class_instance other_model
                 WHERE other_model.project_id = %(project)s AND other_model.relation_id = %(model_of)s
                   AND other_model.id <> model.id
@@ -138,7 +137,6 @@ def _nearest_candidate(project_id, coordinate, radius, exclude_annotation_patter
             'neuron_class': classes['neuron'], 'skeleton_class': classes['skeleton'],
             'annotation_class': classes['annotation'], 'exclude_annotation_pattern': exclude_annotation_pattern,
             'is_superuser': user.is_superuser, 'editable_user_ids': editable_user_ids,
-            'skipped_skeletons': skipped_skeletons,
         })
         return cursor.fetchone()
 
@@ -177,22 +175,14 @@ def _assign(project_id: int, user, change: NearestAnnotation) -> tuple[int, int]
     lock_annotation(project_id, change.annotation)
     if _neuron_annotation_links(project_id).filter(class_instance_b__name__iexact=change.annotation).exists():
         raise AnnotationMatchConflict('The annotation already belongs to a skeleton')
-    skipped_skeletons = []
-    while True:
-        candidate = _nearest_candidate(project_id, change.coordinate, change.radius,
-                change.exclude_annotation_pattern, user, skipped_skeletons)
-        if candidate is None:
-            raise AnnotationMatchNoMatch('No eligible skeleton within the requested radius')
-        skeleton_id, treenode_id, neuron_id, x, y, z = candidate
-        try:
-            # Roll back any label and release this candidate's locks if its
-            # sampler prevents rerooting before trying a different skeleton.
-            with transaction.atomic():
-                _link_candidate(project_id, user, change,
-                        skeleton_id, treenode_id, neuron_id, (x, y, z))
-                return skeleton_id, treenode_id
-        except skeleton.RerootSamplerConflict:
-            skipped_skeletons.append(skeleton_id)
+    candidate = _nearest_candidate(project_id, change.coordinate, change.radius,
+            change.exclude_annotation_pattern, user)
+    if candidate is None:
+        raise AnnotationMatchNoMatch('No eligible skeleton within the requested radius')
+    skeleton_id, treenode_id, neuron_id, x, y, z = candidate
+    _link_candidate(project_id, user, change,
+            skeleton_id, treenode_id, neuron_id, (x, y, z))
+    return skeleton_id, treenode_id
 
 
 def _link_candidate(project_id, user, change, skeleton_id, treenode_id,

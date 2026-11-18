@@ -204,7 +204,7 @@ class AnnotationMatchingApiTests(AnnotationMatchingFixtures, CatmaidApiTestCase)
         self.assertEqual({'skeleton_id': 1, 'root_id': 11}, result)
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
 
-    def test_skips_a_candidate_whose_new_root_would_break_a_sampler(self):
+    def test_native_sampler_rejection_rolls_back_without_trying_another_skeleton(self):
         self.move_node_near(405, 13, dx=40)
         sampler = Sampler.objects.create(
                 project_id=self.test_project_id, user_id=self.test_user_id, skeleton_id=1,
@@ -216,12 +216,13 @@ class AnnotationMatchingApiTests(AnnotationMatchingFixtures, CatmaidApiTestCase)
                 sampler=sampler, start_node_id=11,
                 domain_type=SamplerDomainType.objects.create(name='Test domain'))
 
-        result = self.result(self.post(self.change(self.annotation_a, 13, radius=100)))
+        response = self.post(self.change(self.annotation_a, 13, radius=100))
 
-        self.assertEqual({'skeleton_id': 373, 'root_id': 405}, result)
-        self.assertEqual({SKELETON_373_NEURON}, self.neurons_with(self.annotation_a))
+        self.assertEqual(400, response.status_code, response.content)
+        self.assertIn('is used in a sampler', response.json()['error'])
+        self.assertEqual(set(), self.neurons_with(self.annotation_a))
         self.assertEqual(7, self.root(1))
-        self.assertEqual(405, self.root(373))
+        self.assertEqual(377, self.root(373))
 
     def test_breaks_distance_ties_by_skeleton_then_node_id(self):
         self.move_node_near(405, 11)
