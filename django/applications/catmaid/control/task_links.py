@@ -35,7 +35,6 @@ class TaskLink:
     study_id: str
     coordinate: tuple[float, float, float]
     radius: float
-    cutoff_ms: int
 
 
 def _spatial_number(value) -> float:
@@ -44,7 +43,7 @@ def _spatial_number(value) -> float:
     return float(value)
 
 
-def _parse_link(data, cutoff_ms: int) -> TaskLink:
+def _parse_link(data) -> TaskLink:
     if not isinstance(data, dict) or data.keys() != {'annotation', 'coordinate', 'radius'}:
         raise ValueError('Expected an annotation, one coordinate and a radius')
     name = data['annotation']
@@ -58,7 +57,7 @@ def _parse_link(data, cutoff_ms: int) -> TaskLink:
     radius = _spatial_number(data['radius'])
     if radius <= 0:
         raise ValueError('The radius must be positive')
-    return TaskLink(name, match.group(1), (x, y, z), radius, cutoff_ms)
+    return TaskLink(name, match.group(1), (x, y, z), radius)
 
 
 def _nearest_candidate(project_id, coordinate, radius, study_annotations, user, skipped_skeletons):
@@ -147,18 +146,6 @@ def _target_neuron(project_id: int, skeleton_id: int) -> int:
     return targets[0]
 
 
-def task_link_clock_ms() -> int:
-    """Read the clock shared by all workers of this CATMAID database."""
-    with connection.cursor() as cursor:
-        cursor.execute('SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint')
-        return cursor.fetchone()[0]
-
-
-def _check_task_link_deadline(cutoff_ms: int) -> None:
-    if task_link_clock_ms() >= cutoff_ms:
-        raise TaskLinkConflict('The task link request has expired. Try starting again.')
-
-
 def lock_task_annotation(project_id: int, name: str) -> None:
     """Serialize writes for a task whose annotation might not exist yet."""
     key = 'catmaid-task-link:%s:%s' % (project_id, name.lower())
@@ -176,8 +163,6 @@ def _neuron_annotation_links(project_id: int):
 
 def _assign(project_id: int, user, change: TaskLink) -> tuple[int, bool]:
     lock_task_annotation(project_id, change.annotation)
-    # A request waiting for the task lock can expire before it is admitted.
-    _check_task_link_deadline(change.cutoff_ms)
     if _neuron_annotation_links(project_id).filter(class_instance_b__name__iexact=change.annotation).exists():
         raise TaskLinkConflict('The task already has a skeleton')
     study_annotations = r'^neuroglass:study:%s:task:%s$' % (change.study_id, UUID_PATTERN)
@@ -185,7 +170,6 @@ def _assign(project_id: int, user, change: TaskLink) -> tuple[int, bool]:
     while True:
         candidate = _nearest_candidate(project_id, change.coordinate, change.radius,
                 study_annotations, user, skipped_skeletons)
-        _check_task_link_deadline(change.cutoff_ms)
         if candidate is None:
             raise TaskLinkNoMatch('No eligible skeleton within the requested radius')
         skeleton_id, treenode_id, x, y, z = candidate
@@ -196,7 +180,6 @@ def _assign(project_id: int, user, change: TaskLink) -> tuple[int, bool]:
                 return _link_candidate(project_id, user, change, study_annotations,
                         skeleton_id, treenode_id, (x, y, z))
         except skeleton.RerootSamplerConflict:
-            _check_task_link_deadline(change.cutoff_ms)
             skipped_skeletons.append(skeleton_id)
 
 
@@ -229,7 +212,6 @@ def _link_candidate(project_id, user, change, study_annotations, skeleton_id, tr
     if links.filter(class_instance_a_id=neuron_id, class_instance_b__name__iregex=study_annotations).exists():
         raise TaskLinkConflict('The skeleton already belongs to another task in this study')
 
-    _check_task_link_deadline(change.cutoff_ms)
     added, _, _ = annotation._annotate_entities(project_id,
             [neuron_id], {change.annotation: {'user_id': user.id}})
     if not any(neuron_id in entities for entities in added.values()):
@@ -248,18 +230,11 @@ def link_task(request: HttpRequest, project_id=None) -> JsonResponse:
     """
     if getattr(request, '_neuroglass_task_link_authorized', False) is not True:
         raise PermissionError('Task linking requires authorization from NeuroGlass')
-    cutoff_ms = getattr(request, '_neuroglass_task_link_cutoff_ms', None)
-    if type(cutoff_ms) is not int or not 0 < cutoff_ms < 2**63:
-        raise PermissionError('Task linking requires a signed write cutoff')
     try:
-        change = _parse_link(request.data, cutoff_ms)
+        change = _parse_link(request.data)
     except ValueError as error:
         return HttpResponseBadRequest(str(error))
 
     with transaction.atomic():
         skeleton_id, rerooted = _assign(int(project_id), request.user, change)
-        response = JsonResponse({'skeleton_id': skeleton_id, 'rerooted': rerooted})
-        # Rerooting can exceed the deadline. Raise before leaving the transaction
-        # so the annotation and topology changes are rolled back together.
-        _check_task_link_deadline(change.cutoff_ms)
-    return response
+    return JsonResponse({'skeleton_id': skeleton_id, 'rerooted': rerooted})

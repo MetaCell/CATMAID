@@ -4,7 +4,7 @@ import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
-from time import monotonic, sleep, time
+from time import monotonic, sleep
 from unittest.mock import patch
 
 from django.db import connection, connections
@@ -29,13 +29,9 @@ def task_annotation(study_id):
 
 
 class TrustedTaskLinkHandler(ClientHandler):
-    cutoff_ms = None
-
     def get_response(self, request):
         # Stand in for the installed overlay's server-side grant.
         request._neuroglass_task_link_authorized = True
-        request._neuroglass_task_link_cutoff_ms = (
-                self.cutoff_ms if self.cutoff_ms is not None else int(time() * 1000) + 60_000)
         return super().get_response(request)
 
 
@@ -97,36 +93,6 @@ class TaskLinksApiTests(TaskLinksFixtures, CatmaidApiTestCase):
         native = Client()
         native.cookies.update(self.client.cookies)
         self.assertEqual(403, self.post(self.change(self.task_a, 11), client=native).status_code)
-        self.assertEqual(set(), self.neurons_with(self.task_a))
-        self.assertEqual(7, self.root(1))
-
-    def test_expired_start_cannot_link_or_reroot(self):
-        self.client.handler.cutoff_ms = 1
-
-        response = self.post(self.change(self.task_a, 11))
-
-        self.assertEqual(409, response.status_code, response.content)
-        self.assertEqual(set(), self.neurons_with(self.task_a))
-        self.assertEqual(7, self.root(1))
-
-    def test_start_expiring_during_assignment_rolls_back_link_and_reroot(self):
-        cutoff_ms = 5000
-        self.client.handler.cutoff_ms = cutoff_ms
-        link_candidate = task_links._link_candidate
-
-        def expire_after_linking(*args):
-            result = link_candidate(*args)
-            self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.task_a))
-            self.assertIsNone(Treenode.objects.get(pk=11).parent_id)
-            clock.return_value = cutoff_ms
-            return result
-
-        with patch.object(task_links, 'task_link_clock_ms', return_value=cutoff_ms - 1) as clock, \
-                patch.object(task_links, '_link_candidate', side_effect=expire_after_linking):
-            response = self.post(self.change(self.task_a, 11))
-
-        self.assertEqual(409, response.status_code, response.content)
-        self.assertIn('has expired', response.json()['error'])
         self.assertEqual(set(), self.neurons_with(self.task_a))
         self.assertEqual(7, self.root(1))
 
