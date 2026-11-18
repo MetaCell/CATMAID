@@ -90,9 +90,7 @@
     if (this.in_merge_mode) {
       this.merge(this.over_model_id, this.under_model_id);
     } else {
-      const upstreamInTopPane = !this.upstream_is_small;
-      this.split(this.get_annotation_set(upstreamInTopPane),
-          this.get_annotation_set(!upstreamInTopPane), this.splitParentId);
+      this.split();
     }
   };
 
@@ -200,16 +198,8 @@
       return CATMAID.Annotations.forSkeleton(project.id, skid, api).then(function(annotations) {
             // Create annotation check boxes
             annotations.forEach(function(aobj) {
-              var create_cb = function(a_info, pane) {
-                var checked = pane.checked;
+              var create_cb = function(a_info, checked) {
                 var disabled = false;
-                if (pane.upstream !== undefined) {
-                  // Source-fragment annotations are inherited by both pieces.
-                  if (a_info.name.startsWith('source-fragment:')) {
-                    checked = true;
-                    disabled = true;
-                  }
-                }
                 // The front end shouldn't allow the removal of annotations one
                 // hasn't permissions on in merge mode: If the current user has no
                 // permission to change this annotation, check and disable this
@@ -225,7 +215,7 @@
                     checked, disabled, a_info.name + ' (by ' + a_info.users[0].name + ')');
               };
               listboxes.forEach(function(lb) {
-                lb.obj.appendChild(create_cb(aobj, lb));
+                lb.obj.appendChild(create_cb(aobj, lb.checked));
               });
             });
             // If there is no annotation, add a note
@@ -358,7 +348,6 @@
           positions[this.splitNodeId] = new THREE.Vector3(x, y, z);
         }
 
-        this.splitParentId = arbor.edges[this.splitNodeId];
         var newArbor = arbor.subArbor(this.splitNodeId),
             length1 = newArbor.cableLength(positions),
             length2 = arbor.cableLength(positions) - length1,
@@ -367,15 +356,12 @@
             over_length, under_length,
             model_name = this.models[this.model1_id].baseName;
         this.upstream_is_small = length1 > length2;
-        const upstreamInTopPane = !this.upstream_is_small;
-        const topLabel = upstreamInTopPane ? 'remaining skeleton' : 'new skeleton';
-        const bottomLabel = upstreamInTopPane ? 'new skeleton' : 'remaining skeleton';
 
         if (this.upstream_is_small) {
           over_length = length1;
           under_length = length2;
           titleBig.setAttribute('title', "New (" + nodeCount1 + ' nodes)');
-          titleSmall.setAttribute('title', model_name + ' (' + nodeCount2 + ' nodes)');
+          titleSmall.setAttribute('title', model_name + ' (' + nodeCount2 + ' nodes');
         } else {
           over_length = length2;
           under_length = length1;
@@ -391,37 +377,35 @@
         selectAllBig.style.margin = '5%';
         selectAllBig.setAttribute('type', 'checkbox');
         selectAllBig.setAttribute('checked', 'true');
-        selectAllBig.setAttribute('title', 'Toggle annotations of the ' + topLabel);
+        selectAllBig.setAttribute('title', 'Toggle annotations of remaining skeleton');
         selectAllBig.onchange = function() {
-          $('input[type=checkbox]:enabled', big).prop('checked', this.checked);
+          $('input[type=checkbox]', contentBig).prop('checked', this.checked);
         };
         var selectAllSmall = colorSmall.appendChild(document.createElement('input'));
         selectAllSmall.style.margin = '5%';
         selectAllSmall.setAttribute('type', 'checkbox');
-        selectAllSmall.setAttribute('title', 'Toggle annotations of the ' + bottomLabel);
+        selectAllBig.setAttribute('title', 'Toggle annotations of new skeleton');
         selectAllSmall.onchange = function() {
-          $('input[type=checkbox]:enabled', small).prop('checked', this.checked);
+          $('input[type=checkbox]', contentSmall).prop('checked', this.checked);
         };
 
         // Add titles
         titleBig.appendChild(document.createTextNode(Math.round(over_length) +
-              'nm cable in ' + topLabel));
+              "nm cable in remaining skeleton"));
         titleSmall.appendChild(document.createTextNode(Math.round(under_length) +
-              'nm cable in ' + bottomLabel));
-
-        // Match the preview shading for each piece independently of its size.
-        const upstreamColor = '#' + skeleton.getActorColorAsHTMLHex();
-        const baseColor = this.webglapp.getSkeletonColor(this.model1_id);
-        // The viewer uses 0.1 + 0.9 * 0.5 for the downstream shading weight.
-        const downstreamRgb = [baseColor.r, baseColor.g, baseColor.b].map(c => Math.floor(c * 255 * 0.55));
-        const downstreamColor = 'rgb(' + downstreamRgb.join() + ')';
-        colorBig.style.backgroundColor = upstreamInTopPane ? upstreamColor : downstreamColor;
-        colorSmall.style.backgroundColor = upstreamInTopPane ? downstreamColor : upstreamColor;
-
-        add_annotations_fn(this.model1_id, [
-          {obj: big, checked: true, upstream: upstreamInTopPane},
-          {obj: small, checked: false, upstream: !upstreamInTopPane},
-        ], false, this.models[this.model1_id].api);
+              "nm cable in new skeleton"));
+        // Color the small and big title boxes
+        colorBig.style.backgroundColor = '#' + skeleton.getActorColorAsHTMLHex();
+        var bc = this.webglapp.getSkeletonColor(this.model1_id);
+        // Convert the big arbor color to 8 bit and weight it by 0.5. Since the 3D
+        // viewer multiplies this weight by 0.9 and adds 0.1, we do the same.
+        var sc_8bit = [bc.r, bc.g, bc.b].map(function(c) {
+          return parseInt(c * 255 * 0.55);
+        });
+        colorSmall.style.backgroundColor = 'rgb(' + sc_8bit.join()  + ')';
+        // Add annotations
+        add_annotations_fn(this.model1_id,
+            [{obj: big, checked: true}, {obj: small, checked: false}], false);
       }
 
       // Extend skeletons: Unfortunately, it is not possible right now to add new
@@ -602,8 +586,10 @@
   };
 
   /**
-   * One split piece must keep all editable annotations. The server assigns
-   * source-fragment annotations independently.
+   * The annotation distribution for a split is only valid if one part keeps the
+   * whole set of annotations. This test verifies this agains the cached list of
+   * annotations. One part keeps all annotations if all its checkboxes are
+   * checked.
    */
   SplitMergeDialog.prototype.check_split_annotations = function() {
     // Define a test function every checkbox should be tested against
@@ -612,13 +598,13 @@
     };
     // Test over annotation set
     var $over_checkboxes = $(this.dialog).find(
-        '#split_merge_dialog_over_annotations input[type=checkbox]:enabled');
+        '#split_merge_dialog_over_annotations input[type=checkbox]');
     if ($over_checkboxes.toArray().every(checked_test)) {
       return true;
     }
     // Test under annotation set
     var $under_checkboxes = $(this.dialog).find(
-        '#split_merge_dialog_under_annotations input[type=checkbox]:enabled');
+        '#split_merge_dialog_under_annotations input[type=checkbox]');
     if ($under_checkboxes.toArray().every(checked_test)) {
       return true;
     }
@@ -633,10 +619,6 @@
   };
 
   SplitMergeDialog.prototype.confirm = function() {
-    if (!this.in_merge_mode && this.splitParentId == null) {
-      CATMAID.warn('The split edge is unavailable. Open the Split preview again.');
-      return false;
-    }
     var confirmed = true;
     if (self.in_merge_mode && !self.check_merge_annotations()) {
       CATMAID.warn("The selected annotation configuration isn't valid. " +

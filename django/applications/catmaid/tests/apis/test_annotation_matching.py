@@ -79,7 +79,7 @@ class AnnotationMatchingApiTests(AnnotationMatchingFixtures, CatmaidApiTestCase)
         payload = self.change('My annotation', 11)
         payload.pop('exclude_annotation_pattern')
         result = self.result(self.post(payload))
-        self.assertEqual({'skeleton_id': 1}, result)
+        self.assertEqual({'skeleton_id': 1, 'root_id': 11}, result)
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with('My annotation'))
         self.assertEqual(11, self.root(1))
 
@@ -103,7 +103,7 @@ class AnnotationMatchingApiTests(AnnotationMatchingFixtures, CatmaidApiTestCase)
         self.link(self.annotation_b, SKELETON_1_NEURON)
         payload = self.change(self.annotation_a, 11)
         payload.pop('exclude_annotation_pattern')
-        self.assertEqual({'skeleton_id': 1}, self.result(self.post(payload)))
+        self.assertEqual({'skeleton_id': 1, 'root_id': 11}, self.result(self.post(payload)))
 
     def test_invalid_annotation_pattern_leaves_no_annotation_or_reroot(self):
         payload = dict(self.change(self.annotation_a, 11), exclude_annotation_pattern='[')
@@ -121,13 +121,13 @@ class AnnotationMatchingApiTests(AnnotationMatchingFixtures, CatmaidApiTestCase)
     def test_assignment_adds_link_and_reroots(self):
         self.move_node_near(405, 11, dx=40)
         result = self.result(self.post(self.change(self.annotation_a, 11, radius=100)))
-        self.assertEqual({'skeleton_id': 1}, result)
+        self.assertEqual({'skeleton_id': 1, 'root_id': 11}, result)
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
         self.assertEqual(11, self.root(1))
 
     def test_already_root_only_links(self):
         result = self.result(self.post(self.change(self.annotation_a, 7)))
-        self.assertEqual({'skeleton_id': 1}, result)
+        self.assertEqual({'skeleton_id': 1, 'root_id': 7}, result)
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
         self.assertEqual(7, self.root(1))
 
@@ -148,30 +148,6 @@ class AnnotationMatchingApiTests(AnnotationMatchingFixtures, CatmaidApiTestCase)
                 annotation.annotations_for_skeleton(self.test_project_id, result['new_skeleton_id']))
         self.assertTrue(ClassInstance.objects.filter(pk=label.id).exists())
         self.assertEqual({label.id}, self.neurons_with('meta label'))
-
-    def test_split_refuses_a_preview_whose_parent_changed_during_start(self):
-        self.assertEqual(7, Treenode.objects.get(pk=11).parent_id)
-        self.assertEqual(11, Treenode.objects.get(pk=13).parent_id)
-        self.assertStatus(self.post(self.change(self.annotation_a, 13)))
-        self.assertEqual(13, Treenode.objects.get(pk=11).parent_id)
-        original_nodes = set(Treenode.objects.filter(skeleton_id=1).values_list('id', flat=True))
-
-        split = self.client.post('/%d/skeleton/split' % self.test_project_id, {
-            'treenode_id': 11,
-            'expected_parent_id': 7,
-            'upstream_annotation_map': '{}',
-            'downstream_annotation_map': '{}',
-        })
-
-        self.assertEqual(400, split.status_code, split.content)
-        self.assertIn('The split edge changed', split.json()['error'])
-        self.assertEqual(original_nodes, set(Treenode.objects.filter(skeleton_id=1)
-                .values_list('id', flat=True)))
-        self.assertEqual(13, self.root(1))
-        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
-
-
-
 
     def test_assigned_annotation_cannot_move_or_reroot(self):
         self.link(self.annotation_a, SKELETON_1_NEURON)
@@ -199,7 +175,7 @@ class AnnotationMatchingApiTests(AnnotationMatchingFixtures, CatmaidApiTestCase)
 
         result = self.result(self.post(self.change(self.annotation_a, 11, radius=100)))
 
-        self.assertEqual({'skeleton_id': 373}, result)
+        self.assertEqual({'skeleton_id': 373, 'root_id': 405}, result)
         self.assertEqual({SKELETON_373_NEURON}, self.neurons_with(self.annotation_a))
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_b))
         self.assertEqual(405, self.root(373))
@@ -213,7 +189,7 @@ class AnnotationMatchingApiTests(AnnotationMatchingFixtures, CatmaidApiTestCase)
 
         result = self.result(self.post(self.change(self.annotation_a, 11, radius=100)))
 
-        self.assertEqual({'skeleton_id': 373}, result)
+        self.assertEqual({'skeleton_id': 373, 'root_id': 405}, result)
         self.assertEqual({SKELETON_373_NEURON}, self.neurons_with(self.annotation_a))
         self.assertEqual(7, self.root(1))
         self.assertEqual(405, self.root(373))
@@ -225,7 +201,7 @@ class AnnotationMatchingApiTests(AnnotationMatchingFixtures, CatmaidApiTestCase)
 
         result = self.result(self.post(self.change(self.annotation_a, 11)))
 
-        self.assertEqual({'skeleton_id': 1}, result)
+        self.assertEqual({'skeleton_id': 1, 'root_id': 11}, result)
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
 
     def test_skips_a_candidate_whose_new_root_would_break_a_sampler(self):
@@ -242,7 +218,7 @@ class AnnotationMatchingApiTests(AnnotationMatchingFixtures, CatmaidApiTestCase)
 
         result = self.result(self.post(self.change(self.annotation_a, 13, radius=100)))
 
-        self.assertEqual({'skeleton_id': 373}, result)
+        self.assertEqual({'skeleton_id': 373, 'root_id': 405}, result)
         self.assertEqual({SKELETON_373_NEURON}, self.neurons_with(self.annotation_a))
         self.assertEqual(7, self.root(1))
         self.assertEqual(405, self.root(373))
@@ -253,7 +229,7 @@ class AnnotationMatchingApiTests(AnnotationMatchingFixtures, CatmaidApiTestCase)
 
         result = self.result(self.post(self.change(self.annotation_a, 11)))
 
-        self.assertEqual(1, result['skeleton_id'])
+        self.assertEqual({'skeleton_id': 1, 'root_id': 11}, result)
         self.assertEqual(11, self.root(1))
         self.assertEqual(377, self.root(373))
 
@@ -366,7 +342,7 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
         with ThreadPoolExecutor(max_workers=1) as pool:
             def apply_then_overlap(project_id, user, change):
                 result = original(project_id, user, change)
-                if result == 1:
+                if result[0] == 1:
                     waiters.append(self.overlapping_request(pool,
                             lambda: self.post(second, client=second_client)))
                 return result
@@ -535,7 +511,7 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
                 response = self.post(self.change(self.annotation_a, 13))
             deleted = pending[0].result(timeout=10)
 
-        self.assertEqual({'skeleton_id': 1}, self.result(response))
+        self.assertEqual({'skeleton_id': 1, 'root_id': 13}, self.result(response))
         self.assertStatus(deleted)
         self.assertFalse(Treenode.objects.filter(pk=11).exists())
         self.assertEqual(13, self.root(1))

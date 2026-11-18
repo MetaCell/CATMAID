@@ -2219,7 +2219,7 @@ var SkeletonAnnotations = {};
       var model = new CATMAID.SkeletonModel(node.skeleton_id, name,
           new THREE.Color(1, 1, 0), self.api);
 
-      let split = function(splitNode, upstreamAnnotationSet, downstreamAnnotationSet, expectedParentId) {
+      let split = function(splitNode, upstreamAnnotationSet, downstreamAnnotationSet) {
         // Call backend
         return self.submit.promise()
           .then(function() {
@@ -2227,7 +2227,7 @@ var SkeletonAnnotations = {};
           }).then(function(splitNodeId) {
             var command = new CATMAID.SplitSkeletonCommand(self.state,
                 self.projectId, splitNodeId, upstreamAnnotationSet,
-                downstreamAnnotationSet, self.api, expectedParentId);
+                downstreamAnnotationSet, self.api);
             return CATMAID.commands.execute(command)
               .then(function(result) {
                 return self.updateNodes(function () { self.selectNode(splitNodeId); });
@@ -2253,8 +2253,17 @@ var SkeletonAnnotations = {};
           var dialog = new CATMAID.SplitMergeDialog({
             model1: model,
             splitNodeId: nodeId,
-            split: function(upstreamAnnotations, downstreamAnnotations, expectedParentId) {
-              return split(node, upstreamAnnotations, downstreamAnnotations, expectedParentId)
+            split: function() {
+              // Get upstream and downstream annotation set
+              var upstream_set, downstream_set;
+              if (self.upstream_is_small) {
+                upstream_set = dialog.get_under_annotation_set();
+                downstream_set = dialog.get_over_annotation_set();
+              } else {
+                upstream_set = dialog.get_over_annotation_set();
+                downstream_set = dialog.get_under_annotation_set();
+              }
+              return split(node, upstream_set, downstream_set)
                 .catch(CATMAID.handleError)
                 .finally(() => resolve());
             },

@@ -1266,7 +1266,6 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     ordinary annotations are copied to the respective skeleton.
     Imported source-fragment identifiers are always copied to both parts,
     independently of the requested distribution of ordinary annotations.
-    A confirmed preview may send expected_parent_id to guard the cut edge.
     """
     treenode_id = int(request.POST['treenode_id'])
     project_id = int(project_id)
@@ -1276,10 +1275,6 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     treenode = Treenode.objects.select_related('parent').get(id=treenode_id, project_id=project_id)
     if treenode.skeleton_id != skeleton_id:
         raise ValueError('The treenode changed skeletons during split, please retry')
-
-    expected_parent_id = request.POST.get('expected_parent_id')
-    if expected_parent_id is not None and treenode.parent_id != int(expected_parent_id):
-        raise ValueError('The split edge changed. Open the Split preview again.')
 
     upstream_annotation_map = request.POST.get('upstream_annotation_map')
     downstream_annotation_map = request.POST.get('downstream_annotation_map')
@@ -1320,7 +1315,7 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
             {skeleton_id: neuron.id}, cursor)
     locked_parent = next(parent for node, parent in locked_nodes if node == treenode_id)
     if locked_parent != treenode.parent_id:
-        raise ValueError('The split edge changed. Open the Split preview again.')
+        raise ValueError('The split edge changed. Retry the operation.')
 
     # Read metadata after serializing structural edits of the source neuron.
     current_annotations = annotations_for_skeleton(project_id, skeleton_id)

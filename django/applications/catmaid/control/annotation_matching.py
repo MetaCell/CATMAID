@@ -173,7 +173,7 @@ def _neuron_annotation_links(project_id: int):
     )
 
 
-def _assign(project_id: int, user, change: NearestAnnotation) -> int:
+def _assign(project_id: int, user, change: NearestAnnotation) -> tuple[int, int]:
     lock_annotation(project_id, change.annotation)
     if _neuron_annotation_links(project_id).filter(class_instance_b__name__iexact=change.annotation).exists():
         raise AnnotationMatchConflict('The annotation already belongs to a skeleton')
@@ -188,8 +188,9 @@ def _assign(project_id: int, user, change: NearestAnnotation) -> int:
             # Roll back any label and release this candidate's locks if its
             # sampler prevents rerooting before trying a different skeleton.
             with transaction.atomic():
-                return _link_candidate(project_id, user, change,
+                _link_candidate(project_id, user, change,
                         skeleton_id, treenode_id, neuron_id, (x, y, z))
+                return skeleton_id, treenode_id
         except skeleton.RerootSamplerConflict:
             skipped_skeletons.append(skeleton_id)
 
@@ -229,7 +230,6 @@ def _link_candidate(project_id, user, change, skeleton_id, treenode_id,
     if not any(neuron_id in entities for entities in added.values()):
         raise AnnotationMatchConflict('The annotation could not be added')
     skeleton._reroot_skeleton_locked(treenode_id, project_id, skeleton_id)
-    return skeleton_id
 
 
 @api_view(['POST'])
@@ -241,7 +241,8 @@ def annotate_nearest(request: HttpRequest, project_id=None) -> JsonResponse:
     Send an annotation, an [x, y, z] coordinate and a positive radius in project
     nanometres. An optional exclude_annotation_pattern skips neurons carrying
     matching annotations (case-insensitive PostgreSQL regular expression).
-    The annotation must be unused on neurons in this project.
+    The annotation must be unused on neurons in this project. The response
+    contains the selected skeleton_id and root_id.
     """
     project_id = int(project_id)
     try:
@@ -250,5 +251,5 @@ def annotate_nearest(request: HttpRequest, project_id=None) -> JsonResponse:
         return HttpResponseBadRequest(str(error))
 
     with transaction.atomic():
-        skeleton_id = _assign(project_id, request.user, change)
-    return JsonResponse({'skeleton_id': skeleton_id})
+        skeleton_id, root_id = _assign(project_id, request.user, change)
+    return JsonResponse({'skeleton_id': skeleton_id, 'root_id': root_id})

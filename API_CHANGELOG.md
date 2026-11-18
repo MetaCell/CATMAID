@@ -13,7 +13,7 @@ included in this changelog.
   a case-insensitive PostgreSQL regular expression.
   CATMAID picks the nearest eligible skeleton, breaking ties by skeleton ID
   and then treenode ID, adds the annotation, and makes the selected node the
-  root in one transaction. The response contains `skeleton_id`.
+  root in one transaction. The response contains `skeleton_id` and `root_id`.
   Access requires the project's Annotate role and respects neuron edit locks.
   A search with no eligible skeleton returns 409 with
   `meta.code: "annotation_match_no_match"`. An annotation already assigned
