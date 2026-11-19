@@ -29,6 +29,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from catmaid.history import add_log_entry
+from catmaid.neuroglass_task_annotations import prepare_split_annotations
 from catmaid.source_fragments import (
     SOURCE_FRAGMENT_ANNOTATION_PREFIX, is_source_fragment_annotation_name,
     reject_reserved_annotation_names)
@@ -1266,6 +1267,7 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     ordinary annotations are copied to the respective skeleton.
     Imported source-fragment identifiers are always copied to both parts,
     independently of the requested distribution of ordinary annotations.
+    NeuroGlass task annotations always stay on the original skeleton.
     """
     treenode_id = int(request.POST['treenode_id'])
     project_id = int(project_id)
@@ -1332,8 +1334,10 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     downstream_annotation_map = _retain_source_fragment_annotations(
             downstream_annotation_map, source_annotations)
 
+    upstream_annotation_map, downstream_annotation_map, distributable_annotations = (
+        prepare_split_annotations(current_annotations,
+                upstream_annotation_map, downstream_annotation_map))
     # Either piece can keep the complete set of distributable annotations.
-    distributable_annotations = set(current_annotations)
     if not (distributable_annotations.issubset(upstream_annotation_map)
             or distributable_annotations.issubset(downstream_annotation_map)):
         raise ValueError("Annotation distribution is not valid for splitting. "

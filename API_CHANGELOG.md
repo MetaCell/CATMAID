@@ -27,6 +27,10 @@ included in this changelog.
 
 ### Modifications
 
+- `POST /{project_id}/skeleton/split` keeps existing NeuroGlass task
+  annotations on the original skeleton. Annotation selections distribute ordinary
+  annotations and cannot introduce task links.
+
 - `GET|POST /{project_id}/skeletons/compact-detail`:
   The new parameter 'with_edition_times' can now be used to return the edition
   time for every returned treenode, connector and labe/tag.
