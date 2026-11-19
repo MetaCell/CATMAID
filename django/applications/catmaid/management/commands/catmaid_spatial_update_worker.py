@@ -10,6 +10,7 @@ from typing import Dict, List, Set
 from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.db import connection
+from django.db.models import Q
 
 from catmaid.control.edge import get_intersected_grid_cells
 from catmaid.control.node import (get_configured_node_providers,
@@ -25,39 +26,25 @@ logger = logging.getLogger(__name__)
 class GridWorker():
 
     def __init__(self):
-        # Keep a reference to all enabled grid caches
-        enabled_node_providers = get_configured_node_providers(
-                settings.NODE_PROVIDERS, enabled_only=True)
+        providers = get_configured_node_providers(settings.NODE_PROVIDERS, enabled_only=True)
+        self.grid_restrictions = Q(pk__in=[])
+        for provider in providers:
+            if not isinstance(provider, GridCachedNodeProvider):
+                continue
+            restriction = Q()
+            if provider.cache_id is not None:
+                restriction &= Q(pk=provider.cache_id)
+            if provider.project_id is not None:
+                restriction &= Q(project_id=provider.project_id)
+            if not restriction:
+                self.grid_restrictions = Q()
+                break
+            self.grid_restrictions |= restriction
 
-        enabled_grid_cache_providers = list(filter(lambda x: isinstance(x,
-                GridCachedNodeProvider), enabled_node_providers))
-
-        # Keep track of received events
+        self.grid_caches: List[NodeGridCache] = []
+        self.cache_project_ids: Set[int] = set()
         self.updatesReceived = 0
         self.cellsMarkedDirty = 0
-
-        if enabled_grid_cache_providers:
-            logger.info(f"Found {len(enabled_grid_cache_providers)} enabled grid cache provider(s)")
-        else:
-            logger.info("Could not find any enabled grid cache provider")
-
-        # Find a grid cache for each provider and make sure each cache is only
-        # referenced once.
-        self.grid_caches:List = []
-        for provider in enabled_grid_cache_providers:
-            # If a particular cache is referenced explicitly, use it if it is
-            # enabled.
-            if provider.cache_id is not None:
-                grid_cache = NodeGridCache.get(pk=provider.cache_id,
-                        enabled=True)
-                if grid_cache:
-                    self.grid_caches.append(grid_cache)
-            # Without an explicit ID, get all enabled grid caches
-            else:
-                enabled_grid_caches = list(NodeGridCache.objects.filter(enabled=True))
-                self.grid_caches.extend(enabled_grid_caches)
-        self.cache_project_ids = set([c.project_id for c in self.grid_caches])
-        logger.info(f'Found caches in projects: {", ".join(map(str, self.cache_project_ids))}')
 
     def update(self, updates, cursor):
         """ We want regular node queries to be able to tell whether a particular
@@ -67,6 +54,14 @@ class GridWorker():
         project and then, for each notification compute the intersected grid
         indices with each grid, update existing grids and create missing ones.
         """
+        # Projects and enabled grids can change while the worker is running.
+        updates = list(updates)
+        projects = {entry["project_id"] for entry in updates if entry.get("project_id") is not None}
+        self.grid_caches = list(NodeGridCache.objects.filter(
+            self.grid_restrictions, enabled=True, project_id__in=projects,
+        ))
+        self.cache_project_ids = {grid.project_id for grid in self.grid_caches}
+
         # Batch of grids to update during one run
         grid_coords_to_update:Dict = {}
         for update in updates:

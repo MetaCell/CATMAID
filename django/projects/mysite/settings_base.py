@@ -537,7 +537,7 @@ DEFAULT_CACHE_GRID_CELL_DEPTH = 40
 # Whether Postgres should emit "catmaid.spatial-update" events on changes of
 # spatial data (e.g. inserts, updates and deletions of treenodes, connectors and
 # connector links).
-SPATIAL_UPDATE_NOTIFICATIONS = False
+SPATIAL_UPDATE_NOTIFICATIONS = True
 
 # Specifies whether grid cache update workser will notify all clients about
 # recomputed dirty cells using WebSockets.
