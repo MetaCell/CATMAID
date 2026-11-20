@@ -2,14 +2,16 @@
 
 import json
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from queue import Queue
 from time import monotonic, sleep
 from unittest.mock import patch
 
-from django.db import connection, connections
-from django.test import Client
+from django.db import connection, connections, transaction
+from django.test import Client, override_settings
 
 from catmaid.control import annotation, skeleton, annotation_matching
+from catmaid.locks import SkeletonEditLockTimeout
 from catmaid.models import (Class, ClassInstance, ClassInstanceClassInstance,
         Sampler, SamplerDomain, SamplerDomainType, SamplerState, Treenode, User)
 from catmaid.source_fragments import SOURCE_FRAGMENT_ANNOTATION_PREFIX
@@ -299,6 +301,74 @@ class AnnotationMatchingApiTests(AnnotationMatchingFixtures, CatmaidApiTestCase)
 
 
 class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiTransactionTestCase):
+
+    @contextmanager
+    def held_topology_lock(self, skeleton_id):
+        holder = connections['default'].copy(alias='reroot_lock_holder')
+        try:
+            holder.set_autocommit(False)
+            with holder.cursor() as cursor:
+                cursor.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))',
+                        ['catmaid-reroot:%s:%s' % (self.test_project_id, skeleton_id)])
+            yield
+        finally:
+            holder.rollback()
+            holder.close()
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=75)
+    def test_annotate_nearest_reports_topology_lock_timeout_as_409(self):
+        parents = dict(Treenode.objects.filter(skeleton_id=1).values_list('id', 'parent_id'))
+        change = self.change(self.annotation_a, 11)
+        with self.held_topology_lock(1):
+            response = self.post(change)
+        self.assertEqual(409, response.status_code, response.content)
+        self.assertEqual({'code': 'edit_lock_timeout'}, response.json()['meta'])
+        self.assertEqual(set(), self.neurons_with(self.annotation_a))
+        self.assertEqual(parents,
+                dict(Treenode.objects.filter(skeleton_id=1).values_list('id', 'parent_id')))
+        self.assertEqual(7, self.root(1))
+
+        self.assertEqual({'skeleton_id': 1, 'root_id': 11}, self.result(self.post(change)))
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=75)
+    def test_native_reroot_reports_topology_lock_timeout_as_409(self):
+        parents = dict(Treenode.objects.filter(skeleton_id=1).values_list('id', 'parent_id'))
+        url = '/%d/skeleton/reroot' % self.test_project_id
+        with self.held_topology_lock(1):
+            response = self.client.post(url, {'treenode_id': 11})
+        self.assertEqual(409, response.status_code, response.content)
+        self.assertEqual({'code': 'edit_lock_timeout'}, response.json()['meta'])
+        self.assertEqual(set(), self.neurons_with(self.annotation_a))
+        self.assertEqual(parents,
+                dict(Treenode.objects.filter(skeleton_id=1).values_list('id', 'parent_id')))
+        self.assertEqual(7, self.root(1))
+
+        self.assertStatus(self.client.post(url, {'treenode_id': 11}))
+        self.assertEqual(11, self.root(1))
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=75)
+    def test_topology_lock_timeout_restores_policy_and_releases_partial_locks(self):
+        with self.held_topology_lock(373):
+            for previous_timeout in (25, 2500):
+                with self.subTest(previous_timeout=previous_timeout), transaction.atomic():
+                    with connection.cursor() as cursor:
+                        cursor.execute("SELECT set_config('lock_timeout', %s, true)",
+                                [f'{previous_timeout}ms'])
+                        with self.assertRaises(ValueError) as failure:
+                            skeleton._lock_skeletons_for_reroot(self.test_project_id, [373, 1, 1])
+                        self.assertIsInstance(failure.exception, SkeletonEditLockTimeout)
+                        cursor.execute("SELECT setting::integer FROM pg_settings WHERE name='lock_timeout'")
+                        self.assertEqual(previous_timeout, cursor.fetchone()[0])
+                    probe = connections['default'].copy(alias='reroot_lock_probe')
+                    try:
+                        with probe.cursor() as cursor:
+                            cursor.execute('SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))',
+                                    ['catmaid-reroot:%s:1' % self.test_project_id])
+                            self.assertTrue(cursor.fetchone()[0], 'The partial advisory lock was not released')
+                    finally:
+                        probe.close()
+
     def overlapping_request(self, pool, call):
         backend_ids = Queue()
 

@@ -18,6 +18,8 @@ included in this changelog.
   A search with no eligible skeleton returns 409 with
   `meta.code: "annotation_match_no_match"`. An annotation already assigned
   to a neuron or a target that changed during selection also returns 409.
+  Lock contention returns a retryable 409 with
+  `meta.code: "edit_lock_timeout"`.
 
 - `POST /{project_id}/skeletons/{skeleton_id}/delete`:
   Delete a skeleton along with its neuron (like calling /delete on the neuron).

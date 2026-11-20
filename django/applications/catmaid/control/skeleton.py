@@ -2280,16 +2280,13 @@ def reroot_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
 
 def _lock_skeletons_for_reroot(project_id, skeleton_ids):
     """Serialize topology snapshots for reroots within the current transaction."""
-    try:
-        with connection.cursor() as cursor, skeleton_edit_lock_timeout(cursor):
-            cursor.execute('''
-                SELECT pg_advisory_xact_lock(
-                    hashtextextended('catmaid-reroot:' || %s::text || ':' || id, 0))
-                FROM unnest(%s::bigint[]) AS skeletons(id)
-                ORDER BY id
-            ''', [int(project_id), sorted(set(skeleton_ids))])
-    except SkeletonEditLockTimeout as error:
-        raise ValueError('A skeleton is being edited; retry the operation.') from error
+    with connection.cursor() as cursor, skeleton_edit_lock_timeout(cursor):
+        cursor.execute('''
+            SELECT pg_advisory_xact_lock(
+                hashtextextended('catmaid-reroot:' || %s::text || ':' || id, 0))
+            FROM unnest(%s::bigint[]) AS skeletons(id)
+            ORDER BY id
+        ''', [int(project_id), sorted(set(skeleton_ids))])
 
 
 @transaction.atomic
@@ -2303,6 +2300,8 @@ def _reroot_skeleton(treenode_id, project_id):
         skeleton_id = Treenode.objects.values_list('skeleton_id', flat=True).get(
                 id=treenode_id, project=project_id)
         _lock_skeletons_for_reroot(project_id, [skeleton_id])
+    except (ClientError, ImproperlyConfigured):
+        raise
     except Exception as error:
         raise ValueError(f'Failed to select treenode with id {treenode_id}: {error}') from error
 
