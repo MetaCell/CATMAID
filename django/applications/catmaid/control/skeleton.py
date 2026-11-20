@@ -2323,8 +2323,8 @@ def _reroot_skeleton_locked(treenode_id, project_id, skeleton_id):
         if first_parent is None:
             return False
 
-        # Native insertion locks its parent row without taking our advisory lock.
-        # An insertion committed during a lock wait can introduce more nodes:
+        # Native node creation can append a child while locking only its parent.
+        # An append committed during a lock wait can introduce more nodes:
         # repeat until every node in the fresh graph is covered by our locks.
         while True:
             with connection.cursor() as cursor, skeleton_edit_lock_timeout(cursor):

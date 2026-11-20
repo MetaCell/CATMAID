@@ -132,6 +132,7 @@ def create_treenode(request:HttpRequest, project_id=None) -> JsonResponse:
     })
 
 @requires_user_role(UserRole.Annotate)
+@transaction.atomic
 def insert_treenode(request:HttpRequest, project_id=None) -> JsonResponse:
     """
     Create a new treenode between two existing nodes. Its creator and
@@ -170,25 +171,27 @@ def insert_treenode(request:HttpRequest, project_id=None) -> JsonResponse:
     except Exception as e:
         raise ValueError(f"Couldn't parse list parameter: {e}")
 
-    # Make sure the back-end is in the expected state if the node should have a
-    # parent and will therefore become part of another skeleton.
-    parent_id = params.get('parent_id')
-    child_id = params.get('child_id')
-    if parent_id not in (-1, None):
-        s = request.POST.get('state')
-        # Testing egular edge insertion is assumed if a child ID is provided
-        partial_child_checks = [] if child_id in (-1, None) else [child_id]
-        if takeover_child_ids:
-            partial_child_checks.extend(takeover_child_ids)
-        state.validate_state(parent_id, s, node=True,
-                children=partial_child_checks or False, lock=True),
+    # Insertion locks the parent before updating the child. Serialize with
+    # rerooting before either operation takes treenode row locks.
+    from catmaid.control.skeleton import _lock_skeletons_for_reroot
 
-    # Find child and parent of new treenode
-    child = Treenode.objects.get(pk=params['child_id'])
-    parent = Treenode.objects.get(pk=params['parent_id'])
+    parent_id, child_id = params['parent_id'], params['child_id']
+    skeleton_id = Treenode.objects.values_list('skeleton_id', flat=True).get(
+            id=parent_id, project_id=project_id)
+    _lock_skeletons_for_reroot(project_id, [skeleton_id])
 
-    # Make sure both nodes are actually child and parent
-    if not child.parent == parent:
+    # Validate the client state and edge after the wait.
+    partial_child_checks = [] if child_id == -1 else [child_id]
+    if takeover_child_ids:
+        partial_child_checks.extend(takeover_child_ids)
+    state.validate_state(parent_id, request.POST.get('state'), node=True,
+            children=partial_child_checks or False, lock=True)
+
+    parent = Treenode.objects.get(pk=parent_id, project_id=project_id)
+    child = Treenode.objects.get(pk=child_id, project_id=project_id)
+    if parent.skeleton_id != skeleton_id:
+        raise ValueError('The parent treenode changed skeletons during insertion, please retry')
+    if child.parent_id != parent_id:
         raise ValueError('The provided nodes need to be child and parent')
 
     # Make sure the requested location for the new node is on the edge between

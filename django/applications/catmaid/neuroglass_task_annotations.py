@@ -2,15 +2,14 @@
 
 import re
 
-from catmaid.neuroglass_tasks import is_task_annotation
-from catmaid.source_fragments import is_source_fragment_annotation_name
+from catmaid.neuroglass_tasks import TASK_ANNOTATION_NAMESPACE, is_task_annotation
 
 
 _COUNTING_PATTERN = re.compile(r"\{n(\d+)\}")
 
 
 def _creates_task_annotation(name):
-    if is_source_fragment_annotation_name(name):
+    if not TASK_ANNOTATION_NAMESPACE.match(name):
         return False
     # Split annotates one neuron per call: counters use their starting value.
     name = name.replace("{n}", "{n1}")

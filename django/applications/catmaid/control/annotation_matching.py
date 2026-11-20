@@ -52,6 +52,9 @@ def _parse_request(data) -> NearestAnnotation:
     name = data['annotation']
     if not isinstance(name, str) or not name.strip() or '\x00' in name:
         raise ValueError('Expected a nonempty annotation name')
+    max_name_length = ClassInstance._meta.get_field('name').max_length
+    if len(name) > max_name_length:
+        raise ValueError(f'The annotation name cannot exceed {max_name_length} characters')
     if re.search(r'\{n(?:\d+)?\}', name):
         raise ValueError('Annotation counting patterns are not supported')
     pattern = data.get('exclude_annotation_pattern')

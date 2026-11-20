@@ -86,6 +86,18 @@ class AnnotationMatchingApiTests(AnnotationMatchingFixtures, CatmaidApiTestCase)
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with('My annotation'))
         self.assertEqual(11, self.root(1))
 
+    def test_annotation_name_length_limit(self):
+        oversized_name = 'a' * 256
+        response = self.post(self.change(oversized_name, 11))
+        self.assertEqual(400, response.status_code, response.content)
+        self.assertEqual(set(), self.neurons_with(oversized_name))
+        self.assertEqual(7, self.root(1))
+
+        max_length_name = 'a' * 255
+        result = self.result(self.post(self.change(max_length_name, 11)))
+        self.assertEqual({'skeleton_id': 1, 'root_id': 11}, result)
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(max_length_name))
+
     def test_annotating_nearest_requires_project_annotate_permission(self):
         from guardian.shortcuts import remove_perm
         remove_perm('can_annotate', self.test_user, self.test_project)
@@ -641,6 +653,43 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
         return self.held_lock('SELECT id FROM treenode WHERE id=%s FOR UPDATE', [node_id])
 
     @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
+    def test_native_insertion_on_selected_edge_does_not_deadlock(self):
+        original_nodes = set(Treenode.objects.filter(skeleton_id=1).values_list('id', flat=True))
+        parent = Treenode.objects.get(pk=11)
+        child = Treenode.objects.get(pk=13)
+        insertion = self.edge_insertion(parent.id, child.id)
+        insertion['state'] = json.dumps({
+            'edition_time': parent.edition_time.isoformat(),
+            'children': [[child.id, child.edition_time.isoformat()]],
+        })
+        native = Client()
+        native.cookies.update(self.client.cookies)
+        pending = []
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            def insert_before_graph_lock(execute, sql, params, many, context):
+                if 'ORDER BY t.id' in sql and 'FOR NO KEY UPDATE OF t' in sql and not pending:
+                    pending.append(self.overlapping_request(pool, lambda: native.post(
+                            '/%d/treenode/insert' % self.test_project_id, insertion)))
+                    self.assertFalse(pending[0].done(), 'Native insertion did not wait')
+                return execute(sql, params, many, context)
+
+            with connection.execute_wrapper(insert_before_graph_lock):
+                response = self.post(self.change(self.annotation_a, child.id))
+            self.assertEqual(1, len(pending), 'The test did not run the native insertion')
+            inserted = pending[0].result(timeout=10)
+
+        self.assertEqual({'skeleton_id': 1, 'root_id': 13}, self.result(response))
+        self.assertEqual(400, inserted.status_code, inserted.content)
+        self.assertIn('state differs', inserted.json()['error'])
+        parents = dict(Treenode.objects.filter(skeleton_id=1).values_list('id', 'parent_id'))
+        self.assertEqual(original_nodes, parents.keys())
+        self.assertIsNone(parents[13])
+        self.assertEqual(13, parents[11])
+        self.assertEqual(11, parents[7])
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
     def test_native_edge_insertion_waits_for_annotation_matching_reroot(self):
         original_nodes = set(Treenode.objects.filter(skeleton_id=1).values_list('id', flat=True))
         insertion = self.edge_insertion(7, 11)
@@ -676,7 +725,7 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
 
     @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
-    def test_reroot_reads_an_insertion_committed_during_node_lock_wait(self):
+    def test_annotation_matching_reroot_waits_for_edge_insertion(self):
         original_nodes = set(Treenode.objects.filter(skeleton_id=1).values_list('id', flat=True))
         insertion = self.edge_insertion(7, 11)
         change = self.change(self.annotation_a, 13)
@@ -701,7 +750,7 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
 
     @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
-    def test_native_reroot_refreshes_parent_after_insertion_commits(self):
+    def test_native_reroot_reads_new_parent_after_insertion_commits(self):
         original_nodes = set(Treenode.objects.filter(skeleton_id=1).values_list('id', flat=True))
         insertion = self.edge_insertion(11, 13)
         native = Client()
@@ -752,9 +801,15 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
 
     @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
-    def test_reroot_locks_nodes_discovered_after_waiting_for_insertion(self):
+    def test_reroot_locks_nodes_discovered_after_waiting_for_append(self):
         original_nodes = set(Treenode.objects.filter(skeleton_id=1).values_list('id', flat=True))
-        insertion = self.edge_insertion(7, 11)
+        # Ordinary appends do not take the topology lock used by edge insertion.
+        root = Treenode.objects.get(pk=7)
+        create_url = '/%d/treenode/create' % self.test_project_id
+        first_append = {
+            'parent_id': root.id, 'state': make_nocheck_state(),
+            'x': root.location_x + 1, 'y': root.location_y, 'z': root.location_z,
+        }
         change = self.change(self.annotation_a, 13)
         matching = Client()
         matching.cookies.update(self.client.cookies)
@@ -770,9 +825,10 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
             def hold_native_append():
                 try:
                     with transaction.atomic():
-                        response = native.post('/%d/treenode/create' % self.test_project_id, {
-                            'parent_id': inserted, 'state': make_nocheck_state(),
-                            'x': insertion['x'], 'y': insertion['y'] + 1, 'z': insertion['z'],
+                        response = native.post(create_url, {
+                            **first_append,
+                            'parent_id': inserted,
+                            'y': first_append['y'] + 1,
                         })
                         appends.append(response)
                         append_ready.set()
@@ -801,9 +857,9 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
             try:
                 with transaction.atomic():
                     inserted = self.result(self.client.post(
-                            '/%d/treenode/insert' % self.test_project_id, insertion))['treenode_id']
+                            create_url, first_append))['treenode_id']
                     waiting = self.overlapping_request(pool, match_while_append_holds_new_node)
-                    self.assertFalse(waiting.done(), 'Reroot did not wait for the first insertion')
+                    self.assertFalse(waiting.done(), 'Reroot did not wait for the first append')
                 response = waiting.result(timeout=10)
             finally:
                 release_append.set()
@@ -819,6 +875,6 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
         self.assertEqual(original_nodes | {inserted, appended}, set(parents))
         self.assertIsNone(parents[7])
         self.assertEqual(7, parents[inserted])
-        self.assertEqual(inserted, parents[11])
+        self.assertEqual(7, parents[11])
         self.assertEqual(11, parents[13])
         self.assertEqual(inserted, parents[appended])
