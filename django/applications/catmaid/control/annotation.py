@@ -5,9 +5,9 @@ import dateutil.parser
 from contextlib import nullcontext
 import re
 
-from typing import Any, DefaultDict, Dict, FrozenSet, List, Optional, Set, Tuple, Union
+from typing import AbstractSet, Any, DefaultDict, Dict, FrozenSet, List, Optional, Set, Tuple, Union
 
-from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
+from django.http import Http404, HttpRequest, HttpResponse, JsonResponse, QueryDict
 from django.shortcuts import get_object_or_404
 from django.db import connection, transaction
 
@@ -29,18 +29,20 @@ from catmaid.control.common import (get_relation_to_id_map,
         get_class_to_id_map, get_request_bool, get_request_list)
 
 
-def _lock_annotation_name(project_id, name, *, wait=True):
-    """Serialize annotation creation, including names that have no row yet."""
+def _lock_annotation_names(project_id, names, *, wait=True):
+    """Serialize annotation writes, including names that have no row yet."""
+    prefix = f'catmaid:annotation-targets:{int(project_id)}:'
+    keys = [prefix + name for name in sorted(names)]
+    # Native writers may already hold target row locks. They must fail fast
+    # if a replacement holds the name lock while waiting for those rows.
+    lock_function = 'pg_advisory_xact_lock' if wait else 'pg_try_advisory_xact_lock'
     with connection.cursor() as cursor:
-        key = f'catmaid:annotation-targets:{int(project_id)}:{name}'
-        if wait:
-            cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", [key])
-        else:
-            # Native writers can already hold neuron locks. Never wait here
-            # while a replacement holds the name and is acquiring those neurons.
-            cursor.execute("SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))", [key])
-            if not cursor.fetchone()[0]:
-                raise SkeletonEditLockTimeout("The annotation is being updated. Please retry.")
+        cursor.execute(f"""
+            SELECT {lock_function}(hashtextextended(annotation_key, 0))
+            FROM unnest(%s::text[]) AS lock_keys(annotation_key)
+        """, [keys])
+        if not wait and not all(acquired for acquired, in cursor.fetchall()):
+            raise SkeletonEditLockTimeout("The annotation is being updated. Please retry.")
 
 
 def get_annotation_to_id_map(project_id:Union[int,str], annotations:List, relations=None,
@@ -848,7 +850,9 @@ def _annotate_entities(project_id:Union[int,str], entity_ids, annotation_map:Dic
 
 
 def _add_annotation_links(project_id:Union[int,str], entity_ids, annotation_map:Dict[str,Any],
-        update_existing=False, allow_reserved=False) -> Tuple[Dict,Set,Set]:
+        update_existing=False, allow_reserved=False, *,
+        existing_targets: AbstractSet[int] = frozenset()) -> Tuple[Dict,Set,Set]:
+    """Add annotation links, optionally reusing the locked targets of one exact annotation."""
     # Annotations can also be targets of meta-annotations. Check both names and
     # target objects so ordinary editing cannot alter the reserved source records.
     if not allow_reserved:
@@ -895,7 +899,7 @@ def _add_annotation_links(project_id:Union[int,str], entity_ids, annotation_map:
         # Make sure the annotation's class instance exists.
         for a, a_entity_ids in expanded_annotations.items():
             with transaction.atomic():
-                _lock_annotation_name(project_id, a, wait=False)
+                _lock_annotation_names(project_id, [a], wait=False)
                 ci, created = ClassInstance.objects.get_or_create(
                         project_id=project_id, name=a,
                         class_column=annotation_class,
@@ -907,6 +911,9 @@ def _add_annotation_links(project_id:Union[int,str], entity_ids, annotation_map:
             newly_annotated = set()
             # Annotate each of the entities. Don't allow duplicates.
             for entity_id in a_entity_ids:
+                if not update_existing and entity_id in existing_targets:
+                    existing_annotations.add(ci.id)
+                    continue
                 new_cici_defaults = {
                     'class_instance_a_id': entity_id,
                     'user_id': meta['user_id']
@@ -933,6 +940,7 @@ def _add_annotation_links(project_id:Union[int,str], entity_ids, annotation_map:
 
     return annotation_objects, new_annotations, existing_annotations
 
+@transaction.atomic
 def _annotate_entities_with_name(project_id:Union[int,str], user_id, entity_ids) -> Tuple[List[List[Any]], List[List[Any]]]:
     # Deriving annotations from entity names can enter the reserved namespace
     # without an explicit annotation argument. Preflight before creating any rows.
@@ -941,6 +949,7 @@ def _annotate_entities_with_name(project_id:Union[int,str], user_id, entity_ids)
             project_id=project_id, pk__in=entity_ids).values_list('id', 'name'))
     entity_names = set(entity_name_map.values())
     reject_reserved_annotation_names(entity_names)
+    _lock_annotation_names(project_id, entity_names | {'Name'}, wait=False)
     cursor = connection.cursor()
 
     annotated_with = Relation.objects.get(project_id=project_id,
@@ -1224,6 +1233,9 @@ def _remove_annotation(user, project_id:Union[int,str], entity_ids, annotation_i
     annotation_name = ClassInstance.objects.filter(
         project_id=project_id, pk=annotation_id,
     ).values_list('name', flat=True).first()
+    if annotation_name is not None:
+        # Replacement takes this lock before locking the annotation and its links.
+        _lock_annotation_names(project_id, [annotation_name], wait=False)
     if is_task_annotation(annotation_name):
         entity_ids = list(entity_ids)
         lock_task_annotation_targets(project_id, entity_ids)
@@ -1270,6 +1282,20 @@ def _remove_annotation_links(user, project_id:Union[int,str], entity_ids,
 
     return cicis_to_delete, missed_cicis, deleted, num_left
 
+def _get_annotation_target_ids(post: QueryDict, field: str) -> Set[int]:
+    """Read a flat CATMAID form list without discarding invalid target fields."""
+    indexed_fields = [key for key in post if key.startswith(f'{field}[')]
+    if not indexed_fields:
+        return set(map(int, post.getlist(field)))
+    if field not in post:
+        if indexed_fields == [f'{field}[]']:
+            return {int(item) for value in post.getlist(f'{field}[]') for item in value.split(',')}
+        if all(re.fullmatch(rf'{field}\[[0-9]+\]', key) and len(post.getlist(key)) == 1
+               for key in indexed_fields):
+            return {int(post[key]) for key in indexed_fields}
+    raise ValueError(f'Provide one flat list for {field}')
+
+
 class AnnotationTargetConflict(ClientError):
     status_code = 409
 
@@ -1298,8 +1324,8 @@ def set_annotation_targets(request: HttpRequest, project_id=None) -> JsonRespons
     if not name.strip() or len(name) > 255 or re.search(r'\{n\d*\}', name):
         raise ValueError("Provide one exact annotation name without numbered templates")
     reject_reserved_annotation_names([name])
-    entity_ids = set(get_request_list(request.POST, 'entity_ids', [], map_fn=int))
-    skeleton_ids = set(get_request_list(request.POST, 'skeleton_ids', [], map_fn=int))
+    entity_ids = _get_annotation_target_ids(request.POST, 'entity_ids')
+    skeleton_ids = _get_annotation_target_ids(request.POST, 'skeleton_ids')
     if entity_ids and skeleton_ids:
         raise ValueError("Provide entity_ids or skeleton_ids, not both")
     if any(target <= 0 for target in entity_ids | skeleton_ids):
@@ -1323,7 +1349,7 @@ def set_annotation_targets(request: HttpRequest, project_id=None) -> JsonRespons
 
     with connection.cursor() as cursor, skeleton_edit_lock_timeout(cursor):
         # A name lock also serializes first use, when there is no annotation row.
-        _lock_annotation_name(project_id, name)
+        _lock_annotation_names(project_id, [name])
         annotations = list(ClassInstance.objects.select_for_update(of=('self',)).filter(
             project_id=project_id, class_column__class_name='annotation', name=name,
         )[:2])
@@ -1357,11 +1383,11 @@ def set_annotation_targets(request: HttpRequest, project_id=None) -> JsonRespons
         for target in sorted(affected):
             can_edit_class_instance_or_fail(request.user, target)
 
-        # The write helpers retain NeuroGlass's final scoped permission checks.
+        # NeuroGlass checks the full requested set at the write helper.
         if entity_ids:
             _add_annotation_links(project_id, sorted(entity_ids), {
                 name: {'user_id': request.user.id},
-            })
+            }, existing_targets=current_targets)
         to_remove = current_targets - entity_ids
         if to_remove:
             _, missed, _, _ = _remove_annotation_links(

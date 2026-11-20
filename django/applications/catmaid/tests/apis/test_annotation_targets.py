@@ -4,7 +4,7 @@ from threading import Event, Thread
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.db import close_old_connections, connections
+from django.db import close_old_connections, connection, connections, transaction
 from django.test import Client, override_settings
 
 from catmaid.control import annotation
@@ -69,6 +69,27 @@ class AnnotationTargetsApiTests(AnnotationTargetsMixin, CatmaidApiTestCase):
         self.assertEqual(self.targets(), set())
         self.assertEqual(response.json()['entity_ids'], [])
         self.assertStatus(self.set_targets())
+
+    def test_bracketed_target_lists_are_supported(self):
+        for fields in (
+            {'entity_ids[0]': 2365, 'entity_ids[3]': 2389},
+            {'entity_ids[]': '2365,2389'},
+        ):
+            with self.subTest(fields=fields):
+                self.assertStatus(self.set_targets(**fields))
+                self.assertEqual(self.targets(), {2365, 2389})
+
+    def test_malformed_target_lists_leave_the_existing_targets_intact(self):
+        self.label()
+        for fields in (
+            {'skeleton_ids[-1]': 123},
+            {'entity_ids[0][0]': 2389},
+            {'entity_ids': [2389], 'entity_ids[0]': 2365},
+        ):
+            with self.subTest(fields=fields):
+                response = self.set_targets(**fields)
+                self.assertStatus(response, 400)
+                self.assertEqual(self.targets(), {2365})
 
     def test_repeated_request_preserves_the_original_annotator(self):
         owner = get_user_model().objects.create_user(username='annotation-original-owner')
@@ -251,10 +272,42 @@ class AnnotationTargetsConcurrencyTests(AnnotationTargetsMixin, CatmaidApiTransa
             class_column__class_name='annotation',
         ).count(), 1)
 
+    def test_neuron_name_add_cannot_create_a_duplicate_during_replacement(self):
+        ClassInstance.objects.filter(pk=2389).update(name=self.name)
+        path = f'/{self.test_project_id}/annotations/add-neuron-names'
+        data = {'entity_ids': [2389]}
+        with self.paused_replacement():
+            response = self.client.post(path, data)
+            self.assertStatus(response, 409)
+            self.assertEqual(response.json()['meta']['code'], 'edit_lock_timeout')
+        self.assertStatus(self.client.post(path, data))
+        self.assertEqual(self.targets(), {2365, 2389})
+        self.assertEqual(ClassInstance.objects.filter(
+            project_id=self.test_project_id, name=self.name,
+            class_column__class_name='annotation',
+        ).count(), 1)
+
+    def test_native_remove_returns_conflict_during_replacement(self):
+        self.label(target=2389)
+        label = ClassInstance.objects.get(
+            project_id=self.test_project_id, name=self.name,
+            class_column__class_name='annotation',
+        )
+        with self.paused_replacement(), transaction.atomic():
+            # Bound a native DELETE wait so a lock-order regression fails quickly.
+            with connection.cursor() as cursor:
+                cursor.execute("SET LOCAL lock_timeout = '100ms'")
+            response = self.client.post(
+                f'/{self.test_project_id}/annotations/remove',
+                {'annotation_ids': [label.pk], 'entity_ids': [2389]},
+            )
+            self.assertStatus(response, 409)
+            self.assertEqual(response.json()['meta']['code'], 'edit_lock_timeout')
+        self.assertEqual(self.targets(), {2365})
+
     @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
     def test_skeleton_mapping_is_rechecked_after_waiting_for_the_neuron(self):
         from time import monotonic, sleep
-        from django.db import connection, transaction
 
         model = ClassInstanceClassInstance.objects.get(
             project_id=self.test_project_id, relation__relation_name='model_of',
