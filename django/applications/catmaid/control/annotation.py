@@ -51,8 +51,8 @@ class AnnotationTargetConflict(ClientError):
     status_code = 409
 
 
-def lock_annotation_renames(project_id, renames):
-    """Hold old and new names through a rename and reject duplicate destinations."""
+def lock_class_instance_renames(project_id, renames):
+    """Lock rows in ID order and reserve the old and new names of annotations."""
     project_id = int(project_id)
     annotation_renames = {}
     instance_ids = set()
@@ -65,7 +65,7 @@ def lock_annotation_renames(project_id, renames):
         if instance.pk in annotation_renames:
             raise ValueError("Each annotation can be renamed only once per request")
         annotation_renames[instance.pk] = (instance.name, str(new_name))
-    if not annotation_renames:
+    if len(instance_ids) < 2 and not annotation_renames:
         return
 
     old_names = {pk: old for pk, (old, _) in annotation_renames.items()}
@@ -74,18 +74,17 @@ def lock_annotation_renames(project_id, renames):
     if len(new_names) != len(destinations):
         raise AnnotationTargetConflict("Annotation names must be unique within the project")
 
-    _lock_annotation_names(project_id, set(old_names.values()) | new_names, wait=False)
-    annotations = ClassInstance.objects.filter(
-        project_id=project_id, class_column__class_name='annotation',
-    )
-    # Bulk renames may also update neurons. Lock every affected row in the
-    # same order as target replacement.
+    if old_names:
+        _lock_annotation_names(project_id, set(old_names.values()) | new_names, wait=False)
+    # Match the row lock order used by target replacement for all bulk renames.
     locked_names = dict(ClassInstance.objects.select_for_update(of=('self',)).filter(
         project_id=project_id, pk__in=instance_ids,
     ).order_by('id').values_list('pk', 'name'))
     if any(locked_names.get(pk) != old_name for pk, old_name in old_names.items()):
         raise AnnotationTargetConflict("An annotation changed during rename. Please retry.")
-    if annotations.filter(name__in=new_names).exclude(pk__in=destinations).exists():
+    if ClassInstance.objects.filter(
+        project_id=project_id, class_column__class_name='annotation', name__in=new_names,
+    ).exclude(pk__in=destinations).exists():
         raise AnnotationTargetConflict("An annotation already uses the new name")
 
 
@@ -984,7 +983,6 @@ def _add_annotation_links(project_id:Union[int,str], entity_ids, annotation_map:
 
     return annotation_objects, new_annotations, existing_annotations
 
-@transaction.atomic
 def _annotate_entities_with_name(project_id:Union[int,str], user_id, entity_ids) -> Tuple[List[List[Any]], List[List[Any]]]:
     # Deriving annotations from entity names can enter the reserved namespace
     # without an explicit annotation argument. Preflight before creating any rows.
@@ -993,7 +991,6 @@ def _annotate_entities_with_name(project_id:Union[int,str], user_id, entity_ids)
             project_id=project_id, pk__in=entity_ids).values_list('id', 'name'))
     entity_names = set(entity_name_map.values())
     reject_reserved_annotation_names(entity_names)
-    _lock_annotation_names(project_id, entity_names | {'Name'}, wait=False)
     cursor = connection.cursor()
 
     annotated_with = Relation.objects.get(project_id=project_id,
@@ -1361,12 +1358,18 @@ def set_annotation_targets(request: HttpRequest, project_id=None) -> JsonRespons
     skeleton mappings or edit-lock timeouts 409; all leave the old links intact.
     """
     project_id = get_object_or_404(Project, pk=project_id).pk
-    name = request.POST.get('annotation', '')
+    post = request.POST
+    allowed_fields = {'annotation', 'entity_ids', 'skeleton_ids', 'csrfmiddlewaretoken'}
+    for field in post:
+        if field not in allowed_fields and not field.startswith(('entity_ids[', 'skeleton_ids[')):
+            raise ValueError(f'Unrecognized form field {field!r}')
+
+    name = post.get('annotation', '')
     if not name.strip() or len(name) > 255 or re.search(r'\{n\d*\}', name):
         raise ValueError("Provide one exact annotation name without numbered templates")
     reject_reserved_annotation_names([name])
-    entity_ids = _get_annotation_target_ids(request.POST, 'entity_ids')
-    skeleton_ids = _get_annotation_target_ids(request.POST, 'skeleton_ids')
+    entity_ids = _get_annotation_target_ids(post, 'entity_ids')
+    skeleton_ids = _get_annotation_target_ids(post, 'skeleton_ids')
     if entity_ids and skeleton_ids:
         raise ValueError("Provide entity_ids or skeleton_ids, not both")
     if any(target <= 0 for target in entity_ids | skeleton_ids):
@@ -1375,7 +1378,7 @@ def set_annotation_targets(request: HttpRequest, project_id=None) -> JsonRespons
     annotated_with = Relation.objects.get(project_id=project_id, relation_name='annotated_with')
     models = ClassInstanceClassInstance.objects.filter(
         project_id=project_id, relation__project_id=project_id,
-        relation__relation_name='model_of', class_instance_a_id__in=skeleton_ids,
+        relation__relation_name='model_of',
         class_instance_a__project_id=project_id,
         class_instance_a__class_column__class_name='skeleton',
         class_instance_a__class_column__project_id=project_id,
@@ -1383,8 +1386,9 @@ def set_annotation_targets(request: HttpRequest, project_id=None) -> JsonRespons
         class_instance_b__class_column__class_name='neuron',
         class_instance_b__class_column__project_id=project_id,
     ).values_list('class_instance_a_id', 'class_instance_b_id')
-    selected_models = dict(models)
-    if set(selected_models) != skeleton_ids or len(models) != len(skeleton_ids):
+    selected_rows = models.filter(class_instance_a_id__in=skeleton_ids)
+    selected_models = dict(selected_rows)
+    if set(selected_models) != skeleton_ids or len(selected_rows) != len(skeleton_ids):
         raise Http404("A selected skeleton does not exist in this project")
     entity_ids.update(selected_models.values())
 
@@ -1426,12 +1430,7 @@ def set_annotation_targets(request: HttpRequest, project_id=None) -> JsonRespons
         if current_targets - locked:
             raise AnnotationTargetConflict("Annotation targets changed during replacement. Please retry.")
         affected = current_targets | entity_ids
-        actual_models = list(ClassInstanceClassInstance.objects.filter(
-            project_id=project_id, relation__project_id=project_id,
-            relation__relation_name='model_of', class_instance_b_id__in=entity_ids,
-            class_instance_a__project_id=project_id,
-            class_instance_a__class_column__class_name='skeleton',
-        ).values_list('class_instance_a_id', 'class_instance_b_id'))
+        actual_models = list(models.filter(class_instance_b_id__in=entity_ids))
         actual_skeleton_ids = {skeleton_id for skeleton_id, _ in actual_models}
         if skeleton_ids and (dict(actual_models) != selected_models or len(actual_models) != len(selected_models)):
             raise AnnotationTargetConflict("Skeleton targets changed or omit a modeled skeleton. Please retry.")

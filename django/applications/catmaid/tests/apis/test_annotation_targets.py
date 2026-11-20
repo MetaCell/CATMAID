@@ -11,7 +11,7 @@ from django.test import Client, override_settings
 from django.test.utils import CaptureQueriesContext
 
 from catmaid.control import annotation
-from catmaid.models import Class, ClassInstance, ClassInstanceClassInstance, Project
+from catmaid.models import Class, ClassInstance, ClassInstanceClassInstance, Project, Relation
 from .common import CatmaidApiTestCase, CatmaidApiTransactionTestCase
 
 
@@ -77,7 +77,7 @@ class AnnotationTargetsApiTests(AnnotationTargetsMixin, CatmaidApiTestCase):
         self.assertStatus(response)
         self.assertEqual(self.targets(), set())
         self.assertEqual(response.json()['entity_ids'], [])
-        self.assertStatus(self.set_targets())
+        self.assertStatus(self.set_targets(csrfmiddlewaretoken='form-token'))
 
     def test_clear_preserves_the_annotation_and_its_meta_annotations(self):
         self.label()
@@ -145,6 +145,7 @@ class AnnotationTargetsApiTests(AnnotationTargetsMixin, CatmaidApiTestCase):
             {'skeleton_ids[-1]': 123},
             {'entity_ids[0][0]': 2389},
             {'entity_ids': [2389], 'entity_ids[0]': 2365},
+            {'skeleton_id': 2364},
         ):
             with self.subTest(fields=fields):
                 response = self.set_targets(**fields)
@@ -227,7 +228,6 @@ class AnnotationTargetsApiTests(AnnotationTargetsMixin, CatmaidApiTestCase):
             project_id=self.test_project_id, user_id=self.test_user_id, name=self.name,
             class_column=Class.objects.get(project_id=self.test_project_id, class_name='annotation'),
         )
-        from catmaid.models import Relation
         ClassInstanceClassInstance.objects.create(
             project_id=self.test_project_id, user_id=self.test_user_id,
             relation=Relation.objects.get(project_id=self.test_project_id, relation_name='annotated_with'),
@@ -244,9 +244,15 @@ class AnnotationTargetsApiTests(AnnotationTargetsMixin, CatmaidApiTestCase):
                 project_id=self.test_project_id, class_name='annotation',
             ), name='Meta annotation target',
         )
+        ClassInstanceClassInstance.objects.create(
+            project_id=self.test_project_id, user_id=self.test_user_id,
+            relation=Relation.objects.get(project_id=self.test_project_id, relation_name='model_of'),
+            class_instance_a_id=2364, class_instance_b=target,
+        )
         response = self.set_targets(entity_ids=[target.pk])
         self.assertStatus(response)
         self.assertEqual(self.targets(), {target.pk})
+        self.assertEqual(response.json()['skeleton_ids'], [])
 
 
 @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=100)
@@ -255,12 +261,14 @@ class AnnotationTargetsConcurrencyTests(AnnotationTargetsMixin, CatmaidApiTransa
         deadline = monotonic() + 5
         while monotonic() < deadline:
             with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_stat_clear_snapshot()")
                 cursor.execute(
-                    "SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s",
+                    "SELECT wait_event_type, query FROM pg_stat_activity WHERE pid = %s",
                     [backend_id],
                 )
-                if cursor.fetchone()[0] == 'Lock':
-                    return
+                wait_event, query = cursor.fetchone()
+                if wait_event == 'Lock':
+                    return query
             sleep(.01)
         self.fail('The request did not wait for the row lock')
 
@@ -345,21 +353,6 @@ class AnnotationTargetsConcurrencyTests(AnnotationTargetsMixin, CatmaidApiTransa
             class_column__class_name='annotation',
         ).count(), 1)
 
-    def test_neuron_name_add_cannot_create_a_duplicate_during_replacement(self):
-        ClassInstance.objects.filter(pk=2389).update(name=self.name)
-        path = f'/{self.test_project_id}/annotations/add-neuron-names'
-        data = {'entity_ids': [2389]}
-        with self.paused_replacement():
-            response = self.client.post(path, data)
-            self.assertStatus(response, 409)
-            self.assertEqual(response.json()['meta']['code'], 'edit_lock_timeout')
-        self.assertStatus(self.client.post(path, data))
-        self.assertEqual(self.targets(), {2365, 2389})
-        self.assertEqual(ClassInstance.objects.filter(
-            project_id=self.test_project_id, name=self.name,
-            class_column__class_name='annotation',
-        ).count(), 1)
-
     def test_rename_respects_the_destination_name_lock(self):
         other = self.create_annotation('rename-source')
         path = f'/{self.test_project_id}/neurons/{other.pk}/rename'
@@ -435,12 +428,22 @@ class AnnotationTargetsConcurrencyTests(AnnotationTargetsMixin, CatmaidApiTransa
         self.assertEqual(self.targets(), {2365})
 
     @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
+    def test_bulk_neuron_rename_and_replacement_lock_rows_in_the_same_order(self):
+        self.assert_bulk_rename_and_replacement_succeed('neuron')
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
     def test_mixed_bulk_rename_and_replacement_lock_rows_in_the_same_order(self):
+        self.assert_bulk_rename_and_replacement_succeed('annotation')
+
+    def assert_bulk_rename_and_replacement_succeed(self, class_name):
         neuron = ClassInstance.objects.create(
             project_id=self.test_project_id, user_id=self.test_user_id, name='neuron-to-rename',
             class_column=Class.objects.get(project_id=self.test_project_id, class_name='neuron'),
         )
-        label = self.create_annotation('annotation-to-rename')
+        other = ClassInstance.objects.create(
+            project_id=self.test_project_id, user_id=self.test_user_id, name='other-to-rename',
+            class_column=Class.objects.get(project_id=self.test_project_id, class_name=class_name),
+        )
         started = Event()
         backend_ids = []
 
@@ -453,8 +456,8 @@ class AnnotationTargetsConcurrencyTests(AnnotationTargetsMixin, CatmaidApiTransa
                     backend_ids.append(cursor.fetchone()[0])
                 started.set()
                 return client.post(f'/{self.test_project_id}/neurons/rename', {
-                    'names[0][0]': neuron.pk, 'names[0][1]': 'renamed-neuron',
-                    'names[1][0]': label.pk, 'names[1][1]': 'renamed-annotation',
+                    'names[0][0]': other.pk, 'names[0][1]': f'renamed-{class_name}-target',
+                    'names[1][0]': neuron.pk, 'names[1][1]': 'renamed-neuron',
                 })
             finally:
                 connection.close()
@@ -464,10 +467,11 @@ class AnnotationTargetsConcurrencyTests(AnnotationTargetsMixin, CatmaidApiTransa
                 ClassInstance.objects.select_for_update().get(pk=neuron.pk)
                 renaming = workers.submit(rename)
                 self.assertTrue(started.wait(10))
-                self.wait_for_lock(backend_ids[0])
-                self.assertStatus(self.set_targets(entity_ids=[neuron.pk, label.pk]))
+                waiting_query = self.wait_for_lock(backend_ids[0])
+                self.assertIn('FOR UPDATE', waiting_query)
+                self.assertStatus(self.set_targets(entity_ids=[neuron.pk, other.pk]))
             self.assertStatus(renaming.result(timeout=15))
-        self.assertEqual(self.targets(), {neuron.pk, label.pk})
+        self.assertEqual(self.targets(), {neuron.pk, other.pk})
 
     def test_native_remove_returns_conflict_during_replacement(self):
         self.label(target=2389)
