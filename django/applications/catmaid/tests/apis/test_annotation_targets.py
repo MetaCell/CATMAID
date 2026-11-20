@@ -1,11 +1,14 @@
 """Atomic replacement of one annotation's complete target set."""
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from threading import Event, Thread
+from threading import Barrier, Event, Thread
+from time import monotonic, sleep
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.db import close_old_connections, connection, connections, transaction
 from django.test import Client, override_settings
+from django.test.utils import CaptureQueriesContext
 
 from catmaid.control import annotation
 from catmaid.models import Class, ClassInstance, ClassInstanceClassInstance, Project
@@ -23,6 +26,12 @@ class AnnotationTargetsMixin:
         annotation._annotate_entities(self.test_project_id, [target], {
             self.name: {'user_id': user_id or self.test_user_id},
         })
+
+    def create_annotation(self, name):
+        return ClassInstance.objects.create(
+            project_id=self.test_project_id, user_id=self.test_user_id, name=name,
+            class_column=Class.objects.get(project_id=self.test_project_id, class_name='annotation'),
+        )
 
     def targets(self):
         return set(ClassInstanceClassInstance.objects.filter(
@@ -69,6 +78,57 @@ class AnnotationTargetsApiTests(AnnotationTargetsMixin, CatmaidApiTestCase):
         self.assertEqual(self.targets(), set())
         self.assertEqual(response.json()['entity_ids'], [])
         self.assertStatus(self.set_targets())
+
+    def test_clear_preserves_the_annotation_and_its_meta_annotations(self):
+        self.label()
+        label = ClassInstance.objects.get(project_id=self.test_project_id, name=self.name)
+        annotation._annotate_entities(self.test_project_id, [label.pk], {
+            'meta-annotation': {'user_id': self.test_user_id},
+        })
+        self.assertStatus(self.set_targets())
+        self.assertEqual(self.targets(), set())
+        self.assertTrue(ClassInstance.objects.filter(pk=label.pk).exists())
+        self.assertTrue(ClassInstanceClassInstance.objects.filter(
+            class_instance_a=label, class_instance_b__name='meta-annotation',
+        ).exists())
+
+    def test_annotation_rename_routes_reject_existing_destination(self):
+        self.label()
+        other = self.create_annotation('another-annotation')
+        project = self.test_project_id
+        for path, data in (
+            (f'neurons/{other.pk}/rename', {'name': self.name}),
+            ('neurons/rename', {'names[0][0]': other.pk, 'names[0][1]': self.name}),
+            (f'classification/{project}/instance-operation',
+             {'operation': 'rename_node', 'id': other.pk, 'title': self.name}),
+        ):
+            with self.subTest(path=path), transaction.atomic():
+                response = self.client.post(f'/{project}/{path}', data)
+                self.assertStatus(response, 409)
+                other.refresh_from_db()
+                self.assertEqual(other.name, 'another-annotation')
+                self.assertStatus(self.set_targets(entity_ids=[2365]))
+
+    def test_bulk_annotation_rename_can_swap_names(self):
+        first = self.create_annotation('label-one')
+        second = self.create_annotation('label-two')
+        response = self.client.post(f'/{self.test_project_id}/neurons/rename', {
+            'names[0][0]': first.pk, 'names[0][1]': second.name,
+            'names[1][0]': second.pk, 'names[1][1]': first.name,
+        })
+        self.assertStatus(response)
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual((first.name, second.name), ('label-two', 'label-one'))
+
+    def test_unlocked_targets_use_one_query_for_edit_locks(self):
+        with CaptureQueriesContext(connection) as queries:
+            self.assertStatus(self.set_targets(entity_ids=[2365, 2389]))
+        lock_queries = [
+            query['sql'] for query in queries
+            if "'locked'" in query['sql'] and 'class_instance_class_instance' in query['sql']
+        ]
+        self.assertEqual(len(lock_queries), 1)
 
     def test_bracketed_target_lists_are_supported(self):
         for fields in (
@@ -191,6 +251,19 @@ class AnnotationTargetsApiTests(AnnotationTargetsMixin, CatmaidApiTestCase):
 
 @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=100)
 class AnnotationTargetsConcurrencyTests(AnnotationTargetsMixin, CatmaidApiTransactionTestCase):
+    def wait_for_lock(self, backend_id):
+        deadline = monotonic() + 5
+        while monotonic() < deadline:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s",
+                    [backend_id],
+                )
+                if cursor.fetchone()[0] == 'Lock':
+                    return
+            sleep(.01)
+        self.fail('The request did not wait for the row lock')
+
     @contextmanager
     def paused_replacement(self):
         ready, release = Event(), Event()
@@ -287,6 +360,115 @@ class AnnotationTargetsConcurrencyTests(AnnotationTargetsMixin, CatmaidApiTransa
             class_column__class_name='annotation',
         ).count(), 1)
 
+    def test_rename_respects_the_destination_name_lock(self):
+        other = self.create_annotation('rename-source')
+        path = f'/{self.test_project_id}/neurons/{other.pk}/rename'
+        with self.paused_replacement():
+            response = self.client.post(path, {'name': self.name})
+            self.assertStatus(response, 409)
+            self.assertEqual(response.json()['meta']['code'], 'edit_lock_timeout')
+        self.assertStatus(self.client.post(path, {'name': self.name}), 409)
+        self.assertStatus(self.client.post(path, {'name': 'available-name'}))
+        other.refresh_from_db()
+        self.assertEqual(other.name, 'available-name')
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
+    def test_crossed_meta_annotation_replacements_do_not_deadlock(self):
+        first = self.create_annotation(self.name)
+        second = self.create_annotation('another-annotation')
+        ready_to_lock = Barrier(2)
+
+        def replace(source, target):
+            try:
+                client = Client()
+                client.force_login(get_user_model().objects.get(pk=self.test_user_id))
+
+                def wait_for_other_request(execute, sql, params, many, context):
+                    if ('FOR UPDATE' in sql and 'ORDER BY' in sql
+                            and '"class_instance"."id" IN' in sql):
+                        ready_to_lock.wait(timeout=8)
+                    return execute(sql, params, many, context)
+
+                with connection.execute_wrapper(wait_for_other_request):
+                    return client.post(f'/{self.test_project_id}/annotations/set-targets', {
+                        'annotation': source.name, 'entity_ids': [target.pk],
+                    })
+            finally:
+                connection.close()
+
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            forward = workers.submit(replace, first, second)
+            reverse = workers.submit(replace, second, first)
+            self.assertStatus(forward.result(timeout=15))
+            self.assertStatus(reverse.result(timeout=15))
+        self.assertEqual(self.targets(), {second.pk})
+        self.assertTrue(ClassInstanceClassInstance.objects.filter(
+            class_instance_a=first, class_instance_b=second,
+        ).exists())
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=15000)
+    def test_replacement_returns_conflict_if_an_existing_link_is_locked(self):
+        self.label()
+        started = Event()
+
+        def replace():
+            try:
+                client = Client()
+                client.force_login(get_user_model().objects.get(pk=self.test_user_id))
+                started.set()
+                return client.post(f'/{self.test_project_id}/annotations/set-targets', {
+                    'annotation': self.name, 'entity_ids': [2389],
+                })
+            finally:
+                connection.close()
+
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            with transaction.atomic():
+                ClassInstanceClassInstance.objects.select_for_update(of=('self',)).get(
+                    class_instance_a_id=2365, class_instance_b__name=self.name,
+                )
+                pending = workers.submit(replace)
+                self.assertTrue(started.wait(10))
+                response = pending.result(timeout=5)
+                self.assertStatus(response, 409)
+                self.assertEqual(response.json()['meta']['code'], 'edit_lock_timeout')
+        self.assertEqual(self.targets(), {2365})
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
+    def test_mixed_bulk_rename_and_replacement_lock_rows_in_the_same_order(self):
+        neuron = ClassInstance.objects.create(
+            project_id=self.test_project_id, user_id=self.test_user_id, name='neuron-to-rename',
+            class_column=Class.objects.get(project_id=self.test_project_id, class_name='neuron'),
+        )
+        label = self.create_annotation('annotation-to-rename')
+        started = Event()
+        backend_ids = []
+
+        def rename():
+            try:
+                client = Client()
+                client.force_login(get_user_model().objects.get(pk=self.test_user_id))
+                with connection.cursor() as cursor:
+                    cursor.execute('SELECT pg_backend_pid()')
+                    backend_ids.append(cursor.fetchone()[0])
+                started.set()
+                return client.post(f'/{self.test_project_id}/neurons/rename', {
+                    'names[0][0]': neuron.pk, 'names[0][1]': 'renamed-neuron',
+                    'names[1][0]': label.pk, 'names[1][1]': 'renamed-annotation',
+                })
+            finally:
+                connection.close()
+
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            with transaction.atomic():
+                ClassInstance.objects.select_for_update().get(pk=neuron.pk)
+                renaming = workers.submit(rename)
+                self.assertTrue(started.wait(10))
+                self.wait_for_lock(backend_ids[0])
+                self.assertStatus(self.set_targets(entity_ids=[neuron.pk, label.pk]))
+            self.assertStatus(renaming.result(timeout=15))
+        self.assertEqual(self.targets(), {neuron.pk, label.pk})
+
     def test_native_remove_returns_conflict_during_replacement(self):
         self.label(target=2389)
         label = ClassInstance.objects.get(
@@ -307,8 +489,6 @@ class AnnotationTargetsConcurrencyTests(AnnotationTargetsMixin, CatmaidApiTransa
 
     @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
     def test_skeleton_mapping_is_rechecked_after_waiting_for_the_neuron(self):
-        from time import monotonic, sleep
-
         model = ClassInstanceClassInstance.objects.get(
             project_id=self.test_project_id, relation__relation_name='model_of',
             class_instance_b_id=2365,
@@ -340,18 +520,7 @@ class AnnotationTargetsConcurrencyTests(AnnotationTargetsMixin, CatmaidApiTransa
             worker.start()
             self.addCleanup(worker.join, 10)
             self.assertTrue(started.wait(10))
-            deadline = monotonic() + 5
-            while monotonic() < deadline:
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s",
-                        [backend_ids[0]],
-                    )
-                    if cursor.fetchone()[0] == 'Lock':
-                        break
-                sleep(.01)
-            else:
-                self.fail('The replacement did not wait for the neuron lock')
+            self.wait_for_lock(backend_ids[0])
             ClassInstanceClassInstance.objects.filter(pk=model.pk).update(
                 class_instance_b_id=2389,
             )

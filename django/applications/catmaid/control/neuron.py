@@ -13,6 +13,7 @@ from django.db import connection, transaction
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 
+from catmaid.control.annotation import lock_annotation_renames
 from catmaid.control.authentication import requires_user_role, \
         can_edit_class_instance_or_fail, can_edit_all_or_fail
 from catmaid.control.common import insert_into_log, get_request_list, \
@@ -326,6 +327,7 @@ def give_neuron_to_other_user(request:HttpRequest, project_id=None, neuron_id=No
 
 @api_view(['POST'])
 @requires_user_role(UserRole.Annotate)
+@transaction.atomic
 def rename_neuron(request:HttpRequest, project_id=None, neuron_id=None) -> JsonResponse:
     """Rename a neuron.
 
@@ -372,6 +374,7 @@ def rename_neuron(request:HttpRequest, project_id=None, neuron_id=None) -> JsonR
     # Legacy rename routes accept ClassInstance IDs, including annotations.
     # Inspect the actual class so they cannot rename protected source objects.
     reject_reserved_annotation_rename(neuron, new_name)
+    lock_annotation_renames(neuron.project_id, [(neuron, new_name)])
     old_name = neuron.name
     neuron.name=new_name
     neuron.save()
@@ -389,6 +392,7 @@ def rename_neuron(request:HttpRequest, project_id=None, neuron_id=None) -> JsonR
 
 @api_view(['POST'])
 @requires_user_role(UserRole.Annotate)
+@transaction.atomic
 def rename_neurons(request:HttpRequest, project_id=None) -> JsonResponse:
     """Rename a neuron.
 
@@ -435,6 +439,10 @@ def rename_neurons(request:HttpRequest, project_id=None) -> JsonResponse:
         if '|' in new_name:
             raise ValueError('New name should not contain pipe character')
 
+    lock_annotation_renames(project_id, (
+        (candidates.get(neuron_id), new_name)
+        for neuron_id, new_name in zip(neuron_ids, neuron_names)
+    ))
     cursor = connection.cursor()
     cursor.execute("""
         UPDATE class_instance ci

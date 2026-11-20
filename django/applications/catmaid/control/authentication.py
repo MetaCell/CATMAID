@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+from contextvars import ContextVar
 from functools import wraps
 from itertools import groupby
 import json
@@ -482,6 +483,36 @@ def get_object_permissions(request:HttpRequest, ci_id) -> JsonResponse:
 
     return JsonResponse(permissions)
 
+_known_editable_class_instances = ContextVar('known_editable_class_instances', default=None)
+
+
+def _class_instance_locks(user):
+    return ClassInstanceClassInstance.objects.filter(
+        relation__relation_name='annotated_with', class_instance_b__name='locked',
+    ).exclude(user=user)
+
+
+def can_edit_class_instances_or_fail(user, existing_ids: Set[int]) -> None:
+    """Check edit permission for class instances the caller has already locked."""
+    if not existing_ids:
+        return
+
+    locked_by_others = set()
+    if not user.is_superuser:
+        locked_by_others = set(_class_instance_locks(user).filter(
+            class_instance_a_id__in=existing_ids,
+        ).values_list('class_instance_a_id', flat=True).distinct())
+
+    # Keep calling the public check so deployments that wrap it can enforce
+    # their policy. The native check can skip queries for already cleared IDs.
+    token = _known_editable_class_instances.set((user.pk, existing_ids - locked_by_others))
+    try:
+        for ci_id in sorted(existing_ids):
+            can_edit_class_instance_or_fail(user, ci_id)
+    finally:
+        _known_editable_class_instances.reset(token)
+
+
 def can_edit_class_instance_or_fail(user, ci_id, name='object') -> bool:
     """ Returns true if a) the class instance is not locked or b) if the class
     instance is locked and the the user owns the link to the 'locked' annotation
@@ -490,16 +521,16 @@ def can_edit_class_instance_or_fail(user, ci_id, name='object') -> bool:
     and is only used in messages returned to the user.
     """
     ci_id = int(ci_id)
+    known = _known_editable_class_instances.get()
+    if known is not None and known[0] == user.pk and ci_id in known[1]:
+        return True
     # Check if the class instance exists at all
     if ClassInstance.objects.filter(id=ci_id).exists():
         # Implicit: a super user belongs to all users' groups
         if user.is_superuser:
             return True
         # Check if the class instance is locked by other users
-        locked_by_other = ClassInstanceClassInstance.objects.filter(
-                class_instance_a__id=ci_id,
-                relation__relation_name = 'annotated_with',
-                class_instance_b__name='locked').exclude(user=user)
+        locked_by_other = _class_instance_locks(user).filter(class_instance_a_id=ci_id)
         if bool(locked_by_other):
             # Check if the user belongs to a group with the name of the owner
             if user_can_edit(connection.cursor(), user.id,

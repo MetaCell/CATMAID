@@ -8,7 +8,7 @@ from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple, Union
 
 
 from django import forms
-from django.db import connection
+from django.db import connection, transaction
 from django.db.models import Q
 from django.conf import settings
 from django.forms.widgets import CheckboxSelectMultiple
@@ -19,6 +19,7 @@ from django.contrib.contenttypes.models import ContentType
 
 from formtools.wizard.views import SessionWizardView
 
+from catmaid.control.annotation import lock_annotation_renames
 from catmaid.control.common import get_class_to_id_map, \
         get_relation_to_id_map, insert_into_log, get_request_bool
 from catmaid.control.ontology import get_class_links_qs, get_features
@@ -850,6 +851,7 @@ def _reject_reserved_classification_subtree(root_id):
 
 
 @requires_user_role(UserRole.Annotate)
+@transaction.atomic
 def classification_instance_operation(request:HttpRequest, workspace_pid=None, project_id=None) -> JsonResponse:
     workspace_pid = int(workspace_pid)
     params = {}
@@ -882,6 +884,7 @@ def classification_instance_operation(request:HttpRequest, workspace_pid=None, p
         if node:
             if params['operation'] == 'rename_node':
                 reject_reserved_annotation_rename(node, params['title'])
+                lock_annotation_renames(node.project_id, [(node, params['title'])])
             elif params['rel'] == 'element':
                 _reject_reserved_classification_subtree(node.id)
             else:

@@ -15,7 +15,9 @@ from rest_framework.decorators import api_view
 
 from catmaid.models import UserRole, Project, Class, ClassInstance, \
         ClassInstanceClassInstance, Relation, ReviewerWhitelist
-from catmaid.control.authentication import requires_user_role, can_edit_or_fail, can_edit_class_instance_or_fail, PermissionError
+from catmaid.control.authentication import (
+    PermissionError, can_edit_class_instances_or_fail, can_edit_or_fail, requires_user_role,
+)
 from catmaid.error import ClientError
 from catmaid.locks import SkeletonEditLockTimeout, skeleton_edit_lock_timeout
 from catmaid.neuroglass_tasks import (
@@ -43,6 +45,48 @@ def _lock_annotation_names(project_id, names, *, wait=True):
         """, [keys])
         if not wait and not all(acquired for acquired, in cursor.fetchall()):
             raise SkeletonEditLockTimeout("The annotation is being updated. Please retry.")
+
+
+class AnnotationTargetConflict(ClientError):
+    status_code = 409
+
+
+def lock_annotation_renames(project_id, renames):
+    """Hold old and new names through a rename and reject duplicate destinations."""
+    project_id = int(project_id)
+    annotation_renames = {}
+    instance_ids = set()
+    for instance, new_name in renames:
+        if instance is None or instance.project_id != project_id:
+            continue
+        instance_ids.add(instance.pk)
+        if instance.class_column.class_name != 'annotation':
+            continue
+        if instance.pk in annotation_renames:
+            raise ValueError("Each annotation can be renamed only once per request")
+        annotation_renames[instance.pk] = (instance.name, str(new_name))
+    if not annotation_renames:
+        return
+
+    old_names = {pk: old for pk, (old, _) in annotation_renames.items()}
+    destinations = {pk: new for pk, (old, new) in annotation_renames.items() if old != new}
+    new_names = set(destinations.values())
+    if len(new_names) != len(destinations):
+        raise AnnotationTargetConflict("Annotation names must be unique within the project")
+
+    _lock_annotation_names(project_id, set(old_names.values()) | new_names, wait=False)
+    annotations = ClassInstance.objects.filter(
+        project_id=project_id, class_column__class_name='annotation',
+    )
+    # Bulk renames may also update neurons. Lock every affected row in the
+    # same order as target replacement.
+    locked_names = dict(ClassInstance.objects.select_for_update(of=('self',)).filter(
+        project_id=project_id, pk__in=instance_ids,
+    ).order_by('id').values_list('pk', 'name'))
+    if any(locked_names.get(pk) != old_name for pk, old_name in old_names.items()):
+        raise AnnotationTargetConflict("An annotation changed during rename. Please retry.")
+    if annotations.filter(name__in=new_names).exclude(pk__in=destinations).exists():
+        raise AnnotationTargetConflict("An annotation already uses the new name")
 
 
 def get_annotation_to_id_map(project_id:Union[int,str], annotations:List, relations=None,
@@ -1230,29 +1274,36 @@ def _remove_annotation(user, project_id:Union[int,str], entity_ids, annotation_i
     (because it wasn't used anymore) and how many uses of this annotation are
     left.
     """
-    annotation_name = ClassInstance.objects.filter(
+    annotation_names = ClassInstance.objects.filter(
         project_id=project_id, pk=annotation_id,
-    ).values_list('name', flat=True).first()
+    ).values_list('name', flat=True)
+    annotation_name = annotation_names.first()
     if annotation_name is not None:
         # Replacement takes this lock before locking the annotation and its links.
         _lock_annotation_names(project_id, [annotation_name], wait=False)
+        if annotation_names.first() != annotation_name:
+            raise AnnotationTargetConflict("The annotation changed during removal. Please retry.")
     if is_task_annotation(annotation_name):
         entity_ids = list(entity_ids)
         lock_task_annotation_targets(project_id, entity_ids)
-    return _remove_annotation_links(user, project_id, entity_ids, annotation_id)
+
+    removed, missed = _remove_annotation_links(user, project_id, entity_ids, annotation_id)
+    annotated_with = Relation.objects.get(project_id=project_id, relation_name='annotated_with')
+    deleted, num_left = delete_annotation_if_unused(project_id, annotation_id, annotated_with)
+    return removed, missed, deleted, num_left
 
 
 def _remove_annotation_links(user, project_id:Union[int,str], entity_ids,
-        annotation_id) -> Tuple[List, List, int, int]:
+        annotation_id) -> Tuple[List, List]:
+    """Remove permitted links to an annotation, leaving the annotation in place."""
     reject_reserved_annotations(project_id, [annotation_id])
     reject_reserved_annotations(project_id, entity_ids)
     p = get_object_or_404(Project, pk=project_id)
-    relations = dict(Relation.objects.filter(
-        project_id=project_id).values_list('relation_name', 'id'))
+    annotated_with = Relation.objects.get(project_id=project_id, relation_name='annotated_with')
 
     # Get CICI instance representing the link
     cici_n_a = ClassInstanceClassInstance.objects.filter(project=p,
-            relation_id=relations['annotated_with'],
+            relation=annotated_with,
             class_instance_a__id__in=entity_ids,
             class_instance_b__id=annotation_id)
     # Make sure the current user has permissions to remove the annotation.
@@ -1273,14 +1324,7 @@ def _remove_annotation_links(user, project_id:Union[int,str], entity_ids,
                 .filter(id__in=[cici.id for cici in cicis_to_delete]) \
                 .delete()
 
-    # Remove the annotation class instance, regardless of the owner, if there
-    # are no more links to it
-    annotated_with = Relation.objects.get(project_id=project_id,
-            relation_name='annotated_with')
-    deleted, num_left = delete_annotation_if_unused(project_id, annotation_id,
-                                                    annotated_with)
-
-    return cicis_to_delete, missed_cicis, deleted, num_left
+    return cicis_to_delete, missed_cicis
 
 def _get_annotation_target_ids(post: QueryDict, field: str) -> Set[int]:
     """Read a flat CATMAID form list without discarding invalid target fields."""
@@ -1296,19 +1340,16 @@ def _get_annotation_target_ids(post: QueryDict, field: str) -> Set[int]:
     raise ValueError(f'Provide one flat list for {field}')
 
 
-class AnnotationTargetConflict(ClientError):
-    status_code = 409
-
-
 @api_view(['POST'])
 @requires_user_role(UserRole.Annotate)
 @transaction.atomic
 def set_annotation_targets(request: HttpRequest, project_id=None) -> JsonResponse:
     """Set one exact annotation's complete targets in a single transaction.
 
-    POST annotation plus either entity_ids or skeleton_ids; omit both to clear
-    its links. Skeleton IDs resolve to neurons and must include all skeletons
-    of those neurons. Existing links retain their annotators. The response
+    POST annotation plus either entity_ids or skeleton_ids. Omit both to clear
+    the targets and retain the annotation and any meta-annotations assigned to it.
+    Skeleton IDs resolve to neurons and must include all skeletons of those
+    neurons. Existing links retain their annotators. The response
     contains annotation, entity_ids and skeleton_ids for the resulting targets.
     Numbered annotation templates and reserved source-fragment records are
     excluded. Concurrent replacements use the shared skeleton edit timeout.
@@ -1350,7 +1391,7 @@ def set_annotation_targets(request: HttpRequest, project_id=None) -> JsonRespons
     with connection.cursor() as cursor, skeleton_edit_lock_timeout(cursor):
         # A name lock also serializes first use, when there is no annotation row.
         _lock_annotation_names(project_id, [name])
-        annotations = list(ClassInstance.objects.select_for_update(of=('self',)).filter(
+        annotations = list(ClassInstance.objects.filter(
             project_id=project_id, class_column__class_name='annotation', name=name,
         )[:2])
         if len(annotations) > 1:
@@ -1361,15 +1402,30 @@ def set_annotation_targets(request: HttpRequest, project_id=None) -> JsonRespons
                 project_id=project_id, user=request.user, name=name,
                 class_column=Class.objects.get(project_id=project_id, class_name='annotation'),
             )
-        current_targets = set(ClassInstanceClassInstance.objects.select_for_update().filter(
-            project_id=project_id, relation=annotated_with, class_instance_b=annotation,
-        ).values_list('class_instance_a_id', flat=True)) if annotation is not None else set()
-        affected = current_targets | entity_ids
+        links = ClassInstanceClassInstance.objects.none()
+        instances_to_lock = entity_ids.copy()
+        if annotation is not None:
+            links = ClassInstanceClassInstance.objects.filter(
+                project_id=project_id, relation=annotated_with, class_instance_b=annotation,
+            )
+            instances_to_lock.add(annotation.pk)
+            instances_to_lock.update(links.values_list('class_instance_a_id', flat=True))
+
+        # Annotations can also be targets. Lock all class instances in ID order
+        # before locking links to avoid cycles between different annotations.
         locked = set(ClassInstance.objects.select_for_update(of=('self',)).filter(
-            project_id=project_id, class_column__project_id=project_id, id__in=affected,
+            project_id=project_id, class_column__project_id=project_id, id__in=instances_to_lock,
         ).order_by('id').values_list('id', flat=True))
-        if locked != affected:
-            raise Http404("An annotation target does not exist in this project")
+        if locked != instances_to_lock:
+            raise Http404("An annotation or target does not exist in this project")
+        # A cascading deletion can hold a link before acquiring its target
+        # row. Return a retryable conflict if any link is locked.
+        current_targets = set(links.select_for_update(nowait=True).order_by('id').values_list(
+            'class_instance_a_id', flat=True,
+        ))
+        if current_targets - locked:
+            raise AnnotationTargetConflict("Annotation targets changed during replacement. Please retry.")
+        affected = current_targets | entity_ids
         actual_models = list(ClassInstanceClassInstance.objects.filter(
             project_id=project_id, relation__project_id=project_id,
             relation__relation_name='model_of', class_instance_b_id__in=entity_ids,
@@ -1380,8 +1436,7 @@ def set_annotation_targets(request: HttpRequest, project_id=None) -> JsonRespons
         if skeleton_ids and (dict(actual_models) != selected_models or len(actual_models) != len(selected_models)):
             raise AnnotationTargetConflict("Skeleton targets changed or omit a modeled skeleton. Please retry.")
         reject_reserved_annotations(project_id, affected)
-        for target in sorted(affected):
-            can_edit_class_instance_or_fail(request.user, target)
+        can_edit_class_instances_or_fail(request.user, affected)
 
         # NeuroGlass checks the full requested set at the write helper.
         if entity_ids:
@@ -1390,7 +1445,7 @@ def set_annotation_targets(request: HttpRequest, project_id=None) -> JsonRespons
             }, existing_targets=current_targets)
         to_remove = current_targets - entity_ids
         if to_remove:
-            _, missed, _, _ = _remove_annotation_links(
+            _, missed = _remove_annotation_links(
                 request.user, project_id, sorted(to_remove), annotation.id)
             if missed:
                 raise PermissionError("Some annotation links cannot be removed by this user")
