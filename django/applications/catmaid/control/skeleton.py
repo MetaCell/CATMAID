@@ -2323,10 +2323,32 @@ def _reroot_skeleton_locked(treenode_id, project_id, skeleton_id):
         if first_parent is None:
             return False
 
-        q_treenode = Treenode.objects.filter(
-                skeleton_id=rootnode.skeleton_id,
-                project=project_id).values_list('id', 'parent_id', 'confidence')
-        nodes = {tnid: (parent_id, confidence) for (tnid, parent_id, confidence) in list(q_treenode)}
+        # Native insertion locks its parent row without taking our advisory lock.
+        # An insertion committed during a lock wait can introduce more nodes:
+        # repeat until every node in the fresh graph is covered by our locks.
+        while True:
+            with connection.cursor() as cursor, skeleton_edit_lock_timeout(cursor):
+                cursor.execute('''
+                    SELECT t.id FROM treenode t
+                    WHERE t.project_id = %s AND t.skeleton_id = %s
+                    ORDER BY t.id
+                    FOR NO KEY UPDATE OF t
+                ''', [int(project_id), skeleton_id])
+                locked_node_ids = {row[0] for row in cursor.fetchall()}
+
+            nodes = {node_id: (parent_id, confidence)
+                    for node_id, parent_id, confidence in Treenode.objects.filter(
+                        skeleton_id=skeleton_id, project=project_id).values_list(
+                            'id', 'parent_id', 'confidence')}
+            if nodes.keys() <= locked_node_ids:
+                break
+
+        rootnode.refresh_from_db()
+        if rootnode.skeleton_id != skeleton_id:
+            raise ValueError('The treenode changed skeletons during reroot, please retry')
+        first_parent = rootnode.parent_id
+        if first_parent is None:
+            return False
 
         # Make sure this skeleton is not used in a sampler
         samplers = Sampler.objects.prefetch_related('samplerdomain_set') \
@@ -2391,6 +2413,8 @@ def _reroot_skeleton_locked(treenode_id, project_id, skeleton_id):
 
         return rootnode
 
+    except (ClientError, ImproperlyConfigured):
+        raise
     except Exception as e:
         raise ValueError(f'{response_on_error}: {e}')
 

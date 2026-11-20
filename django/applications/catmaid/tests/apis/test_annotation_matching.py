@@ -4,6 +4,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from queue import Queue
+from threading import Event
 from time import monotonic, sleep
 from unittest.mock import patch
 
@@ -588,3 +589,208 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
         self.assertEqual(13, self.root(1))
         self.assertEqual(13, Treenode.objects.get(pk=7).parent_id)
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
+
+    def edge_insertion(self, parent_id, child_id):
+        parent = Treenode.objects.get(pk=parent_id)
+        child = Treenode.objects.get(pk=child_id)
+        return {
+            'parent_id': parent_id, 'child_id': child_id, 'state': make_nocheck_state(),
+            'x': (parent.location_x + child.location_x) / 2,
+            'y': (parent.location_y + child.location_y) / 2,
+            'z': (parent.location_z + child.location_z) / 2,
+        }
+
+    @contextmanager
+    def held_node_lock(self, node_id):
+        holder = connections['default'].copy(alias='reroot_node_holder')
+        try:
+            holder.set_autocommit(False)
+            with holder.cursor() as cursor:
+                cursor.execute('SELECT id FROM treenode WHERE id=%s FOR UPDATE', [node_id])
+            yield
+        finally:
+            holder.rollback()
+            holder.close()
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
+    def test_native_edge_insertion_waits_for_annotation_matching_reroot(self):
+        original_nodes = set(Treenode.objects.filter(skeleton_id=1).values_list('id', flat=True))
+        insertion = self.edge_insertion(7, 11)
+        native = Client()
+        native.cookies.update(self.client.cookies)
+        pending = []
+        blocked = []
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            def insert_before_parent_rewrite(execute, sql, params, many, context):
+                if 'UPDATE treenode' in sql and 'v.parent_id' in sql and not pending:
+                    waiting = self.overlapping_request(pool, lambda: native.post(
+                            '/%d/treenode/insert' % self.test_project_id, insertion))
+                    pending.append(waiting)
+                    blocked.append(not waiting.done())
+                return execute(sql, params, many, context)
+
+            with connection.execute_wrapper(insert_before_parent_rewrite):
+                response = self.post(self.change(self.annotation_a, 13))
+            self.assertStatus(response)
+            self.assertEqual(1, len(pending), 'The test did not overlap the native insertion')
+            inserted = pending[0].result(timeout=10)
+
+        self.assertTrue(blocked[0], 'Native insertion bypassed the reroot snapshot lock')
+        self.assertEqual(400, inserted.status_code, inserted.content)
+        self.assertIn('child and parent', inserted.json()['error'])
+        self.assertEqual(original_nodes,
+                set(Treenode.objects.filter(skeleton_id=1).values_list('id', flat=True)))
+        parents = dict(Treenode.objects.filter(skeleton_id=1).values_list('id', 'parent_id'))
+        self.assertIsNone(parents[13])
+        self.assertEqual(13, parents[11])
+        self.assertEqual(11, parents[7])
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
+    def test_reroot_reads_an_insertion_committed_during_node_lock_wait(self):
+        original_nodes = set(Treenode.objects.filter(skeleton_id=1).values_list('id', flat=True))
+        insertion = self.edge_insertion(7, 11)
+        change = self.change(self.annotation_a, 13)
+        matching = Client()
+        matching.cookies.update(self.client.cookies)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with transaction.atomic():
+                inserted = self.result(self.client.post(
+                        '/%d/treenode/insert' % self.test_project_id, insertion))['treenode_id']
+                waiting = self.overlapping_request(pool, lambda: self.post(change, client=matching))
+                self.assertFalse(waiting.done(), 'Reroot did not wait for native insertion')
+            response = waiting.result(timeout=10)
+
+        self.assertEqual({'skeleton_id': 1, 'root_id': 13}, self.result(response))
+        parents = dict(Treenode.objects.filter(skeleton_id=1).values_list('id', 'parent_id'))
+        self.assertEqual(original_nodes | {inserted}, set(parents))
+        self.assertIsNone(parents[13])
+        self.assertEqual(13, parents[11])
+        self.assertEqual(11, parents[inserted])
+        self.assertEqual(inserted, parents[7])
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
+    def test_native_reroot_refreshes_parent_after_insertion_commits(self):
+        original_nodes = set(Treenode.objects.filter(skeleton_id=1).values_list('id', flat=True))
+        insertion = self.edge_insertion(11, 13)
+        native = Client()
+        native.cookies.update(self.client.cookies)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with transaction.atomic():
+                inserted = self.result(self.client.post(
+                        '/%d/treenode/insert' % self.test_project_id, insertion))['treenode_id']
+                waiting = self.overlapping_request(pool, lambda: native.post(
+                        '/%d/skeleton/reroot' % self.test_project_id, {'treenode_id': 13}))
+                self.assertFalse(waiting.done(), 'Native reroot did not wait for insertion')
+            response = waiting.result(timeout=10)
+
+        self.assertStatus(response)
+        parents = dict(Treenode.objects.filter(skeleton_id=1).values_list('id', 'parent_id'))
+        self.assertEqual(original_nodes | {inserted}, set(parents))
+        self.assertIsNone(parents[13])
+        self.assertEqual(13, parents[inserted])
+        self.assertEqual(inserted, parents[11])
+        self.assertEqual(11, parents[7])
+        self.assertEqual(set(), self.neurons_with(self.annotation_a))
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=75)
+    def test_reroot_node_lock_timeout_rolls_back_annotation_and_parents(self):
+        parents = dict(Treenode.objects.filter(skeleton_id=1).values_list('id', 'parent_id'))
+        change = self.change(self.annotation_a, 13)
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT current_setting('lock_timeout')")
+            previous_timeout = cursor.fetchone()[0]
+            # Bound the unfixed UPDATE too, so this regression cannot hang.
+            cursor.execute("SELECT set_config('lock_timeout', '400ms', false)")
+        try:
+            with self.held_node_lock(7):
+                response = self.post(change)
+        finally:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT set_config('lock_timeout', %s, false)", [previous_timeout])
+
+        self.assertEqual(409, response.status_code, response.content)
+        self.assertEqual({'code': 'edit_lock_timeout'}, response.json()['meta'])
+        self.assertEqual(set(), self.neurons_with(self.annotation_a))
+        self.assertEqual(parents,
+                dict(Treenode.objects.filter(skeleton_id=1).values_list('id', 'parent_id')))
+        self.assertEqual(7, self.root(1))
+
+        self.assertEqual({'skeleton_id': 1, 'root_id': 13}, self.result(self.post(change)))
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
+    def test_reroot_locks_nodes_discovered_after_waiting_for_insertion(self):
+        original_nodes = set(Treenode.objects.filter(skeleton_id=1).values_list('id', flat=True))
+        insertion = self.edge_insertion(7, 11)
+        change = self.change(self.annotation_a, 13)
+        matching = Client()
+        matching.cookies.update(self.client.cookies)
+        native = Client()
+        native.cookies.update(self.client.cookies)
+        append_ready = Event()
+        release_append = Event()
+        appends = []
+        append_futures = []
+        inserted = None
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            def hold_native_append():
+                try:
+                    with transaction.atomic():
+                        response = native.post('/%d/treenode/create' % self.test_project_id, {
+                            'parent_id': inserted, 'state': make_nocheck_state(),
+                            'x': insertion['x'], 'y': insertion['y'] + 1, 'z': insertion['z'],
+                        })
+                        appends.append(response)
+                        append_ready.set()
+                        if not release_append.wait(timeout=10):
+                            raise RuntimeError('The test did not release the native append')
+                    return response
+                finally:
+                    connections['default'].close()
+
+            def append_at_fresh_graph_read(execute, sql, params, many, context):
+                if (not append_futures and sql.lstrip().startswith('SELECT')
+                        and 'FROM "treenode"' in sql and '"skeleton_id" =' in sql
+                        and '"parent_id"' in sql and '"confidence"' in sql):
+                    append_futures.append(pool.submit(hold_native_append))
+                    if not append_ready.wait(timeout=5):
+                        raise RuntimeError('Native append did not acquire the newly inserted node')
+                return execute(sql, params, many, context)
+
+            def match_while_append_holds_new_node():
+                # The unfixed final UPDATE must time out rather than hang.
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT set_config('lock_timeout', '1s', false)")
+                with connection.execute_wrapper(append_at_fresh_graph_read):
+                    return self.post(change, client=matching)
+
+            try:
+                with transaction.atomic():
+                    inserted = self.result(self.client.post(
+                            '/%d/treenode/insert' % self.test_project_id, insertion))['treenode_id']
+                    waiting = self.overlapping_request(pool, match_while_append_holds_new_node)
+                    self.assertFalse(waiting.done(), 'Reroot did not wait for the first insertion')
+                response = waiting.result(timeout=10)
+            finally:
+                release_append.set()
+                for future in append_futures:
+                    future.result(timeout=10)
+
+        self.assertEqual(1, len(appends), 'The test did not contend on the newly inserted node')
+        appended = self.result(appends[0])['treenode_id']
+        self.assertEqual(409, response.status_code, response.content)
+        self.assertEqual({'code': 'edit_lock_timeout'}, response.json()['meta'])
+        self.assertEqual(set(), self.neurons_with(self.annotation_a))
+        parents = dict(Treenode.objects.filter(skeleton_id=1).values_list('id', 'parent_id'))
+        self.assertEqual(original_nodes | {inserted, appended}, set(parents))
+        self.assertIsNone(parents[7])
+        self.assertEqual(7, parents[inserted])
+        self.assertEqual(inserted, parents[11])
+        self.assertEqual(11, parents[13])
+        self.assertEqual(inserted, parents[appended])
