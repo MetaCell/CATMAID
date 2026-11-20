@@ -17,7 +17,7 @@ import ujson
 
 from django.core.serializers.json import DjangoJSONEncoder
 from django.conf import settings
-from django.db import connection, connections, transaction
+from django.db import connection, connections
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
@@ -25,7 +25,6 @@ from django.shortcuts import get_object_or_404
 from rest_framework.decorators import api_view
 
 from catmaid import state
-from catmaid.locks import lock_skeleton_topology
 from catmaid.models import (ClassInstance, UserRole, Treenode,
         ClassInstanceClassInstance, Review, Project, User)
 from catmaid.control.authentication import requires_user_role, \
@@ -2945,29 +2944,16 @@ def _update_location(table, nodes, now, user, cursor):
 
 
 @requires_user_role(UserRole.Annotate)
-@transaction.atomic
 def node_update(request:HttpRequest, project_id=None) -> JsonResponse:
     treenodes = get_request_list(request.POST, "t") or []
     connectors = get_request_list(request.POST, "c") or []
-    request_state = request.POST.get('state')
-    node_ids = [int(node[0]) for node in treenodes + connectors]
-
-    if len(treenodes) > 1:
-        # A batch can lock a node that matching needs while waiting for the
-        # selected node. Serialize before either takes overlapping row locks.
-        treenode_ids = set(node_ids[:len(treenodes)])
-        treenode_skeletons = Treenode.objects.filter(
-                project_id=project_id, id__in=treenode_ids).values_list('id', 'skeleton_id')
-        skeletons_by_id = dict(treenode_skeletons)
-        if skeletons_by_id.keys() != treenode_ids:
-            raise state.StateMatchingError('A treenode in the move is missing from the project', request_state)
-        lock_skeleton_topology(project_id, skeletons_by_id.values())
-        if dict(treenode_skeletons.all()) != skeletons_by_id:
-            raise state.StateMatchingError('A treenode changed skeletons during the move', request_state)
 
     cursor = connection.cursor()
-    if node_ids:
-        state.validate_state(node_ids, request_state, multinode=True, lock=True, cursor=cursor)
+    nodes = treenodes + connectors
+    if nodes:
+        node_ids = [int(n[0]) for n in nodes]
+        state.validate_state(node_ids, request.POST.get('state'),
+                multinode=True, lock=True, cursor=cursor)
 
     now = timezone.now()
     old_treenodes = _update_location("treenode", treenodes, now, request.user, cursor)

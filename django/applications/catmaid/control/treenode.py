@@ -132,7 +132,6 @@ def create_treenode(request:HttpRequest, project_id=None) -> JsonResponse:
     })
 
 @requires_user_role(UserRole.Annotate)
-@transaction.atomic
 def insert_treenode(request:HttpRequest, project_id=None) -> JsonResponse:
     """
     Create a new treenode between two existing nodes. Its creator and
@@ -171,29 +170,25 @@ def insert_treenode(request:HttpRequest, project_id=None) -> JsonResponse:
     except Exception as e:
         raise ValueError(f"Couldn't parse list parameter: {e}")
 
-    parent_id, child_id = params['parent_id'], params['child_id']
-    request_state = request.POST.get('state')
-    try:
-        # Insertion locks the parent before updating the child. Serialize with
-        # rerooting before either operation takes treenode row locks.
-        skeleton_id = Treenode.objects.values_list('skeleton_id', flat=True).get(
-                id=parent_id, project_id=project_id)
-        lock_skeleton_topology(project_id, [skeleton_id])
-
-        # Validate the client state and edge after the wait.
-        partial_child_checks = [] if child_id == -1 else [child_id]
+    # Make sure the back-end is in the expected state if the node should have a
+    # parent and will therefore become part of another skeleton.
+    parent_id = params.get('parent_id')
+    child_id = params.get('child_id')
+    if parent_id not in (-1, None):
+        s = request.POST.get('state')
+        # Testing egular edge insertion is assumed if a child ID is provided
+        partial_child_checks = [] if child_id in (-1, None) else [child_id]
         if takeover_child_ids:
             partial_child_checks.extend(takeover_child_ids)
-        state.validate_state(parent_id, request_state, node=True,
-                children=partial_child_checks or False, lock=True)
-        parent = Treenode.objects.get(pk=parent_id, project_id=project_id)
-    except Treenode.DoesNotExist as error:
-        raise state.StateMatchingError('The parent treenode no longer exists', request_state) from error
+        state.validate_state(parent_id, s, node=True,
+                children=partial_child_checks or False, lock=True),
 
-    child = Treenode.objects.get(pk=child_id, project_id=project_id)
-    if parent.skeleton_id != skeleton_id:
-        raise ValueError('The parent treenode changed skeletons during insertion, please retry')
-    if child.parent_id != parent_id:
+    # Find child and parent of new treenode
+    child = Treenode.objects.get(pk=params['child_id'])
+    parent = Treenode.objects.get(pk=params['parent_id'])
+
+    # Make sure both nodes are actually child and parent
+    if not child.parent == parent:
         raise ValueError('The provided nodes need to be child and parent')
 
     # Make sure the requested location for the new node is on the edge between
@@ -436,30 +431,22 @@ def _create_treenode(project_id, creator, editor, x, y, z, radius, confidence,
 
 
 @requires_user_role(UserRole.Annotate)
-@transaction.atomic
 def update_parent(request:HttpRequest, project_id=None, treenode_id=None) -> JsonResponse:
     treenode_id = int(treenode_id)
     parent_id = int(request.POST.get('parent_id', -1))
-    request_state = request.POST.get('state')
-
-    skeleton_id = get_object_or_404(Treenode.objects.only('skeleton_id'),
-            pk=treenode_id, project_id=project_id).skeleton_id
-    lock_skeleton_topology(project_id, [skeleton_id])
 
     can_edit_treenode_or_fail(request.user, project_id, treenode_id)
-    # Rerooting can invalidate the requested edge while we wait for the lock.
-    state.validate_state(treenode_id, request_state, neighborhood=True, lock=True)
+
+    # Make sure the back-end is in the expected state
+    state.validate_state(treenode_id, request.POST.get('state'),
+            neighborhood=True, lock=True)
 
     child = get_object_or_404(Treenode, pk=treenode_id, project_id=project_id)
-    if child.skeleton_id != skeleton_id:
-        raise state.StateMatchingError('The treenode changed skeletons during reparenting', request_state)
     parent = get_object_or_404(Treenode, pk=parent_id, project_id=project_id)
 
     if child.skeleton_id != parent.skeleton_id:
         raise ValueError("Child node %s is in skeleton %s but parent node %s is in skeleton %s!", \
                         treenode_id, child.skeleton_id, parent_id, parent.skeleton_id)
-    if child.parent_id is None:
-        raise ValueError('Cannot change the parent of the root node')
 
     child.parent_id = parent_id
     child.save()
@@ -550,21 +537,10 @@ def update_radius(request:HttpRequest, project_id=None, treenode_id=None) -> Jso
     if math.isnan(radius):
         raise ValueError("Radius '%s' is not a number!" % request.POST.get('radius'))
     option = int(request.POST.get('option', 0))
-    request_state = request.POST.get('state')
-    skeleton_id = None
-    if 1 <= option <= 5:
-        # Multi-node radius edits can acquire the same rows as rerooting.
-        anchor = Treenode.objects.filter(pk=treenode_id, project_id=project_id)
-        skeleton_id = anchor.values_list('skeleton_id', flat=True).first()
-        if skeleton_id is None:
-            raise state.StateMatchingError('The treenode no longer exists', request_state)
-        lock_skeleton_topology(project_id, [skeleton_id])
-
     cursor = connection.cursor()
     # Make sure the back-end is in the expected state
-    state.validate_state(treenode_id, request_state, node=True, lock=True, cursor=cursor)
-    if skeleton_id is not None and not anchor.filter(skeleton_id=skeleton_id).exists():
-        raise state.StateMatchingError('The treenode changed skeletons during the radius edit', request_state)
+    state.validate_state(treenode_id, request.POST.get('state'),
+            node=True, lock=True, cursor=cursor)
 
     def create_update_response(updated_nodes, radius) -> JsonResponse:
         return JsonResponse({
@@ -579,17 +555,11 @@ def update_radius(request:HttpRequest, project_id=None, treenode_id=None) -> Jso
         old_radii = update_node_radii(treenode_id, radius, cursor)
         return create_update_response(old_radii, radius)
 
-    if 5 == option:
-        # Update radius of all nodes (in a single query).
-        include = list(Treenode.objects.filter(skeleton_id=skeleton_id).values_list('id', flat=True))
-        old_radii = update_node_radii(include, radius, cursor)
-        return create_update_response(old_radii, radius)
-
     cursor.execute('''
     SELECT id, parent_id, radius
     FROM treenode
-    WHERE skeleton_id = %s
-    ''', [skeleton_id])
+    WHERE skeleton_id = (SELECT t.skeleton_id FROM treenode t WHERE id = %s)
+    ''' % treenode_id)
 
     if 1 == option:
         # Update radius from treenode_id to next branch or end node (included)
@@ -649,6 +619,15 @@ def update_radius(request:HttpRequest, project_id=None, treenode_id=None) -> Jso
         while parent:
             include.append(parent)
             parent = parents[parent]
+
+        old_radii = update_node_radii(include, radius, cursor)
+        return create_update_response(old_radii, radius)
+
+    if 5 == option:
+        # Update radius of all nodes (in a single query)
+        skeleton_id = Treenode.objects.get(pk=treenode_id).skeleton_id
+        include = list(Treenode.objects.filter(skeleton_id=skeleton_id) \
+                .values_list('id', flat=True))
 
         old_radii = update_node_radii(include, radius, cursor)
         return create_update_response(old_radii, radius)
