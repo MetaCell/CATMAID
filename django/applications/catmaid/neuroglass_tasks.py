@@ -41,6 +41,12 @@ class TaskSkeletonAssociationConflict(ClientError):
     status_code = 409
 
 
+class TaskSkeletonAlreadyAssociated(TaskSkeletonAssociationConflict):
+    def __init__(self, task_public_id: str):
+        super().__init__("Skeleton is already associated with another task. Please select a different skeleton.")
+        self.meta = {"code": "task_skeleton_already_associated", "task_public_id": task_public_id}
+
+
 def lock_task_annotation_targets(project_id, entity_ids) -> None:
     """Serialize task label writes with joins and final-node deletion."""
     entity_ids = sorted(set(map(int, entity_ids)))
@@ -84,6 +90,19 @@ def task_annotations_by_neuron(project_id, neuron_ids) -> dict[int, dict[str, in
         for neuron_id, name, user_id in cursor.fetchall():
             annotations.setdefault(neuron_id, {})[name] = user_id
     return annotations
+
+
+def check_task_annotation_targets(project_id, name: str, entity_ids) -> None:
+    """Reject a different same-study task label while the selected neurons are locked."""
+    if not entity_ids or not is_task_annotation(name):
+        return
+
+    study_prefix, task_id = name.lower().rsplit(':', 1)
+    for labels in task_annotations_by_neuron(project_id, sorted(entity_ids)).values():
+        for label in labels:
+            other_study_prefix, other_task_id = label.lower().rsplit(':', 1)
+            if other_study_prefix == study_prefix and other_task_id != task_id:
+                raise TaskSkeletonAlreadyAssociated(other_task_id)
 
 
 def protect_task_annotations_on_join(project_id, winning_neuron_id, losing_neuron_id,

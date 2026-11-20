@@ -21,7 +21,8 @@ from catmaid.control.authentication import (
 from catmaid.error import ClientError
 from catmaid.locks import SkeletonEditLockTimeout, skeleton_edit_lock_timeout
 from catmaid.neuroglass_tasks import (
-    TASK_ANNOTATION_NAMESPACE, is_task_annotation, lock_task_annotation_targets,
+    TASK_ANNOTATION_NAMESPACE, check_task_annotation_targets, is_task_annotation,
+    lock_task_annotation_targets,
 )
 from catmaid.source_fragments import (
     SOURCE_FRAGMENT_ANNOTATION_PREFIX, is_source_fragment_annotation_name,
@@ -1439,6 +1440,7 @@ def set_annotation_targets(request: HttpRequest, project_id=None) -> JsonRespons
             raise AnnotationTargetConflict("Skeleton targets changed or omit a modeled skeleton. Please retry.")
         reject_reserved_annotations(project_id, affected)
         can_edit_class_instances_or_fail(request.user, affected)
+        check_task_annotation_targets(project_id, name, entity_ids)
 
         # NeuroGlass checks the full requested set at the write helper.
         if entity_ids:

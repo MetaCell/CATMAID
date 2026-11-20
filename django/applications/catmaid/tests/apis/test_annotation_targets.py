@@ -71,6 +71,38 @@ class AnnotationTargetsApiTests(AnnotationTargetsMixin, CatmaidApiTestCase):
         self.assertEqual(self.targets(), {2389})
         self.assertEqual(response.json()['skeleton_ids'], [skeleton_id])
 
+    def test_task_conflict_preserves_both_task_links(self):
+        prefix = 'neuroglass:study:00000000-0000-0000-0000-000000000001:task:'
+        owner_id = '00000000-0000-0000-0000-000000000002'
+        owner = prefix + owner_id
+        self.name = prefix + '00000000-0000-0000-0000-000000000003'
+        self.label()
+        self.assertStatus(self.set_targets(annotation=owner, entity_ids=[2389]))
+        skeleton_id = ClassInstanceClassInstance.objects.get(
+            project_id=self.test_project_id, relation__relation_name='model_of',
+            class_instance_b_id=2389,
+        ).class_instance_a_id
+
+        response = self.set_targets(skeleton_ids=[skeleton_id])
+
+        self.assertStatus(response, 409)
+        self.assertEqual(response.json()['meta'], {
+            'code': 'task_skeleton_already_associated', 'task_public_id': owner_id,
+        })
+        self.assertEqual(self.targets(), {2365})
+        self.assertTrue(ClassInstanceClassInstance.objects.filter(
+            project_id=self.test_project_id, relation__relation_name='annotated_with',
+            class_instance_a_id=2389, class_instance_b__name=owner,
+        ).exists())
+
+    def test_task_conflict_is_scoped_to_other_tasks_in_same_study(self):
+        self.name = 'neuroglass:study:00000000-0000-0000-0000-000000000001:task:00000000-0000-0000-0000-000000000003'
+        other_study = 'neuroglass:study:00000000-0000-0000-0000-000000000004:task:00000000-0000-0000-0000-000000000002'
+        self.assertStatus(self.set_targets(annotation=other_study, entity_ids=[2365]))
+        self.assertStatus(self.set_targets(entity_ids=[2365]))
+        self.assertStatus(self.set_targets(entity_ids=[2365]))
+        self.assertEqual(self.targets(), {2365})
+
     def test_empty_targets_clear_the_annotation(self):
         self.label()
         response = self.set_targets()
@@ -385,6 +417,44 @@ class AnnotationTargetsConcurrencyTests(AnnotationTargetsMixin, CatmaidApiTransa
         self.assertStatus(self.client.post(path, {'name': 'available-name'}))
         other.refresh_from_db()
         self.assertEqual(other.name, 'available-name')
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
+    def test_competing_task_annotations_serialize_on_the_same_neuron(self):
+        prefix = 'neuroglass:study:00000000-0000-0000-0000-000000000001:task:'
+        task_ids = ['00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000003']
+        ready_to_lock = Barrier(2)
+
+        def associate(task_id):
+            try:
+                client = Client()
+                client.force_login(get_user_model().objects.get(pk=self.test_user_id))
+
+                def wait_for_other_request(execute, sql, params, many, context):
+                    if ('FOR UPDATE' in sql and 'ORDER BY' in sql
+                            and '"class_instance"."id" IN' in sql):
+                        ready_to_lock.wait(timeout=8)
+                    return execute(sql, params, many, context)
+
+                with connection.execute_wrapper(wait_for_other_request):
+                    return client.post(f'/{self.test_project_id}/annotations/set-targets', {
+                        'annotation': prefix + task_id, 'entity_ids': [2365],
+                    })
+            finally:
+                connection.close()
+
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            responses = list(workers.map(associate, task_ids))
+        self.assertCountEqual([200, 409], [response.status_code for response in responses])
+        winner, = [task_id for task_id, response in zip(task_ids, responses) if response.status_code == 200]
+        rejected, = [response for response in responses if response.status_code == 409]
+        self.assertEqual(rejected.json()['meta'], {
+            'code': 'task_skeleton_already_associated', 'task_public_id': winner,
+        })
+        labels = list(ClassInstanceClassInstance.objects.filter(
+            project_id=self.test_project_id, relation__relation_name='annotated_with',
+            class_instance_a_id=2365, class_instance_b__name__startswith=prefix,
+        ).values_list('class_instance_b__name', flat=True))
+        self.assertEqual(labels, [prefix + winner])
 
     @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
     def test_crossed_meta_annotation_replacements_do_not_deadlock(self):
