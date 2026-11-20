@@ -6,6 +6,21 @@ included in this changelog.
 
 ### Additions
 
+- `POST /{project_id}/skeletons/annotate-nearest`:
+  Send an unused literal `annotation` name, one `coordinate` (`[x, y, z]`), and
+  a positive `radius` in project nanometres. An optional
+  `exclude_annotation_pattern` skips neurons carrying annotations matching
+  a case-insensitive PostgreSQL regular expression.
+  CATMAID picks the nearest eligible skeleton, breaking ties by skeleton ID
+  and then treenode ID, adds the annotation, and makes the selected node the
+  root in one transaction. The response contains `skeleton_id` and `root_id`.
+  Access requires the project's Annotate role and respects neuron edit locks.
+  A search with no eligible skeleton returns 409 with
+  `meta.code: "annotation_match_no_match"`. An annotation already assigned
+  to a neuron or a target that changed during selection also returns 409.
+  Lock acquisition timeouts return a retryable 409 with
+  `meta.code: "edit_lock_timeout"`.
+
 - `POST /{project_id}/skeletons/{skeleton_id}/delete`:
   Delete a skeleton along with its neuron (like calling /delete on the neuron).
   The neuron is by default only deleted if the skeleton was the only model of
@@ -13,6 +28,10 @@ included in this changelog.
   neurons are also deleted, if they are modeled by multiple skeletons.
 
 ### Modifications
+
+- `POST /{project_id}/skeleton/split` keeps existing NeuroGlass task
+  annotations on the original skeleton. Annotation selections distribute ordinary
+  annotations and cannot introduce task links.
 
 - `GET|POST /{project_id}/skeletons/compact-detail`:
   The new parameter 'with_edition_times' can now be used to return the edition
