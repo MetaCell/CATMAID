@@ -16,6 +16,7 @@ from catmaid.control import annotation, skeleton
 from catmaid.control.authentication import can_edit_class_instance_or_fail, requires_user_role, user_domain
 from catmaid.control.common import get_class_to_id_map, get_relation_to_id_map
 from catmaid.error import ClientError
+from catmaid.locks import skeleton_edit_lock_timeout
 from catmaid.models import ClassInstance, ClassInstanceClassInstance, Treenode, UserRole
 
 # Leave room for the search bounds and squared 3D distances in double precision.
@@ -159,7 +160,7 @@ def _target_neuron(project_id: int, skeleton_id: int) -> int:
 def lock_annotation(project_id: int, name: str) -> None:
     """Serialize assignment of an annotation that might not exist yet."""
     key = 'catmaid-annotation-match:%s:%s' % (project_id, name.lower())
-    with connection.cursor() as cursor:
+    with connection.cursor() as cursor, skeleton_edit_lock_timeout(cursor):
         cursor.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))', [key])
 
 
@@ -191,15 +192,17 @@ def _link_candidate(project_id, user, change, skeleton_id, treenode_id,
 
     # Lock the neuron before the treenode, as whole-skeleton deletion does.
     # Single-node deletion is serialized by the topology lock above.
-    if not ClassInstance.objects.select_for_update().filter(project_id=project_id, id=neuron_id).exists():
-        raise AnnotationMatchConflict('The target neuron no longer exists')
-    if _target_neuron(project_id, skeleton_id) != neuron_id:
-        raise AnnotationMatchConflict('The target skeleton changed during assignment')
-
     try:
-        locked_coordinate = Treenode.objects.select_for_update().values_list(
-                'location_x', 'location_y', 'location_z').get(
-                        project_id=project_id, id=treenode_id, skeleton_id=skeleton_id)
+        with connection.cursor() as cursor, skeleton_edit_lock_timeout(cursor):
+            if not ClassInstance.objects.select_for_update().filter(
+                    project_id=project_id, id=neuron_id).exists():
+                raise AnnotationMatchConflict('The target neuron no longer exists')
+            if _target_neuron(project_id, skeleton_id) != neuron_id:
+                raise AnnotationMatchConflict('The target skeleton changed during assignment')
+
+            locked_coordinate = Treenode.objects.select_for_update().values_list(
+                    'location_x', 'location_y', 'location_z').get(
+                            project_id=project_id, id=treenode_id, skeleton_id=skeleton_id)
     except Treenode.DoesNotExist:
         raise AnnotationMatchConflict('The reroot node is no longer on the target skeleton')
     # Moving within the radius can also change which candidate is nearest.

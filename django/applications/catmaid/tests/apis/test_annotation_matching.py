@@ -304,17 +304,54 @@ class AnnotationMatchingApiTests(AnnotationMatchingFixtures, CatmaidApiTestCase)
 class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiTransactionTestCase):
 
     @contextmanager
-    def held_topology_lock(self, skeleton_id):
-        holder = connections['default'].copy(alias='reroot_lock_holder')
+    def held_lock(self, sql, params):
+        holder = connections['default'].copy(alias='matching_lock_holder')
         try:
             holder.set_autocommit(False)
             with holder.cursor() as cursor:
-                cursor.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))',
-                        ['catmaid-reroot:%s:%s' % (self.test_project_id, skeleton_id)])
+                cursor.execute(sql, params)
             yield
         finally:
             holder.rollback()
             holder.close()
+
+    def held_topology_lock(self, skeleton_id):
+        return self.held_lock('SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))',
+                ['catmaid-reroot:%s:%s' % (self.test_project_id, skeleton_id)])
+
+    def assert_assignment_lock_timeout(self, held_lock):
+        parents = dict(Treenode.objects.filter(skeleton_id=1).values_list('id', 'parent_id'))
+        change = self.change(self.annotation_a, 13)
+        with held_lock, transaction.atomic(), connection.cursor() as cursor:
+            # Fail promptly even if the assignment lock loses its timeout.
+            cursor.execute("SET LOCAL lock_timeout = '400ms'")
+            response = self.post(change)
+
+        self.assertEqual(409, response.status_code, response.content)
+        self.assertEqual({'code': 'edit_lock_timeout'}, response.json()['meta'])
+        self.assertEqual(set(), self.neurons_with(self.annotation_a))
+        self.assertEqual(parents,
+                dict(Treenode.objects.filter(skeleton_id=1).values_list('id', 'parent_id')))
+        self.assertEqual(7, self.root(1))
+
+        self.assertEqual({'skeleton_id': 1, 'root_id': 13}, self.result(self.post(change)))
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
+        self.assertEqual(13, self.root(1))
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=75)
+    def test_annotate_nearest_reports_annotation_lock_timeout_as_409(self):
+        key = 'catmaid-annotation-match:%s:%s' % (self.test_project_id, self.annotation_a.lower())
+        self.assert_assignment_lock_timeout(self.held_lock(
+                'SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))', [key]))
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=75)
+    def test_annotate_nearest_reports_neuron_lock_timeout_as_409(self):
+        self.assert_assignment_lock_timeout(self.held_lock(
+                'SELECT id FROM class_instance WHERE id=%s FOR UPDATE', [SKELETON_1_NEURON]))
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=75)
+    def test_annotate_nearest_reports_selected_node_lock_timeout_as_409(self):
+        self.assert_assignment_lock_timeout(self.held_node_lock(13))
 
     @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=75)
     def test_annotate_nearest_reports_topology_lock_timeout_as_409(self):
@@ -600,17 +637,8 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
             'z': (parent.location_z + child.location_z) / 2,
         }
 
-    @contextmanager
     def held_node_lock(self, node_id):
-        holder = connections['default'].copy(alias='reroot_node_holder')
-        try:
-            holder.set_autocommit(False)
-            with holder.cursor() as cursor:
-                cursor.execute('SELECT id FROM treenode WHERE id=%s FOR UPDATE', [node_id])
-            yield
-        finally:
-            holder.rollback()
-            holder.close()
+        return self.held_lock('SELECT id FROM treenode WHERE id=%s FOR UPDATE', [node_id])
 
     @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
     def test_native_edge_insertion_waits_for_annotation_matching_reroot(self):
