@@ -209,6 +209,7 @@ urlpatterns += [
     re_path(r'^(?P<project_id>\d+)/annotations/add$', record_view("annotations.add")(annotation.annotate_entities)),
     re_path(r'^(?P<project_id>\d+)/annotations/add-neuron-names$', record_view("annotations.addneuronname")(annotation.add_neuron_name_annotations)),
     re_path(r'^(?P<project_id>\d+)/annotations/remove$', record_view("annotations.remove")(annotation.remove_annotations)),
+    re_path(r'^(?P<project_id>\d+)/annotations/set-targets$', record_view("annotations.set_targets")(annotation.set_annotation_targets)),
     re_path(r'^(?P<project_id>\d+)/annotations/replace$', record_view("annotations.replace")(annotation.replace_annotations)),
     re_path(r'^(?P<project_id>\d+)/annotations/(?P<annotation_id>\d+)/remove$', record_view("annotations.remove")(annotation.remove_annotation)),
     re_path(r'^(?P<project_id>\d+)/annotations/query-targets$', annotation.query_annotated_classinstances),

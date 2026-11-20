@@ -7,7 +7,7 @@ import re
 
 from typing import Any, DefaultDict, Dict, FrozenSet, List, Optional, Set, Tuple, Union
 
-from django.http import HttpRequest, HttpResponse, JsonResponse
+from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404
 from django.db import connection, transaction
 
@@ -15,7 +15,9 @@ from rest_framework.decorators import api_view
 
 from catmaid.models import UserRole, Project, Class, ClassInstance, \
         ClassInstanceClassInstance, Relation, ReviewerWhitelist
-from catmaid.control.authentication import requires_user_role, can_edit_or_fail
+from catmaid.control.authentication import requires_user_role, can_edit_or_fail, can_edit_class_instance_or_fail, PermissionError
+from catmaid.error import ClientError
+from catmaid.locks import SkeletonEditLockTimeout, skeleton_edit_lock_timeout
 from catmaid.neuroglass_tasks import (
     TASK_ANNOTATION_NAMESPACE, is_task_annotation, lock_task_annotation_targets,
 )
@@ -25,6 +27,20 @@ from catmaid.source_fragments import (
 )
 from catmaid.control.common import (get_relation_to_id_map,
         get_class_to_id_map, get_request_bool, get_request_list)
+
+
+def _lock_annotation_name(project_id, name, *, wait=True):
+    """Serialize annotation creation, including names that have no row yet."""
+    with connection.cursor() as cursor:
+        key = f'catmaid:annotation-targets:{int(project_id)}:{name}'
+        if wait:
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", [key])
+        else:
+            # Native writers can already hold neuron locks. Never wait here
+            # while a replacement holds the name and is acquiring those neurons.
+            cursor.execute("SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))", [key])
+            if not cursor.fetchone()[0]:
+                raise SkeletonEditLockTimeout("The annotation is being updated. Please retry.")
 
 
 def get_annotation_to_id_map(project_id:Union[int,str], annotations:List, relations=None,
@@ -878,10 +894,12 @@ def _add_annotation_links(project_id:Union[int,str], entity_ids, annotation_map:
 
         # Make sure the annotation's class instance exists.
         for a, a_entity_ids in expanded_annotations.items():
-            ci, created = ClassInstance.objects.get_or_create(
-                    project_id=project_id, name=a,
-                    class_column=annotation_class,
-                    defaults={'user_id': meta['user_id']})
+            with transaction.atomic():
+                _lock_annotation_name(project_id, a, wait=False)
+                ci, created = ClassInstance.objects.get_or_create(
+                        project_id=project_id, name=a,
+                        class_column=annotation_class,
+                        defaults={'user_id': meta['user_id']})
 
             if created:
                 new_annotations.add(ci.id)
@@ -1251,6 +1269,111 @@ def _remove_annotation_links(user, project_id:Union[int,str], entity_ids,
                                                     annotated_with)
 
     return cicis_to_delete, missed_cicis, deleted, num_left
+
+class AnnotationTargetConflict(ClientError):
+    status_code = 409
+
+
+@api_view(['POST'])
+@requires_user_role(UserRole.Annotate)
+@transaction.atomic
+def set_annotation_targets(request: HttpRequest, project_id=None) -> JsonResponse:
+    """Set one exact annotation's complete targets in a single transaction.
+
+    POST annotation plus either entity_ids or skeleton_ids; omit both to clear
+    its links. Skeleton IDs resolve to neurons and must include all skeletons
+    of those neurons. Existing links retain their annotators. The response
+    contains annotation, entity_ids and skeleton_ids for the resulting targets.
+    Numbered annotation templates and reserved source-fragment records are
+    excluded. Concurrent replacements use the shared skeleton edit timeout.
+
+    Example form body: annotation=reviewed&skeleton_ids[0]=123. A successful
+    response includes {"annotation": "reviewed", "entity_ids": [456],
+    "skeleton_ids": [123]}. Posting only annotation=reviewed clears its links.
+    Invalid selections return 400/404, permission failures 403, and changed
+    skeleton mappings or edit-lock timeouts 409; all leave the old links intact.
+    """
+    project_id = get_object_or_404(Project, pk=project_id).pk
+    name = request.POST.get('annotation', '')
+    if not name.strip() or len(name) > 255 or re.search(r'\{n\d*\}', name):
+        raise ValueError("Provide one exact annotation name without numbered templates")
+    reject_reserved_annotation_names([name])
+    entity_ids = set(get_request_list(request.POST, 'entity_ids', [], map_fn=int))
+    skeleton_ids = set(get_request_list(request.POST, 'skeleton_ids', [], map_fn=int))
+    if entity_ids and skeleton_ids:
+        raise ValueError("Provide entity_ids or skeleton_ids, not both")
+    if any(target <= 0 for target in entity_ids | skeleton_ids):
+        raise ValueError("Annotation target IDs must be positive")
+
+    annotated_with = Relation.objects.get(project_id=project_id, relation_name='annotated_with')
+    models = ClassInstanceClassInstance.objects.filter(
+        project_id=project_id, relation__project_id=project_id,
+        relation__relation_name='model_of', class_instance_a_id__in=skeleton_ids,
+        class_instance_a__project_id=project_id,
+        class_instance_a__class_column__class_name='skeleton',
+        class_instance_a__class_column__project_id=project_id,
+        class_instance_b__project_id=project_id,
+        class_instance_b__class_column__class_name='neuron',
+        class_instance_b__class_column__project_id=project_id,
+    ).values_list('class_instance_a_id', 'class_instance_b_id')
+    selected_models = dict(models)
+    if set(selected_models) != skeleton_ids or len(models) != len(skeleton_ids):
+        raise Http404("A selected skeleton does not exist in this project")
+    entity_ids.update(selected_models.values())
+
+    with connection.cursor() as cursor, skeleton_edit_lock_timeout(cursor):
+        # A name lock also serializes first use, when there is no annotation row.
+        _lock_annotation_name(project_id, name)
+        annotations = list(ClassInstance.objects.select_for_update(of=('self',)).filter(
+            project_id=project_id, class_column__class_name='annotation', name=name,
+        )[:2])
+        if len(annotations) > 1:
+            raise ValueError("The annotation name is ambiguous")
+        annotation = annotations[0] if annotations else None
+        if annotation is None and entity_ids:
+            annotation = ClassInstance.objects.create(
+                project_id=project_id, user=request.user, name=name,
+                class_column=Class.objects.get(project_id=project_id, class_name='annotation'),
+            )
+        current_targets = set(ClassInstanceClassInstance.objects.select_for_update().filter(
+            project_id=project_id, relation=annotated_with, class_instance_b=annotation,
+        ).values_list('class_instance_a_id', flat=True)) if annotation is not None else set()
+        affected = current_targets | entity_ids
+        locked = set(ClassInstance.objects.select_for_update(of=('self',)).filter(
+            project_id=project_id, class_column__project_id=project_id, id__in=affected,
+        ).order_by('id').values_list('id', flat=True))
+        if locked != affected:
+            raise Http404("An annotation target does not exist in this project")
+        actual_models = list(ClassInstanceClassInstance.objects.filter(
+            project_id=project_id, relation__project_id=project_id,
+            relation__relation_name='model_of', class_instance_b_id__in=entity_ids,
+            class_instance_a__project_id=project_id,
+            class_instance_a__class_column__class_name='skeleton',
+        ).values_list('class_instance_a_id', 'class_instance_b_id'))
+        actual_skeleton_ids = {skeleton_id for skeleton_id, _ in actual_models}
+        if skeleton_ids and (dict(actual_models) != selected_models or len(actual_models) != len(selected_models)):
+            raise AnnotationTargetConflict("Skeleton targets changed or omit a modeled skeleton. Please retry.")
+        reject_reserved_annotations(project_id, affected)
+        for target in sorted(affected):
+            can_edit_class_instance_or_fail(request.user, target)
+
+        # The write helpers retain NeuroGlass's final scoped permission checks.
+        if entity_ids:
+            _add_annotation_links(project_id, sorted(entity_ids), {
+                name: {'user_id': request.user.id},
+            })
+        to_remove = current_targets - entity_ids
+        if to_remove:
+            _, missed, _, _ = _remove_annotation_links(
+                request.user, project_id, sorted(to_remove), annotation.id)
+            if missed:
+                raise PermissionError("Some annotation links cannot be removed by this user")
+
+    return JsonResponse({
+        'annotation': name, 'entity_ids': sorted(entity_ids),
+        'skeleton_ids': sorted(actual_skeleton_ids),
+    })
+
 
 @api_view(['POST'])
 @requires_user_role(UserRole.Annotate)
