@@ -24,7 +24,7 @@ from django.shortcuts import get_object_or_404
 
 from rest_framework.decorators import api_view
 
-from catmaid import state
+from catmaid import grid_cache, state
 from catmaid.models import (ClassInstance, UserRole, Treenode,
         ClassInstanceClassInstance, Review, Project, User)
 from catmaid.control.authentication import requires_user_role, \
@@ -462,12 +462,38 @@ class GridCachedJsonTextNodeProvider(GridCachedNodeProvider):
 class GridCachedMsgpackNodeProvider(GridCachedNodeProvider):
     data_type = 'msgpack'
 
-    def get_tuples(self, *args, **kwargs) -> Tuple[Any, Optional[str]]:
-        tuples, dt = super().get_tuples(*args, **kwargs)
+    def get_tuples(self, params, project_id, explicit_treenode_ids=(),
+            explicit_connector_ids=(), include_labels=False,
+            with_relation_map="used", with_origin=False) -> Tuple[Any, Optional[str]]:
+        tuples, data_type = super().get_tuples(
+            params, project_id, explicit_treenode_ids, explicit_connector_ids,
+            include_labels, with_relation_map, with_origin,
+        )
         if tuples:
-            return bytes(tuples), dt
+            return bytes(tuples), data_type
+        if tuples is not None or data_type is not None:
+            return tuples, data_type
+        if not grid_cache.has_managed_grid(project_id, self.cache_id):
+            return None, None
+
+        # A missing cell in a sparse grid represents empty space. Explicitly
+        # requested nodes still use the targeted query.
+        if explicit_treenode_ids or explicit_connector_ids:
+            tuples, data_type = get_extra_nodes(
+                params, project_id, explicit_treenode_ids, explicit_connector_ids,
+                include_labels, with_relation_map, with_origin,
+            )
+            if data_type != 'json':
+                raise ValueError("Unexpected explicit-node response type")
         else:
-            return tuples, dt
+            relations = {}
+            if with_relation_map == 'all':
+                relations = {
+                    relation_id: name
+                    for name, relation_id in get_relation_to_id_map(project_id).items()
+                }
+            tuples = [[], [], {}, False, relations]
+        return msgpack.packb(tuples), 'msgpack'
 
 class PostgisNodeProvider(BasicNodeProvider, metaclass=ABCMeta):
 
