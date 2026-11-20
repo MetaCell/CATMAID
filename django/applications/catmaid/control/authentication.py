@@ -25,7 +25,7 @@ from django.contrib.sites.shortcuts import get_current_site
 from django.db import connection
 from django.http import HttpRequest, HttpResponse, HttpResponseRedirect, JsonResponse
 from django.core.exceptions import ObjectDoesNotExist
-from django.shortcuts import _get_queryset, render
+from django.shortcuts import _get_queryset, get_object_or_404, render
 from django.template import Context, Template
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
@@ -218,7 +218,7 @@ def requires_user_role(roles):
 
     def decorated_with_requires_user_role(f):
         def inner_decorator(request, roles=roles, *args, **kwargs):
-            p = Project.objects.get(pk=kwargs['project_id'])
+            p = get_object_or_404(Project, pk=kwargs['project_id'])
             u = request.user
 
             has_role = check_user_role(u, p, roles)

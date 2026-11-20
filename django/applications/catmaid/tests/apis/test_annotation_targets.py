@@ -152,6 +152,27 @@ class AnnotationTargetsApiTests(AnnotationTargetsMixin, CatmaidApiTestCase):
                 self.assertStatus(response, 400)
                 self.assertEqual(self.targets(), {2365})
 
+    def test_duplicate_annotation_fields_leave_both_target_sets_intact(self):
+        self.label()
+        other_name = 'other-annotation-targets-test'
+        self.assertStatus(self.set_targets(annotation=other_name, entity_ids=[2389]))
+
+        response = self.set_targets(annotation=[self.name, other_name])
+
+        self.assertStatus(response, 400)
+        self.assertEqual(self.targets(), {2365})
+        self.assertTrue(ClassInstanceClassInstance.objects.filter(
+            project_id=self.test_project_id, relation__relation_name='annotated_with',
+            class_instance_a_id=2389, class_instance_b__name=other_name,
+        ).exists())
+
+    def test_missing_project_returns_not_found(self):
+        missing_project_id = max(Project.objects.values_list('id', flat=True)) + 1
+        response = self.client.post(f'/{missing_project_id}/annotations/set-targets', {
+            'annotation': self.name,
+        })
+        self.assertStatus(response, 404)
+
     def test_repeated_request_preserves_the_original_annotator(self):
         owner = get_user_model().objects.create_user(username='annotation-original-owner')
         self.label(user_id=owner.pk)

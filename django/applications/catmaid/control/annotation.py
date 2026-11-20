@@ -1357,14 +1357,17 @@ def set_annotation_targets(request: HttpRequest, project_id=None) -> JsonRespons
     Invalid selections return 400/404, permission failures 403, and changed
     skeleton mappings or edit-lock timeouts 409; all leave the old links intact.
     """
-    project_id = get_object_or_404(Project, pk=project_id).pk
+    project_id = int(project_id)
     post = request.POST
     allowed_fields = {'annotation', 'entity_ids', 'skeleton_ids', 'csrfmiddlewaretoken'}
     for field in post:
         if field not in allowed_fields and not field.startswith(('entity_ids[', 'skeleton_ids[')):
             raise ValueError(f'Unrecognized form field {field!r}')
 
-    name = post.get('annotation', '')
+    names = post.getlist('annotation')
+    if len(names) != 1:
+        raise ValueError("Provide exactly one annotation field")
+    name = names[0]
     if not name.strip() or len(name) > 255 or re.search(r'\{n\d*\}', name):
         raise ValueError("Provide one exact annotation name without numbered templates")
     reject_reserved_annotation_names([name])
