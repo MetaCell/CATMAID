@@ -639,6 +639,35 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
         self.assertEqual(13, Treenode.objects.get(pk=7).parent_id)
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
 
+    def test_confidence_edit_rechecks_state_after_matching_reroot(self):
+        edited = Treenode.objects.get(pk=11)
+        selected = Treenode.objects.get(pk=13)
+        self.assertEqual(7, edited.parent_id)
+        self.assertEqual(edited.id, selected.parent_id)
+        payload = {
+            'new_confidence': 3,
+            'state': json.dumps({'edition_time': edited.edition_time.isoformat()}),
+        }
+        editor = Client()
+        editor.cookies.update(self.client.cookies)
+        url = '/%d/treenodes/%d/confidence' % (self.test_project_id, edited.id)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with transaction.atomic():
+                assigned = self.post(self.change(self.annotation_a, selected.id))
+                self.assertEqual({'skeleton_id': 1, 'root_id': 13}, self.result(assigned))
+                waiting = self.overlapping_request(pool, lambda: editor.post(url, payload))
+                self.assertFalse(waiting.done(), 'The confidence edit did not wait for reroot')
+            response = waiting.result(timeout=10)
+
+        self.assertEqual(400, response.status_code, response.content)
+        self.assertEqual('StateMatchingError', response.json()['type'])
+        self.assertEqual(13, self.root(1))
+        edges = {node: (parent, confidence) for node, parent, confidence in
+                 Treenode.objects.filter(pk__in=[7, 11]).values_list('id', 'parent_id', 'confidence')}
+        self.assertEqual({7: (11, edited.confidence), 11: (13, selected.confidence)}, edges)
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
+
     def edge_insertion(self, parent_id, child_id):
         parent = Treenode.objects.get(pk=parent_id)
         child = Treenode.objects.get(pk=child_id)

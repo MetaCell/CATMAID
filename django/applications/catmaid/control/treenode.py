@@ -1075,11 +1075,14 @@ def update_confidence(request:HttpRequest, project_id=None, treenode_id=None) ->
             required: true
     """
     tnid = int(treenode_id)
-    can_edit_treenode_or_fail(request.user, project_id, tnid)
     cursor = connection.cursor()
 
+    # Rerooting can change the edge and edit permissions while we wait.
+    cursor.execute('SELECT id FROM treenode WHERE id = %s AND project_id = %s FOR UPDATE',
+            [tnid, project_id])
+    can_edit_treenode_or_fail(request.user, project_id, tnid)
     state.validate_state(tnid, request.POST.get('state'),
-            node=True, lock=True, cursor=cursor)
+            node=True, lock=False, cursor=cursor)
 
     to_connector = get_request_bool(request.POST, 'to_connector', False)
     partner_ids = get_request_list(request.POST, 'partner_ids', None, int)
