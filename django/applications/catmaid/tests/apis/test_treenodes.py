@@ -552,6 +552,33 @@ class TreenodesApiTests(CatmaidApiTestCase):
         self.assertEqual(neuron_count, count_neurons())
 
 
+    def test_insert_with_deleted_parent_reports_stale_state(self):
+        self.fake_authentication()
+        parent = Treenode.objects.get(pk=11)
+        child = Treenode.objects.get(pk=13)
+        request_state = json.dumps({
+            'edition_time': parent.edition_time.isoformat(),
+            'children': [[child.id, child.edition_time.isoformat()]],
+        })
+        response = self.client.post('/%d/treenode/delete' % self.test_project_id, {
+            'treenode_id': parent.id, 'state': make_nocheck_state(),
+        })
+        self.assertStatus(response)
+        node_count = Treenode.objects.count()
+
+        response = self.client.post('/%d/treenode/insert' % self.test_project_id, {
+            'parent_id': parent.id,
+            'child_id': child.id,
+            'state': request_state,
+            'x': (parent.location_x + child.location_x) / 2,
+            'y': (parent.location_y + child.location_y) / 2,
+            'z': (parent.location_z + child.location_z) / 2,
+        })
+        self.assertEqual(400, response.status_code, response.content)
+        self.assertEqual('StateMatchingError', response.json()['type'])
+        self.assertEqual(node_count, Treenode.objects.count())
+
+
     def test_delete_non_root_non_parent_treenode(self):
         self.fake_authentication()
         treenode_id = 349

@@ -12,7 +12,7 @@ from django.db import connection, connections, transaction
 from django.test import Client, override_settings
 
 from catmaid.control import annotation, skeleton, annotation_matching
-from catmaid.locks import SkeletonEditLockTimeout
+from catmaid.locks import SkeletonEditLockTimeout, lock_skeleton_topology
 from catmaid.models import (Class, ClassInstance, ClassInstanceClassInstance,
         Sampler, SamplerDomain, SamplerDomainType, SamplerState, Treenode, User)
 from catmaid.source_fragments import SOURCE_FRAGMENT_ANNOTATION_PREFIX
@@ -406,7 +406,7 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
                         cursor.execute("SELECT set_config('lock_timeout', %s, true)",
                                 [f'{previous_timeout}ms'])
                         with self.assertRaises(ValueError) as failure:
-                            skeleton._lock_skeletons_for_reroot(self.test_project_id, [373, 1, 1])
+                            lock_skeleton_topology(self.test_project_id, [373, 1, 1])
                         self.assertIsInstance(failure.exception, SkeletonEditLockTimeout)
                         cursor.execute("SELECT setting::integer FROM pg_settings WHERE name='lock_timeout'")
                         self.assertEqual(previous_timeout, cursor.fetchone()[0])
@@ -651,6 +651,39 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
 
     def held_node_lock(self, node_id):
         return self.held_lock('SELECT id FROM treenode WHERE id=%s FOR UPDATE', [node_id])
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
+    def test_native_reparent_to_selected_node_does_not_deadlock(self):
+        moved = Treenode.objects.select_related('parent').get(pk=405)
+        request_state = json.dumps({
+            'edition_time': moved.edition_time.isoformat(),
+            'parent': [moved.parent_id, moved.parent.edition_time.isoformat()],
+            'children': [[node.id, node.edition_time.isoformat()]
+                         for node in Treenode.objects.filter(parent=moved)],
+            'links': [],
+        })
+        native = Client()
+        native.cookies.update(self.client.cookies)
+        pending = []
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            def reparent_before_graph_lock(execute, sql, params, many, context):
+                if 'ORDER BY t.id' in sql and 'FOR NO KEY UPDATE OF t' in sql and not pending:
+                    pending.append(self.overlapping_request(pool, lambda: native.post(
+                            '/%d/treenodes/%d/parent' % (self.test_project_id, moved.id),
+                            {'parent_id': 403, 'state': request_state})))
+                return execute(sql, params, many, context)
+
+            with connection.execute_wrapper(reparent_before_graph_lock):
+                response = self.post(self.change(self.annotation_a, 403))
+            self.assertEqual(1, len(pending), 'The test did not run the native reparent request')
+            reparented = pending[0].result(timeout=10)
+
+        self.assertEqual({'skeleton_id': 373, 'root_id': 403}, self.result(response))
+        self.assertStatus(reparented)
+        self.assertEqual(403, self.root(373))
+        self.assertEqual(403, Treenode.objects.get(pk=moved.id).parent_id)
+        self.assertEqual({SKELETON_373_NEURON}, self.neurons_with(self.annotation_a))
 
     @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
     def test_native_insertion_on_selected_edge_does_not_deadlock(self):

@@ -29,7 +29,7 @@ from rest_framework.views import APIView
 
 from catmaid.error import ClientError
 from catmaid.history import add_log_entry
-from catmaid.locks import SkeletonEditLockTimeout, skeleton_edit_lock_timeout
+from catmaid.locks import SkeletonEditLockTimeout, lock_skeleton_topology, skeleton_edit_lock_timeout
 from catmaid.neuroglass_task_annotations import prepare_split_annotations
 from catmaid.neuroglass_tasks import protect_task_annotations_on_join
 from catmaid.source_fragments import (
@@ -1275,7 +1275,7 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     project_id = int(project_id)
     skeleton_id = Treenode.objects.values_list('skeleton_id', flat=True).get(
             id=treenode_id, project_id=project_id)
-    _lock_skeletons_for_reroot(project_id, [skeleton_id])
+    lock_skeleton_topology(project_id, [skeleton_id])
     treenode = Treenode.objects.select_related('parent').get(id=treenode_id, project_id=project_id)
     if treenode.skeleton_id != skeleton_id:
         raise ValueError('The treenode changed skeletons during split, please retry')
@@ -2278,17 +2278,6 @@ def reroot_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
         raise ValueError(response_on_error + ':' + str(e))
 
 
-def _lock_skeletons_for_reroot(project_id, skeleton_ids):
-    """Serialize topology snapshots for reroots within the current transaction."""
-    with connection.cursor() as cursor, skeleton_edit_lock_timeout(cursor):
-        cursor.execute('''
-            SELECT pg_advisory_xact_lock(
-                hashtextextended('catmaid-reroot:' || %s::text || ':' || id, 0))
-            FROM unnest(%s::bigint[]) AS skeletons(id)
-            ORDER BY id
-        ''', [int(project_id), sorted(set(skeleton_ids))])
-
-
 @transaction.atomic
 def _reroot_skeleton(treenode_id, project_id):
     """ Returns the treenode instance that is now root,
@@ -2299,7 +2288,7 @@ def _reroot_skeleton(treenode_id, project_id):
     try:
         skeleton_id = Treenode.objects.values_list('skeleton_id', flat=True).get(
                 id=treenode_id, project=project_id)
-        _lock_skeletons_for_reroot(project_id, [skeleton_id])
+        lock_skeleton_topology(project_id, [skeleton_id])
     except (ClientError, ImproperlyConfigured):
         raise
     except Exception as error:
@@ -2678,7 +2667,7 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
 
         # Join also reroots one partner. Take the same locks as reroot and
         # annotation matching before either neuron or treenode row locks.
-        _lock_skeletons_for_reroot(project_id, [from_skid, to_skid])
+        lock_skeleton_topology(project_id, [from_skid, to_skid])
 
         # Acquire ownership locks before reading metadata that can change while
         # waiting, including edit restrictions, names and stable-winner labels.

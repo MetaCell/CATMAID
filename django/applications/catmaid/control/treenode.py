@@ -16,7 +16,7 @@ from rest_framework.decorators import api_view
 
 from catmaid import state
 from catmaid.error import ClientError
-from catmaid.locks import skeleton_edit_lock_timeout
+from catmaid.locks import lock_skeleton_topology, skeleton_edit_lock_timeout
 from catmaid.models import UserRole, Treenode, ClassInstance, \
         TreenodeConnector, Location, SamplerInterval
 from catmaid.control.authentication import requires_user_role, \
@@ -171,23 +171,25 @@ def insert_treenode(request:HttpRequest, project_id=None) -> JsonResponse:
     except Exception as e:
         raise ValueError(f"Couldn't parse list parameter: {e}")
 
-    # Insertion locks the parent before updating the child. Serialize with
-    # rerooting before either operation takes treenode row locks.
-    from catmaid.control.skeleton import _lock_skeletons_for_reroot
-
     parent_id, child_id = params['parent_id'], params['child_id']
-    skeleton_id = Treenode.objects.values_list('skeleton_id', flat=True).get(
-            id=parent_id, project_id=project_id)
-    _lock_skeletons_for_reroot(project_id, [skeleton_id])
+    request_state = request.POST.get('state')
+    try:
+        # Insertion locks the parent before updating the child. Serialize with
+        # rerooting before either operation takes treenode row locks.
+        skeleton_id = Treenode.objects.values_list('skeleton_id', flat=True).get(
+                id=parent_id, project_id=project_id)
+        lock_skeleton_topology(project_id, [skeleton_id])
 
-    # Validate the client state and edge after the wait.
-    partial_child_checks = [] if child_id == -1 else [child_id]
-    if takeover_child_ids:
-        partial_child_checks.extend(takeover_child_ids)
-    state.validate_state(parent_id, request.POST.get('state'), node=True,
-            children=partial_child_checks or False, lock=True)
+        # Validate the client state and edge after the wait.
+        partial_child_checks = [] if child_id == -1 else [child_id]
+        if takeover_child_ids:
+            partial_child_checks.extend(takeover_child_ids)
+        state.validate_state(parent_id, request_state, node=True,
+                children=partial_child_checks or False, lock=True)
+        parent = Treenode.objects.get(pk=parent_id, project_id=project_id)
+    except Treenode.DoesNotExist as error:
+        raise state.StateMatchingError('The parent treenode no longer exists', request_state) from error
 
-    parent = Treenode.objects.get(pk=parent_id, project_id=project_id)
     child = Treenode.objects.get(pk=child_id, project_id=project_id)
     if parent.skeleton_id != skeleton_id:
         raise ValueError('The parent treenode changed skeletons during insertion, please retry')
@@ -648,11 +650,9 @@ def delete_treenode(request:HttpRequest, project_id=None) -> JsonResponse:
 
     # Reroot locks the skeleton before any treenode rows. Deletion can also
     # change those parent links, so it must take the locks in the same order.
-    from catmaid.control.skeleton import _lock_skeletons_for_reroot
-
     skeleton_id = Treenode.objects.values_list('skeleton_id', flat=True).get(
             id=treenode_id, project_id=project_id)
-    _lock_skeletons_for_reroot(project_id, [skeleton_id])
+    lock_skeleton_topology(project_id, [skeleton_id])
     if not Treenode.objects.filter(id=treenode_id, project_id=project_id, skeleton_id=skeleton_id).exists():
         raise ValueError('The treenode changed skeletons during deletion, please retry')
 

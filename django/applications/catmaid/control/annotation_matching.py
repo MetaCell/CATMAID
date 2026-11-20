@@ -16,7 +16,7 @@ from catmaid.control import annotation, skeleton
 from catmaid.control.authentication import can_edit_class_instance_or_fail, requires_user_role, user_domain
 from catmaid.control.common import get_class_to_id_map, get_relation_to_id_map
 from catmaid.error import ClientError
-from catmaid.locks import skeleton_edit_lock_timeout
+from catmaid.locks import lock_skeleton_topology, skeleton_edit_lock_timeout
 from catmaid.models import ClassInstance, ClassInstanceClassInstance, Treenode, UserRole
 
 # Leave room for the search bounds and squared 3D distances in double precision.
@@ -191,7 +191,7 @@ def _assign(project_id: int, user, change: NearestAnnotation) -> tuple[int, int]
 
 def _link_candidate(project_id, user, change, skeleton_id, treenode_id,
         neuron_id, candidate_coordinate):
-    skeleton._lock_skeletons_for_reroot(project_id, [skeleton_id])
+    lock_skeleton_topology(project_id, [skeleton_id])
 
     # Lock the neuron before the treenode, as whole-skeleton deletion does.
     # Single-node deletion is serialized by the topology lock above.
@@ -203,7 +203,8 @@ def _link_candidate(project_id, user, change, skeleton_id, treenode_id,
             if _target_neuron(project_id, skeleton_id) != neuron_id:
                 raise AnnotationMatchConflict('The target skeleton changed during assignment')
 
-            locked_coordinate = Treenode.objects.select_for_update().values_list(
+            # Block edits to the node while allowing foreign key references to it.
+            locked_coordinate = Treenode.objects.select_for_update(no_key=True).values_list(
                     'location_x', 'location_y', 'location_z').get(
                             project_id=project_id, id=treenode_id, skeleton_id=skeleton_id)
     except Treenode.DoesNotExist:
