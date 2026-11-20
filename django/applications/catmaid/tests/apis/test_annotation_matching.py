@@ -652,9 +652,8 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
     def held_node_lock(self, node_id):
         return self.held_lock('SELECT id FROM treenode WHERE id=%s FOR UPDATE', [node_id])
 
-    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
-    def test_native_reparent_to_selected_node_does_not_deadlock(self):
-        moved = Treenode.objects.select_related('parent').get(pk=405)
+    def reparent_during_match(self, selected_id, moved_id, new_parent_id):
+        moved = Treenode.objects.select_related('parent').get(pk=moved_id)
         request_state = json.dumps({
             'edition_time': moved.edition_time.isoformat(),
             'parent': [moved.parent_id, moved.parent.edition_time.isoformat()],
@@ -662,28 +661,74 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
                          for node in Treenode.objects.filter(parent=moved)],
             'links': [],
         })
+        return self.native_edit_during_match(selected_id,
+                '/%d/treenodes/%d/parent' % (self.test_project_id, moved_id),
+                {'parent_id': new_parent_id, 'state': request_state})
+
+    def native_edit_during_match(self, selected_id, url, payload):
         native = Client()
         native.cookies.update(self.client.cookies)
         pending = []
 
         with ThreadPoolExecutor(max_workers=1) as pool:
-            def reparent_before_graph_lock(execute, sql, params, many, context):
+            def start_edit_before_graph_lock(execute, sql, params, many, context):
                 if 'ORDER BY t.id' in sql and 'FOR NO KEY UPDATE OF t' in sql and not pending:
-                    pending.append(self.overlapping_request(pool, lambda: native.post(
-                            '/%d/treenodes/%d/parent' % (self.test_project_id, moved.id),
-                            {'parent_id': 403, 'state': request_state})))
+                    pending.append(self.overlapping_request(pool, lambda: native.post(url, payload)))
                 return execute(sql, params, many, context)
 
-            with connection.execute_wrapper(reparent_before_graph_lock):
-                response = self.post(self.change(self.annotation_a, 403))
-            self.assertEqual(1, len(pending), 'The test did not run the native reparent request')
-            reparented = pending[0].result(timeout=10)
+            with connection.execute_wrapper(start_edit_before_graph_lock):
+                response = self.post(self.change(self.annotation_a, selected_id))
+            self.assertEqual(1, len(pending), 'The test did not run the concurrent native edit')
+            return response, pending[0].result(timeout=10)
 
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
+    def test_native_reparent_to_selected_node_does_not_deadlock(self):
+        # Node 407's parent is on a branch that rerooting at 403 leaves intact.
+        response, reparented = self.reparent_during_match(403, 407, 403)
         self.assertEqual({'skeleton_id': 373, 'root_id': 403}, self.result(response))
         self.assertStatus(reparented)
         self.assertEqual(403, self.root(373))
-        self.assertEqual(403, Treenode.objects.get(pk=moved.id).parent_id)
+        self.assertEqual(403, Treenode.objects.get(pk=407).parent_id)
         self.assertEqual({SKELETON_373_NEURON}, self.neurons_with(self.annotation_a))
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
+    def test_native_reparent_rejects_state_stale_after_matching_reroot(self):
+        response, reparented = self.reparent_during_match(403, 403, 405)
+        self.assertEqual({'skeleton_id': 373, 'root_id': 403}, self.result(response))
+        self.assertEqual(400, reparented.status_code, reparented.content)
+        self.assertEqual('StateMatchingError', reparented.json()['type'])
+
+        # A caller that opts out of comparing state still cannot move the root.
+        retry = self.client.post('/%d/treenodes/403/parent' % self.test_project_id, {
+            'parent_id': 405, 'state': make_nocheck_state(),
+        })
+        self.assertEqual(400, retry.status_code, retry.content)
+        self.assertIn('parent of the root node', retry.json()['error'])
+        self.assertEqual(403, self.root(373))
+        self.assertEqual(403, Treenode.objects.get(pk=377).parent_id)
+        self.assertEqual(377, Treenode.objects.get(pk=405).parent_id)
+        self.assertEqual({SKELETON_373_NEURON}, self.neurons_with(self.annotation_a))
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
+    def test_native_batch_move_waits_for_matching_before_checking_state(self):
+        nodes = list(Treenode.objects.filter(pk__in=[7, 13]).order_by('id'))
+        payload = {'state': json.dumps([
+            [node.id, node.edition_time.isoformat()] for node in nodes
+        ])}
+        for index, node in enumerate(nodes):
+            for field, value in enumerate((node.id, node.location_x + 1, node.location_y, node.location_z)):
+                payload[f't[{index}][{field}]'] = value
+
+        response, moved = self.native_edit_during_match(13,
+                '/%d/node/update' % self.test_project_id, payload)
+
+        self.assertEqual({'skeleton_id': 1, 'root_id': 13}, self.result(response))
+        self.assertEqual(400, moved.status_code, moved.content)
+        self.assertEqual('StateMatchingError', moved.json()['type'])
+        self.assertEqual({node.id: node.location_x for node in nodes}, dict(
+                Treenode.objects.filter(pk__in=[7, 13]).values_list('id', 'location_x')))
+        self.assertEqual(13, self.root(1))
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
 
     @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
     def test_native_insertion_on_selected_edge_does_not_deadlock(self):

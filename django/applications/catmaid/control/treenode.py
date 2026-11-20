@@ -436,22 +436,30 @@ def _create_treenode(project_id, creator, editor, x, y, z, radius, confidence,
 
 
 @requires_user_role(UserRole.Annotate)
+@transaction.atomic
 def update_parent(request:HttpRequest, project_id=None, treenode_id=None) -> JsonResponse:
     treenode_id = int(treenode_id)
     parent_id = int(request.POST.get('parent_id', -1))
+    request_state = request.POST.get('state')
+
+    skeleton_id = get_object_or_404(Treenode.objects.only('skeleton_id'),
+            pk=treenode_id, project_id=project_id).skeleton_id
+    lock_skeleton_topology(project_id, [skeleton_id])
 
     can_edit_treenode_or_fail(request.user, project_id, treenode_id)
-
-    # Make sure the back-end is in the expected state
-    state.validate_state(treenode_id, request.POST.get('state'),
-            neighborhood=True, lock=True)
+    # Rerooting can invalidate the requested edge while we wait for the lock.
+    state.validate_state(treenode_id, request_state, neighborhood=True, lock=True)
 
     child = get_object_or_404(Treenode, pk=treenode_id, project_id=project_id)
+    if child.skeleton_id != skeleton_id:
+        raise state.StateMatchingError('The treenode changed skeletons during reparenting', request_state)
     parent = get_object_or_404(Treenode, pk=parent_id, project_id=project_id)
 
     if child.skeleton_id != parent.skeleton_id:
         raise ValueError("Child node %s is in skeleton %s but parent node %s is in skeleton %s!", \
                         treenode_id, child.skeleton_id, parent_id, parent.skeleton_id)
+    if child.parent_id is None:
+        raise ValueError('Cannot change the parent of the root node')
 
     child.parent_id = parent_id
     child.save()
