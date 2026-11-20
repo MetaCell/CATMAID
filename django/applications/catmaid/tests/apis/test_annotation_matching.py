@@ -674,6 +674,7 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
             def start_edit_before_graph_lock(execute, sql, params, many, context):
                 if 'ORDER BY t.id' in sql and 'FOR NO KEY UPDATE OF t' in sql and not pending:
                     pending.append(self.overlapping_request(pool, lambda: native.post(url, payload)))
+                    self.assertFalse(pending[0].done(), 'The concurrent native edit did not wait')
                 return execute(sql, params, many, context)
 
             with connection.execute_wrapper(start_edit_before_graph_lock):
@@ -731,6 +732,23 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
 
     @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
+    def test_native_whole_skeleton_radius_waits_for_matching_before_checking_state(self):
+        anchor = Treenode.objects.get(pk=7)
+        radii = Treenode.objects.filter(skeleton_id=1).values_list('id', 'radius')
+        original = dict(radii)
+        response, radius_edit = self.native_edit_during_match(13,
+                '/%d/treenode/%d/radius' % (self.test_project_id, anchor.id), {
+                    'radius': 5, 'option': 5,
+                    'state': json.dumps({'edition_time': anchor.edition_time.isoformat()}),
+                })
+        self.assertEqual({'skeleton_id': 1, 'root_id': 13}, self.result(response))
+        self.assertEqual(400, radius_edit.status_code, radius_edit.content)
+        self.assertEqual('StateMatchingError', radius_edit.json()['type'])
+        self.assertEqual(original, dict(radii.all()))
+        self.assertEqual(13, self.root(1))
+        self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=5000)
     def test_native_insertion_on_selected_edge_does_not_deadlock(self):
         original_nodes = set(Treenode.objects.filter(skeleton_id=1).values_list('id', flat=True))
         parent = Treenode.objects.get(pk=11)
@@ -740,22 +758,8 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
             'edition_time': parent.edition_time.isoformat(),
             'children': [[child.id, child.edition_time.isoformat()]],
         })
-        native = Client()
-        native.cookies.update(self.client.cookies)
-        pending = []
-
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            def insert_before_graph_lock(execute, sql, params, many, context):
-                if 'ORDER BY t.id' in sql and 'FOR NO KEY UPDATE OF t' in sql and not pending:
-                    pending.append(self.overlapping_request(pool, lambda: native.post(
-                            '/%d/treenode/insert' % self.test_project_id, insertion)))
-                    self.assertFalse(pending[0].done(), 'Native insertion did not wait')
-                return execute(sql, params, many, context)
-
-            with connection.execute_wrapper(insert_before_graph_lock):
-                response = self.post(self.change(self.annotation_a, child.id))
-            self.assertEqual(1, len(pending), 'The test did not run the native insertion')
-            inserted = pending[0].result(timeout=10)
+        response, inserted = self.native_edit_during_match(child.id,
+                '/%d/treenode/insert' % self.test_project_id, insertion)
 
         self.assertEqual({'skeleton_id': 1, 'root_id': 13}, self.result(response))
         self.assertEqual(400, inserted.status_code, inserted.content)

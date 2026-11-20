@@ -550,10 +550,21 @@ def update_radius(request:HttpRequest, project_id=None, treenode_id=None) -> Jso
     if math.isnan(radius):
         raise ValueError("Radius '%s' is not a number!" % request.POST.get('radius'))
     option = int(request.POST.get('option', 0))
+    request_state = request.POST.get('state')
+    skeleton_id = None
+    if 1 <= option <= 5:
+        # Multi-node radius edits can acquire the same rows as rerooting.
+        anchor = Treenode.objects.filter(pk=treenode_id, project_id=project_id)
+        skeleton_id = anchor.values_list('skeleton_id', flat=True).first()
+        if skeleton_id is None:
+            raise state.StateMatchingError('The treenode no longer exists', request_state)
+        lock_skeleton_topology(project_id, [skeleton_id])
+
     cursor = connection.cursor()
     # Make sure the back-end is in the expected state
-    state.validate_state(treenode_id, request.POST.get('state'),
-            node=True, lock=True, cursor=cursor)
+    state.validate_state(treenode_id, request_state, node=True, lock=True, cursor=cursor)
+    if skeleton_id is not None and not anchor.filter(skeleton_id=skeleton_id).exists():
+        raise state.StateMatchingError('The treenode changed skeletons during the radius edit', request_state)
 
     def create_update_response(updated_nodes, radius) -> JsonResponse:
         return JsonResponse({
@@ -568,11 +579,17 @@ def update_radius(request:HttpRequest, project_id=None, treenode_id=None) -> Jso
         old_radii = update_node_radii(treenode_id, radius, cursor)
         return create_update_response(old_radii, radius)
 
+    if 5 == option:
+        # Update radius of all nodes (in a single query).
+        include = list(Treenode.objects.filter(skeleton_id=skeleton_id).values_list('id', flat=True))
+        old_radii = update_node_radii(include, radius, cursor)
+        return create_update_response(old_radii, radius)
+
     cursor.execute('''
     SELECT id, parent_id, radius
     FROM treenode
-    WHERE skeleton_id = (SELECT t.skeleton_id FROM treenode t WHERE id = %s)
-    ''' % treenode_id)
+    WHERE skeleton_id = %s
+    ''', [skeleton_id])
 
     if 1 == option:
         # Update radius from treenode_id to next branch or end node (included)
@@ -632,15 +649,6 @@ def update_radius(request:HttpRequest, project_id=None, treenode_id=None) -> Jso
         while parent:
             include.append(parent)
             parent = parents[parent]
-
-        old_radii = update_node_radii(include, radius, cursor)
-        return create_update_response(old_radii, radius)
-
-    if 5 == option:
-        # Update radius of all nodes (in a single query)
-        skeleton_id = Treenode.objects.get(pk=treenode_id).skeleton_id
-        include = list(Treenode.objects.filter(skeleton_id=skeleton_id) \
-                .values_list('id', flat=True))
 
         old_radii = update_node_radii(include, radius, cursor)
         return create_update_response(old_radii, radius)
