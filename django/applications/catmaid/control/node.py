@@ -322,22 +322,29 @@ class GridCachedNodeProvider(CachedNodeProvider):
         else:
             raise ValueError("Unexpected cached JSON tuple format")
 
-    def get_tuples(self, params, project_id, explicit_treenode_ids,
-            explicit_connector_ids, include_labels, with_relation_map,
-            with_origin) -> Tuple[Any, Optional[str]]:
+    def get_tuples(self, params, project_id, explicit_treenode_ids=(),
+            explicit_connector_ids=(), include_labels=False,
+            with_relation_map="used", with_origin=False) -> Tuple[Any, Optional[str]]:
         # Find a fitting grid index, return empty result if there is none.
         cursor = connection.cursor()
-        params['volume'] = (params['right'] - params['left']) * \
+        volume = (params['right'] - params['left']) * \
                 (params['bottom'] - params['top']) * (params['z2'] - params['z1'])
 
-        # Find grid that has a cell configuration closest to what we are looking for.
+        # Keep the closest grid even if the cache builder added this format
+        # to an existing grid without updating its metadata.
         cursor.execute("""
             SELECT id, cell_width, cell_height, cell_depth, n_lod_levels
             FROM node_grid_cache g
-            WHERE project_id = %(project_id)s
-            ORDER BY @((g.cell_width::double precision * g.cell_height::double precision * g.cell_depth::double precision) - %(volume)s::double precision) ASC
+            WHERE g.project_id = %(project_id)s AND g.enabled
+                AND g.id = COALESCE(%(cache_id)s, g.id)
+            ORDER BY @((g.cell_width::double precision * g.cell_height::double precision * g.cell_depth::double precision) - %(volume)s::double precision) ASC,
+                g.has_{data_type}_data DESC
             LIMIT 1;
-        """, params)
+        """.format(data_type=self.data_type), {
+            'project_id': project_id,
+            'cache_id': self.cache_id,
+            'volume': volume,
+        })
 
         grid_data = cursor.fetchone()
         if not grid_data:
@@ -352,7 +359,7 @@ class GridCachedNodeProvider(CachedNodeProvider):
 
         max_w_i = int(params['right'] // cell_width)
         max_h_i = int(params['bottom'] // cell_height)
-        max_d_i = int(params['z2'] // cell_depth)
+        max_d_i = math.ceil(params['z2'] / cell_depth) if params['z2'] > params['z1'] else min_d_i
 
         # Get the LOD this query wants to work with. It defines the index in the
         # data array up to which entries will be read for the data returned to
@@ -448,7 +455,14 @@ class GridCachedNodeProvider(CachedNodeProvider):
 
             return tuples, self.data_type
         else:
-            return None, None
+            return self._get_empty_tuples(params, project_id, grid_id,
+                    explicit_treenode_ids, explicit_connector_ids,
+                    include_labels, with_relation_map, with_origin)
+
+    def _get_empty_tuples(self, params, project_id, grid_id, explicit_treenode_ids,
+            explicit_connector_ids, include_labels, with_relation_map,
+            with_origin) -> Tuple[Any, Optional[str]]:
+        return None, None
 
 
 class GridCachedJsonNodeProvider(GridCachedNodeProvider):
@@ -462,18 +476,10 @@ class GridCachedJsonTextNodeProvider(GridCachedNodeProvider):
 class GridCachedMsgpackNodeProvider(GridCachedNodeProvider):
     data_type = 'msgpack'
 
-    def get_tuples(self, params, project_id, explicit_treenode_ids=(),
-            explicit_connector_ids=(), include_labels=False,
-            with_relation_map="used", with_origin=False) -> Tuple[Any, Optional[str]]:
-        tuples, data_type = super().get_tuples(
-            params, project_id, explicit_treenode_ids, explicit_connector_ids,
-            include_labels, with_relation_map, with_origin,
-        )
-        if tuples:
-            return bytes(tuples), data_type
-        if tuples is not None or data_type is not None:
-            return tuples, data_type
-        if not grid_cache.has_managed_grid(project_id, self.cache_id):
+    def _get_empty_tuples(self, params, project_id, grid_id, explicit_treenode_ids,
+            explicit_connector_ids, include_labels, with_relation_map,
+            with_origin) -> Tuple[Any, Optional[str]]:
+        if not grid_cache.has_managed_grid(project_id, grid_id):
             return None, None
 
         # A missing cell in a sparse grid represents empty space. Explicitly
@@ -493,7 +499,7 @@ class GridCachedMsgpackNodeProvider(GridCachedNodeProvider):
                     for name, relation_id in get_relation_to_id_map(project_id).items()
                 }
             tuples = [[], [], {}, False, relations]
-        return msgpack.packb(tuples), 'msgpack'
+        return tuples, 'json'
 
 class PostgisNodeProvider(BasicNodeProvider, metaclass=ABCMeta):
 

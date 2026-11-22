@@ -1,5 +1,6 @@
 """Exercise sparse MsgPack caches and spatial invalidation in CATMAID."""
 
+import json
 import math
 from unittest.mock import patch
 
@@ -7,10 +8,11 @@ import msgpack
 
 from django.contrib.auth import get_user_model
 from django.db import connection
-from django.test import SimpleTestCase, TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, TransactionTestCase, override_settings
 
 from catmaid import grid_cache
-from catmaid.control.node import GridCachedMsgpackNodeProvider
+from catmaid.control.node import GridCachedMsgpackNodeProvider, create_node_response
+from catmaid.management.commands import catmaid_cache_update_worker
 from catmaid.management.commands.catmaid_spatial_update_worker import GridWorker
 from catmaid.models import DirtyNodeGridCacheCell, NodeGridCache, Project, ProjectStack, Stack
 
@@ -299,11 +301,12 @@ class SparseGridProviderTests(GridCacheTestCase):
         super().setUpTestData()
         cls.project, cls.stack, cls.grids = make_grid_project("Sparse tracing grid")
 
-    def read(self, *, cache_id=None, **options):
+    def read(self, *, cache_id=None, bounds=None, **options):
         params = {
             "project_id": self.project.pk, "left": 0, "right": 4096,
             "top": 0, "bottom": 4096, "z1": 0, "z2": 8192,
         }
+        params.update(bounds or {})
         return GridCachedMsgpackNodeProvider(cache_id=cache_id).get_tuples(
             params, self.project.pk, **options,
         )
@@ -312,27 +315,67 @@ class SparseGridProviderTests(GridCacheTestCase):
         for grid in self.grids:
             with self.subTest(grid=grid.pk):
                 data, data_type = self.read(cache_id=grid.pk)
-                self.assertEqual(data_type, "msgpack")
-                self.assertEqual(msgpack.unpackb(data), [[], [], {}, False, {}])
+                response = create_node_response(data, {}, "msgpack", None, data_type)
+                self.assertEqual(msgpack.unpackb(response.content), [[], [], {}, False, {}])
 
-    def test_populated_cells_do_not_need_the_sparse_fallback(self):
-        cached = [[[17, None, 1, 2, 3]], [], {}, False, {}]
+    def insert_cell(self, grid, cached, z_index=0):
         with connection.cursor() as cursor:
             cursor.execute("""
                 INSERT INTO node_grid_cache_cell (grid_id, x_index, y_index, z_index, msgpack_data)
-                VALUES (%s, 0, 0, 0, ARRAY[%s]::bytea[])
-            """, (self.grids[0].pk, msgpack.packb(cached)))
+                VALUES (%s, 0, 0, %s, ARRAY[%s]::bytea[])
+            """, (grid.pk, z_index, msgpack.packb(cached)))
+
+    def test_populated_cells_do_not_need_the_sparse_fallback(self):
+        cached = [[[17, None, 1, 2, 3]], [], {}, False, {}]
+        self.insert_cell(self.grids[0], cached)
         with patch.object(grid_cache, "has_managed_grid") as detect_sparse:
             data, data_type = self.read()
         detect_sparse.assert_not_called()
         self.assertEqual(data_type, "msgpack")
         self.assertEqual(msgpack.unpackb(data)[:5], cached)
 
+    def test_reads_partial_z_cells_on_either_side_of_zero(self):
+        grid = self.grids[0]
+        for z_index, z1, z2 in ((0, 1, 5), (-1, -5, -1)):
+            with self.subTest(z1=z1, z2=z2):
+                cached = [[[17, None, 1, 2, z1]], [], {}, False, {}]
+                self.insert_cell(grid, cached, z_index=z_index)
+                data, _ = self.read(cache_id=grid.pk, bounds={"z1": z1, "z2": z2})
+                self.assertEqual(msgpack.unpackb(data)[:5], cached)
+
+    def test_reads_explicit_grid_instead_of_closer_grid(self):
+        first, second = self.grids
+        cached = [[[17, None, 1, 2, 3]], [], {}, False, {}]
+        self.insert_cell(first, [[], [], {}, False, {}])
+        self.insert_cell(second, cached)
+        data, _ = self.read(cache_id=second.pk, bounds={"z2": second.cell_depth})
+        self.assertEqual(msgpack.unpackb(data)[:5], cached)
+
+    def test_skips_disabled_grid_in_favor_of_enabled_grid(self):
+        first, second = self.grids
+        NodeGridCache.objects.filter(pk=first.pk).update(enabled=False)
+        cached = [[[17, None, 1, 2, 3]], [], {}, False, {}]
+        self.insert_cell(second, cached)
+        data, _ = self.read(bounds={"z2": second.cell_depth})
+        self.assertEqual(msgpack.unpackb(data)[:5], cached)
+
+    def test_reads_cached_format_added_to_an_existing_grid(self):
+        grid = self.grids[0]
+        # The cache builder can add data of another format to an existing grid.
+        NodeGridCache.objects.filter(pk=grid.pk).update(has_msgpack_data=False, has_json_data=True)
+        cached = [[[17, None, 1, 2, 3]], [], {}, False, {}]
+        self.insert_cell(grid, cached)
+        for cache_id in (None, grid.pk):
+            with self.subTest(cache_id=cache_id):
+                data, _ = self.read(cache_id=cache_id, bounds={"z2": grid.cell_depth})
+                self.assertIsNotNone(data)
+                self.assertEqual(msgpack.unpackb(data)[:5], cached)
+
     def test_legacy_single_level_grids_are_still_sparse(self):
         first, second = self.grids
         NodeGridCache.objects.filter(pk=second.pk).delete()
         NodeGridCache.objects.filter(pk=first.pk).update(n_lod_levels=1)
-        self.assertEqual(self.read()[1], "msgpack")
+        self.assertEqual(self.read()[0], [[], [], {}, False, {}])
 
     def test_falls_back_when_project_has_no_managed_cache(self):
         self.stack.metadata = {"read_only": False}
@@ -355,14 +398,55 @@ class SparseGridProviderTests(GridCacheTestCase):
             data, data_type = self.read(
                 explicit_treenode_ids=(17,), explicit_connector_ids=(23,), with_origin=True,
             )
-        self.assertEqual(data_type, "msgpack")
-        self.assertEqual(msgpack.unpackb(data), extra)
+        response = create_node_response(data, {}, "msgpack", None, data_type)
+        self.assertEqual(msgpack.unpackb(response.content), extra)
         self.assertEqual(get_extra.call_args.args[1:], (self.project.pk, (17,), (23,), False, "used", True))
 
     def test_includes_requested_relation_map_on_an_empty_read(self):
         with patch("catmaid.control.node.get_relation_to_id_map", return_value={"presynaptic_to": 7}):
-            data, _ = self.read(with_relation_map="all")
-        self.assertEqual(msgpack.unpackb(data, strict_map_key=False)[4], {7: "presynaptic_to"})
+            data, data_type = self.read(with_relation_map="all")
+        response = create_node_response(data, {}, "msgpack", None, data_type)
+        self.assertEqual(msgpack.unpackb(response.content, strict_map_key=False)[4], {7: "presynaptic_to"})
+
+    def test_json_response_includes_requested_relation_map_on_an_empty_read(self):
+        with patch("catmaid.control.node.get_relation_to_id_map", return_value={"presynaptic_to": 7}):
+            data, data_type = self.read(with_relation_map="all")
+        response = create_node_response(data, {}, "json", None, data_type)
+        self.assertEqual(json.loads(response.content), [[], [], {}, False, {"7": "presynaptic_to"}])
+
+
+class DirtyGridStartupTests(TransactionTestCase):
+    def test_worker_re_notifies_dirty_cells_from_multiple_batches_after_listening(self):
+        get_user_model().objects.create_superuser(username="dirty-grid-startup-test")
+        _, _, (grid, _) = make_grid_project("Restart backlog")
+        DirtyNodeGridCacheCell.objects.bulk_create([
+            DirtyNodeGridCacheCell(grid=grid, x_index=x, y_index=0, z_index=-1)
+            for x in range(12)
+        ])
+        original_times = dict(DirtyNodeGridCacheCell.objects.values_list("id", "invalidation_time"))
+        command = catmaid_cache_update_worker.Command()
+        payloads = []
+
+        def consume_notifications():
+            connection.connection.poll()
+            notifications = command.filter_notifies()
+            if not notifications:
+                raise InterruptedError
+            payloads.extend(json.loads(notification.payload) for notification in notifications)
+
+        with patch.object(catmaid_cache_update_worker, "signal"), \
+                patch.object(command, "wait_and_queue", side_effect=consume_notifications):
+            try:
+                command.handle(grid_cache=True, delay=0)
+            finally:
+                with connection.cursor() as cursor:
+                    cursor.execute('UNLISTEN "catmaid.dirty-cache"')
+
+        self.assertCountEqual(payloads, [
+            {"grid_id": grid.pk, "x": x, "y": 0, "z": -1} for x in range(12)
+        ])
+        self.assertEqual(dict(DirtyNodeGridCacheCell.objects.values_list("id", "invalidation_time")),
+                         original_times)
 
 
 class SpatialWorkerGridDiscoveryTests(GridCacheTestCase):
