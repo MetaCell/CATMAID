@@ -17,7 +17,7 @@ from django.core.exceptions import ImproperlyConfigured
 from django.http import HttpRequest, HttpResponse, HttpResponseBadRequest, Http404, \
         JsonResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404
-from django.db import connection
+from django.db import connection, transaction
 from django.db.models import Q
 from django.views.decorators.cache import never_cache
 from django.utils.decorators import method_decorator
@@ -2250,12 +2250,17 @@ def review_status(request:HttpRequest, project_id=None) -> JsonResponse:
     return JsonResponse(status)
 
 
+# Lets a managed provider require the checked reroot endpoint before exposing it.
+REROOT_CHECKS_NEURON_EDIT_PERMISSION = True
+
+
 @api_view(['POST'])
 @requires_user_role(UserRole.Annotate)
+@transaction.atomic
 def reroot_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     """ Make a particular treenode the new root node of the skeleton.
 
-    Any user with an Annotate role can reroot any skeleton. Returns the ID of
+    Requires permission to edit the neuron modeled by the skeleton. Returns
     the new root ID, the skeleton ID and the new edition timestamp.
     ---
     parameters:
@@ -2266,7 +2271,7 @@ def reroot_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
           paramType: form
     """
     treenode_id = request.POST.get('treenode_id', None)
-    treenode = _reroot_skeleton(treenode_id, project_id)
+    treenode = _reroot_skeleton(treenode_id, project_id, user=request.user)
     response_on_error = ''
     try:
         if treenode:
@@ -2286,9 +2291,12 @@ def reroot_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
         raise ValueError(response_on_error + ':' + str(e))
 
 
-def _reroot_skeleton(treenode_id, project_id):
-    """ Returns the treenode instance that is now root,
-    or False if the treenode was root already. """
+def _reroot_skeleton(treenode_id, project_id, *, user=None):
+    """ Return the new root or False if the node is already the root.
+
+    The standalone endpoint passes a user for authorization. Internal callers
+    that already hold the neuron lock and checked its edit permission can omit it.
+    """
     if treenode_id is None:
         raise ValueError('A treenode id has not been provided!')
 
@@ -2296,6 +2304,16 @@ def _reroot_skeleton(treenode_id, project_id):
     try:
         response_on_error = 'Failed to select treenode with id %s.' % treenode_id
         rootnode = Treenode.objects.get(id=treenode_id, project=project_id)
+
+        if user is not None:
+            skeleton_id = rootnode.skeleton_id
+            neuron_id = _get_neuronname_from_skeletonid(project_id, skeleton_id)['neuronid']
+            with connection.cursor() as cursor:
+                _lock_source_fragment_neurons(project_id, [neuron_id], cursor)
+                _check_fragment_source_nodes(project_id, {rootnode.id: skeleton_id},
+                        {skeleton_id: neuron_id}, cursor)
+            can_edit_class_instance_or_fail(user, neuron_id, 'neuron')
+            rootnode.refresh_from_db()
 
         # Obtain the treenode from the response
         first_parent = rootnode.parent_id
@@ -2372,6 +2390,8 @@ def _reroot_skeleton(treenode_id, project_id):
 
         return rootnode
 
+    except PermissionError:
+        raise
     except Exception as e:
         raise ValueError(f'{response_on_error}: {e}')
 
