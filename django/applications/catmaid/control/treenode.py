@@ -550,6 +550,8 @@ def update_radius(request:HttpRequest, project_id=None, treenode_id=None) -> Jso
         })
 
     if 0 == option:
+        # Task assignment can change edit permission while the node lock waits.
+        can_edit_treenode_or_fail(request.user, project_id, treenode_id)
         # Update radius only for the passed in treenode and return the old
         # radius.
         old_radii = update_node_radii(treenode_id, radius, cursor)

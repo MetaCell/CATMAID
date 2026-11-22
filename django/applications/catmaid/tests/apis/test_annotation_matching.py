@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from django.db import connection, connections, transaction
 from django.test import Client, override_settings
+from guardian.shortcuts import assign_perm
 
 from catmaid.control import annotation, skeleton, annotation_matching
 from catmaid.locks import SkeletonEditLockTimeout, lock_skeleton_topology
@@ -667,6 +668,28 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
                  Treenode.objects.filter(pk__in=[7, 11]).values_list('id', 'parent_id', 'confidence')}
         self.assertEqual({7: (11, edited.confidence), 11: (13, selected.confidence)}, edges)
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
+
+    def test_single_node_radius_rechecks_permission_after_matching_reroot(self):
+        user = User.objects.create_user(username='radius-editor')
+        assign_perm('can_annotate', user, self.test_project)
+        editor = Client()
+        editor.force_login(user)
+        node = Treenode.objects.get(pk=11)
+        url = '/%d/treenode/%d/radius' % (self.test_project_id, node.id)
+        payload = {'radius': node.radius + 125, 'option': 0, 'state': make_nocheck_state()}
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with transaction.atomic():
+                # Attaching the lock annotation changes the editor's permission.
+                assigned = self.post(self.change('locked', 13))
+                self.assertEqual({'skeleton_id': 1, 'root_id': 13}, self.result(assigned))
+                waiting = self.overlapping_request(pool, lambda: editor.post(url, payload))
+                self.assertFalse(waiting.done(), 'The radius edit did not wait for reroot')
+            response = waiting.result(timeout=10)
+
+        self.assertEqual(403, response.status_code, response.content)
+        self.assertEqual('PermissionError', response.json()['type'])
+        self.assertEqual(node.radius, Treenode.objects.get(pk=node.id).radius)
 
     def edge_insertion(self, parent_id, child_id):
         parent = Treenode.objects.get(pk=parent_id)

@@ -53,8 +53,7 @@ from catmaid.history import record_request_action as record_view
 from catmaid.control.link import LINK_TYPES
 from catmaid.control.neuron import _delete_if_empty, _get_all_skeletons_of_neuron, \
         _delete_neuron_as_user
-from catmaid.control.annotation import (annotations_for_skeleton,
-        _annotate_entities, _update_neuron_annotations, clear_annotations)
+from catmaid.control.annotation import _annotate_entities, _update_neuron_annotations, clear_annotations
 from catmaid.control.provenance import get_data_source, normalize_source_url
 from catmaid.control.review import get_review_status
 from catmaid.control.tree_util import find_root, reroot, edge_count_to_root
@@ -1322,16 +1321,16 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
         raise ValueError('The split edge changed. Retry the operation.')
 
     # Read metadata after serializing structural edits of the source neuron.
-    current_annotations = annotations_for_skeleton(project_id, skeleton_id)
+    current_annotations = _neuron_annotation_map(project_id, [neuron.id], cursor)
     upstream_annotation_map = (json.loads(upstream_annotation_map)
             if upstream_annotation_map else current_annotations)
     downstream_annotation_map = (json.loads(downstream_annotation_map)
             if downstream_annotation_map else current_annotations)
 
-    source_annotations = _neuron_annotation_map(project_id, [neuron.id], cursor,
-            source_fragments_only=True)
     # These annotations record inherited origin, rather than per-node membership.
     # Both split results therefore retain the complete source set.
+    source_annotations = {name: author for name, author in current_annotations.items()
+            if is_source_fragment_annotation_name(name)}
     upstream_annotation_map = _retain_source_fragment_annotations(
             upstream_annotation_map, source_annotations)
     downstream_annotation_map = _retain_source_fragment_annotations(
