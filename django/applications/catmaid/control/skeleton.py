@@ -2241,12 +2241,17 @@ def review_status(request:HttpRequest, project_id=None) -> JsonResponse:
     return JsonResponse(status)
 
 
+# Managed NeuroGlass uses this to require the checked endpoint.
+REROOT_CHECKS_NEURON_EDIT_PERMISSION = True
+
+
 @api_view(['POST'])
 @requires_user_role(UserRole.Annotate)
+@transaction.atomic
 def reroot_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     """ Make a particular treenode the new root node of the skeleton.
 
-    Any user with an Annotate role can reroot any skeleton. Returns the ID of
+    Requires permission to edit the neuron modeled by the skeleton. Returns
     the new root ID, the skeleton ID and the new edition timestamp.
     ---
     parameters:
@@ -2257,7 +2262,7 @@ def reroot_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
           paramType: form
     """
     treenode_id = request.POST.get('treenode_id', None)
-    treenode = _reroot_skeleton(treenode_id, project_id)
+    treenode = _reroot_skeleton(treenode_id, project_id, user=request.user)
     response_on_error = ''
     try:
         if treenode:
@@ -2278,7 +2283,7 @@ def reroot_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
 
 
 @transaction.atomic
-def _reroot_skeleton(treenode_id, project_id):
+def _reroot_skeleton(treenode_id, project_id, *, user):
     """ Returns the treenode instance that is now root,
     or False if the treenode was root already. """
     if treenode_id is None:
@@ -2292,6 +2297,13 @@ def _reroot_skeleton(treenode_id, project_id):
         raise
     except Exception as error:
         raise ValueError(f'Failed to select treenode with id {treenode_id}: {error}') from error
+
+    neuron_id = _get_neuronname_from_skeletonid(project_id, skeleton_id)['neuronid']
+    with connection.cursor() as cursor:
+        _lock_source_fragment_neurons(project_id, [neuron_id], cursor)
+        _check_fragment_source_nodes(project_id, {int(treenode_id): skeleton_id},
+                {skeleton_id: neuron_id}, cursor)
+    can_edit_class_instance_or_fail(user, neuron_id, 'neuron')
 
     return _reroot_skeleton_locked(treenode_id, project_id, skeleton_id)
 

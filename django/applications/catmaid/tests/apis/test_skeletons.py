@@ -1015,6 +1015,30 @@ class SkeletonsApiTests(CatmaidApiTestCase):
         self.assertJSONEqual(parsed_response, expected_result)
 
 
+    def test_reroot_skeleton_locked_by_another_user_is_refused(self):
+        self.fake_authentication()
+        skeleton_id = 373
+        neuron_id = _get_neuronname_from_skeletonid(
+            self.test_project_id, skeleton_id)['neuronid']
+        locking_user = User.objects.get(username='admin')
+        _annotate_entities(self.test_project_id, [neuron_id], {
+            'locked': {'user_id': locking_user.id},
+        })
+
+        nodes = Treenode.objects.filter(
+            project_id=self.test_project_id, skeleton_id=skeleton_id)
+        parents_before = dict(nodes.values_list('id', 'parent_id'))
+        log_count = Log.objects.count()
+
+        response = self.client.post(
+            f'/{self.test_project_id}/skeleton/reroot', {'treenode_id': 407})
+
+        self.assertStatus(response, code=403)
+        self.assertEqual(response.json()['type'], 'PermissionError')
+        self.assertIn('cannot edit neuron', response.json()['error'])
+        self.assertEqual(parents_before, dict(nodes.values_list('id', 'parent_id')))
+        self.assertEqual(log_count, Log.objects.count())
+
     def test_reroot_skeleton(self):
         self.fake_authentication()
 
