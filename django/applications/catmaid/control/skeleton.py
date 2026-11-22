@@ -2241,10 +2241,6 @@ def review_status(request:HttpRequest, project_id=None) -> JsonResponse:
     return JsonResponse(status)
 
 
-# Managed NeuroGlass uses this to require the checked endpoint.
-REROOT_CHECKS_NEURON_EDIT_PERMISSION = True
-
-
 @api_view(['POST'])
 @requires_user_role(UserRole.Annotate)
 @transaction.atomic
