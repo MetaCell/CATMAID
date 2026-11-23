@@ -9,7 +9,7 @@ DEFAULT_REPLAY_BATCH_SIZE = 10
 
 
 def requeue_dirty_grid_cells(cursor, batch_size=DEFAULT_REPLAY_BATCH_SIZE):
-    """Yield counts and ages for batches of dirty cells re-notified without changing them."""
+    """Re-notify persisted dirty cells, yielding after each batch."""
     cursor.execute('SELECT MAX(id) FROM dirty_node_grid_cache_cell')
     last_id, = cursor.fetchone()
     if last_id is None:
@@ -19,16 +19,15 @@ def requeue_dirty_grid_cells(cursor, batch_size=DEFAULT_REPLAY_BATCH_SIZE):
     while after_id < last_id:
         cursor.execute("""
             WITH batch AS (
-                SELECT id, grid_id, x_index, y_index, z_index, invalidation_time
+                SELECT id, grid_id, x_index, y_index, z_index
                 FROM dirty_node_grid_cache_cell
                 WHERE id > %s AND id <= %s
                 ORDER BY id
                 LIMIT %s
             )
-            SELECT id, EXTRACT(EPOCH FROM (statement_timestamp() - invalidation_time)),
-                pg_notify(%s, json_build_object(
-                    'grid_id', grid_id, 'x', x_index, 'y', y_index, 'z', z_index
-                )::text)
+            SELECT id, pg_notify(%s, json_build_object(
+                'grid_id', grid_id, 'x', x_index, 'y', y_index, 'z', z_index
+            )::text)
             FROM batch
             ORDER BY id
         """, [after_id, last_id, batch_size, DIRTY_CACHE_CHANNEL])
@@ -36,7 +35,7 @@ def requeue_dirty_grid_cells(cursor, batch_size=DEFAULT_REPLAY_BATCH_SIZE):
         if not rows:
             return
         after_id = rows[-1][0]
-        yield len(rows), max(float(row[1]) for row in rows)
+        yield
 
 
 def cell_lock_id(grid_id, x, y, z):
