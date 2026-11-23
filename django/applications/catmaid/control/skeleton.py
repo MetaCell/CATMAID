@@ -17,7 +17,7 @@ from django.core.exceptions import ImproperlyConfigured
 from django.http import HttpRequest, HttpResponse, HttpResponseBadRequest, Http404, \
         JsonResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404
-from django.db import connection
+from django.db import connection, transaction
 from django.db.models import Q
 from django.views.decorators.cache import never_cache
 from django.utils.decorators import method_decorator
@@ -29,7 +29,8 @@ from rest_framework.views import APIView
 
 from catmaid.error import ClientError
 from catmaid.history import add_log_entry
-from catmaid.locks import SkeletonEditLockTimeout, skeleton_edit_lock_timeout
+from catmaid.locks import lock_skeleton_topology, skeleton_edit_lock_timeout
+from catmaid.neuroglass_task_annotations import prepare_split_annotations
 from catmaid.neuroglass_tasks import protect_task_annotations_on_join
 from catmaid.source_fragments import (
     SOURCE_FRAGMENT_ANNOTATION_PREFIX, is_source_fragment_annotation_name,
@@ -52,9 +53,7 @@ from catmaid.history import record_request_action as record_view
 from catmaid.control.link import LINK_TYPES
 from catmaid.control.neuron import _delete_if_empty, _get_all_skeletons_of_neuron, \
         _delete_neuron_as_user
-from catmaid.control.annotation import (annotations_for_skeleton,
-        create_annotation_query, _annotate_entities, _update_neuron_annotations,
-        clear_annotations)
+from catmaid.control.annotation import _annotate_entities, _update_neuron_annotations, clear_annotations
 from catmaid.control.provenance import get_data_source, normalize_source_url
 from catmaid.control.review import get_review_status
 from catmaid.control.tree_util import find_root, reroot, edge_count_to_root
@@ -1218,24 +1217,6 @@ def connectivity_counts(request:HttpRequest, project_id=None) -> JsonResponse:
     })
 
 
-def check_annotations_on_split(project_id, skeleton_id, over_annotation_set,
-        under_annotation_set) -> bool:
-    """ With respect to annotations, a split is only correct if one part keeps
-    the whole set of annotations.
-    """
-    # Get current annotation set
-    annotation_query = create_annotation_query(project_id,
-        {'skeleton_id': skeleton_id})
-
-    # Check if current set is equal to under or over set
-    current_annotation_set = frozenset(a.name for a in annotation_query)
-    if not current_annotation_set.difference(over_annotation_set):
-        return True
-    if not current_annotation_set.difference(under_annotation_set):
-        return True
-
-    return False
-
 def check_new_annotations(project_id, user, entity_id, annotation_set) -> bool:
     """ With respect to annotations, the new annotation set is only valid if the
     user doesn't remove annotations for which (s)he has no permissions.
@@ -1284,14 +1265,20 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     neuron are updated to refer to the new skeleton.
 
     If upstream_annotation_map or downstream_annotation_map are not defined,
-    this is interpreted as keeping all annotations for the respective skeleton.
+    ordinary annotations are copied to the respective skeleton.
     Imported source-fragment identifiers are always copied to both parts,
     independently of the requested distribution of ordinary annotations.
+    NeuroGlass task annotations always stay on the original skeleton.
     """
     treenode_id = int(request.POST['treenode_id'])
-    treenode = Treenode.objects.get(pk=treenode_id)
-    skeleton_id = treenode.skeleton_id
     project_id = int(project_id)
+    skeleton_id = Treenode.objects.values_list('skeleton_id', flat=True).get(
+            id=treenode_id, project_id=project_id)
+    lock_skeleton_topology(project_id, [skeleton_id])
+    treenode = Treenode.objects.select_related('parent').get(id=treenode_id, project_id=project_id)
+    if treenode.skeleton_id != skeleton_id:
+        raise ValueError('The treenode changed skeletons during split, please retry')
+
     upstream_annotation_map = request.POST.get('upstream_annotation_map')
     downstream_annotation_map = request.POST.get('downstream_annotation_map')
     cursor = connection.cursor()
@@ -1329,26 +1316,32 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     locked_nodes = cursor.fetchall()
     _check_fragment_source_nodes(project_id, {treenode_id: skeleton_id},
             {skeleton_id: neuron.id}, cursor)
+    locked_parent = next(parent for node, parent in locked_nodes if node == treenode_id)
+    if locked_parent != treenode.parent_id:
+        raise ValueError('The split edge changed. Retry the operation.')
 
     # Read metadata after serializing structural edits of the source neuron.
-    if not upstream_annotation_map or not downstream_annotation_map:
-        current_annotations = annotations_for_skeleton(project_id, skeleton_id)
+    current_annotations = _neuron_annotation_map(project_id, [neuron.id], cursor)
     upstream_annotation_map = (json.loads(upstream_annotation_map)
             if upstream_annotation_map else current_annotations)
     downstream_annotation_map = (json.loads(downstream_annotation_map)
             if downstream_annotation_map else current_annotations)
-    source_annotations = _neuron_annotation_map(project_id, [neuron.id], cursor,
-            source_fragments_only=True)
+
     # These annotations record inherited origin, rather than per-node membership.
     # Both split results therefore retain the complete source set.
+    source_annotations = {name: author for name, author in current_annotations.items()
+            if is_source_fragment_annotation_name(name)}
     upstream_annotation_map = _retain_source_fragment_annotations(
             upstream_annotation_map, source_annotations)
     downstream_annotation_map = _retain_source_fragment_annotations(
             downstream_annotation_map, source_annotations)
 
-    if not check_annotations_on_split(project_id, skeleton_id,
-            frozenset(upstream_annotation_map.keys()),
-            frozenset(downstream_annotation_map.keys())):
+    upstream_annotation_map, downstream_annotation_map, distributable_annotations = (
+        prepare_split_annotations(current_annotations,
+                upstream_annotation_map, downstream_annotation_map))
+    # Either piece can keep the complete set of distributable annotations.
+    if not (distributable_annotations.issubset(upstream_annotation_map)
+            or distributable_annotations.issubset(downstream_annotation_map)):
         raise ValueError("Annotation distribution is not valid for splitting. "
                 "One part has to keep the whole set of annotations!")
 
@@ -1417,14 +1410,12 @@ def split_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     # setting new root treenode's parent to null
     Treenode.objects.filter(id=treenode_id).update(parent=None, editor=request.user)
 
-    # Update annotations of existing neuron to have only over set
-    if upstream_annotation_map:
-        _update_neuron_annotations(project_id, neuron.id,
-                upstream_annotation_map, allow_reserved=True)
-
-    # Update annotations of under skeleton
+    # Link the new piece first so moving the last use of an annotation
+    # preserves its identity and meta-annotations.
     _annotate_entities(project_id, [new_neuron.id], downstream_annotation_map,
             allow_reserved=True)
+    _update_neuron_annotations(project_id, neuron.id,
+            upstream_annotation_map, allow_reserved=True)
 
     # If samplers reference this skeleton, make sure they are updated as well
     sampler_info = prune_samplers(skeleton_id, graph, treenode_parent, treenode)
@@ -2252,10 +2243,11 @@ def review_status(request:HttpRequest, project_id=None) -> JsonResponse:
 
 @api_view(['POST'])
 @requires_user_role(UserRole.Annotate)
+@transaction.atomic
 def reroot_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
     """ Make a particular treenode the new root node of the skeleton.
 
-    Any user with an Annotate role can reroot any skeleton. Returns the ID of
+    Requires permission to edit the neuron modeled by the skeleton. Returns
     the new root ID, the skeleton ID and the new edition timestamp.
     ---
     parameters:
@@ -2266,7 +2258,7 @@ def reroot_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
           paramType: form
     """
     treenode_id = request.POST.get('treenode_id', None)
-    treenode = _reroot_skeleton(treenode_id, project_id)
+    treenode = _reroot_skeleton(treenode_id, project_id, user=request.user)
     response_on_error = ''
     try:
         if treenode:
@@ -2286,16 +2278,39 @@ def reroot_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
         raise ValueError(response_on_error + ':' + str(e))
 
 
-def _reroot_skeleton(treenode_id, project_id):
+@transaction.atomic
+def _reroot_skeleton(treenode_id, project_id, *, user):
     """ Returns the treenode instance that is now root,
     or False if the treenode was root already. """
     if treenode_id is None:
         raise ValueError('A treenode id has not been provided!')
 
-    response_on_error = ''
     try:
-        response_on_error = 'Failed to select treenode with id %s.' % treenode_id
+        skeleton_id = Treenode.objects.values_list('skeleton_id', flat=True).get(
+                id=treenode_id, project=project_id)
+        lock_skeleton_topology(project_id, [skeleton_id])
+    except (ClientError, ImproperlyConfigured):
+        raise
+    except Exception as error:
+        raise ValueError(f'Failed to select treenode with id {treenode_id}: {error}') from error
+
+    neuron_id = _get_neuronname_from_skeletonid(project_id, skeleton_id)['neuronid']
+    with connection.cursor() as cursor:
+        _lock_source_fragment_neurons(project_id, [neuron_id], cursor)
+        _check_fragment_source_nodes(project_id, {int(treenode_id): skeleton_id},
+                {skeleton_id: neuron_id}, cursor)
+    can_edit_class_instance_or_fail(user, neuron_id, 'neuron')
+
+    return _reroot_skeleton_locked(treenode_id, project_id, skeleton_id)
+
+
+def _reroot_skeleton_locked(treenode_id, project_id, skeleton_id):
+    """Reroot within a transaction that already holds the skeleton's topology lock."""
+    response_on_error = f'Failed to select treenode with id {treenode_id}.'
+    try:
         rootnode = Treenode.objects.get(id=treenode_id, project=project_id)
+        if rootnode.skeleton_id != skeleton_id:
+            raise ValueError('The treenode changed skeletons during reroot, please retry')
 
         # Obtain the treenode from the response
         first_parent = rootnode.parent_id
@@ -2304,10 +2319,32 @@ def _reroot_skeleton(treenode_id, project_id):
         if first_parent is None:
             return False
 
-        q_treenode = Treenode.objects.filter(
-                skeleton_id=rootnode.skeleton_id,
-                project=project_id).values_list('id', 'parent_id', 'confidence')
-        nodes = {tnid: (parent_id, confidence) for (tnid, parent_id, confidence) in list(q_treenode)}
+        # Native node creation can append a child while locking only its parent.
+        # An append committed during a lock wait can introduce more nodes:
+        # repeat until every node in the fresh graph is covered by our locks.
+        while True:
+            with connection.cursor() as cursor, skeleton_edit_lock_timeout(cursor):
+                cursor.execute('''
+                    SELECT t.id FROM treenode t
+                    WHERE t.project_id = %s AND t.skeleton_id = %s
+                    ORDER BY t.id
+                    FOR NO KEY UPDATE OF t
+                ''', [int(project_id), skeleton_id])
+                locked_node_ids = {row[0] for row in cursor.fetchall()}
+
+            nodes = {node_id: (parent_id, confidence)
+                    for node_id, parent_id, confidence in Treenode.objects.filter(
+                        skeleton_id=skeleton_id, project=project_id).values_list(
+                            'id', 'parent_id', 'confidence')}
+            if nodes.keys() <= locked_node_ids:
+                break
+
+        rootnode.refresh_from_db()
+        if rootnode.skeleton_id != skeleton_id:
+            raise ValueError('The treenode changed skeletons during reroot, please retry')
+        first_parent = rootnode.parent_id
+        if first_parent is None:
+            return False
 
         # Make sure this skeleton is not used in a sampler
         samplers = Sampler.objects.prefetch_related('samplerdomain_set') \
@@ -2372,6 +2409,8 @@ def _reroot_skeleton(treenode_id, project_id):
 
         return rootnode
 
+    except (ClientError, ImproperlyConfigured):
+        raise
     except Exception as e:
         raise ValueError(f'{response_on_error}: {e}')
 
@@ -2438,27 +2477,22 @@ def join_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
 
 
 def _lock_source_fragment_neurons(project_id, neuron_ids, cursor) -> None:
-    """Serialize inheritance even when edits select different nodes of one neuron.
+    """Lock neurons before checking edit permission or reading provenance.
 
-    Read provenance after locking its owner, then recheck captured node ownership.
-    Wait briefly for a conflicting editor; longer contention asks the caller to
-    retry. Limit only this lock acquisition, not the rest of the request.
+    Raise a retryable error if a conflicting edit holds the lock too long.
     """
     expected = set(neuron_ids)
-    try:
-        with skeleton_edit_lock_timeout(cursor):
-            cursor.execute("""
-                SELECT ci.id
-                FROM class_instance ci
-                JOIN class c ON c.id = ci.class_id
-                WHERE ci.project_id = %s AND ci.id = ANY(%s::bigint[])
-                    AND c.class_name = 'neuron'
-                ORDER BY ci.id
-                FOR NO KEY UPDATE OF ci
-            """, (project_id, sorted(expected)))
-            locked = {row[0] for row in cursor.fetchall()}
-    except SkeletonEditLockTimeout as error:
-        raise ValueError('A source neuron is being edited; retry the operation.') from error
+    with skeleton_edit_lock_timeout(cursor):
+        cursor.execute("""
+            SELECT ci.id
+            FROM class_instance ci
+            JOIN class c ON c.id = ci.class_id
+            WHERE ci.project_id = %s AND ci.id = ANY(%s::bigint[])
+                AND c.class_name = 'neuron'
+            ORDER BY ci.id
+            FOR NO KEY UPDATE OF ci
+        """, (project_id, sorted(expected)))
+        locked = {row[0] for row in cursor.fetchall()}
     if locked != expected:
         raise ValueError('A source neuron changed during the operation; retry it.')
 
@@ -2576,6 +2610,7 @@ def get_stable_partner_annotation(project_id):
     return row[0] if row else 'stable'
 
 
+@transaction.atomic
 def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
         annotation_map, sampler_handling=None, lose_sampler_handling='keep-samplers',
         from_name_reference=False) -> Dict[str, Any]:
@@ -2631,6 +2666,10 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
                 user, to_neuron['neuronid'], 'neuron')
 
         cursor = connection.cursor()
+
+        # Join also reroots one partner. Take the same locks as reroot and
+        # annotation matching before either neuron or treenode row locks.
+        lock_skeleton_topology(project_id, [from_skid, to_skid])
 
         # Acquire ownership locks before reading metadata that can change while
         # waiting, including edit restrictions, names and stable-winner labels.
@@ -2756,7 +2795,7 @@ def _join_skeleton(user, from_treenode_id, to_treenode_id, project_id,
 
         # Reroot to_skid at to_treenode if necessary
         response_on_error = 'Could not reroot at treenode %s' % to_treenode_id
-        _reroot_skeleton(to_treenode_id, project_id)
+        _reroot_skeleton_locked(to_treenode_id, project_id, to_skid)
 
         # If samplers reference this skeleton, make sure they are updated as well
         sampler_info = _update_samplers_in_merge(project_id, user.id, from_skid, to_skid,

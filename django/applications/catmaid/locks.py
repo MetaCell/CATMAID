@@ -2,7 +2,7 @@ from contextlib import contextmanager
 
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
-from django.db import OperationalError, transaction
+from django.db import OperationalError, connection, transaction
 
 from catmaid.error import ClientError
 
@@ -49,3 +49,14 @@ def skeleton_edit_lock_timeout(cursor):
         if (getattr(cause, 'sqlstate', None) or getattr(cause, 'pgcode', None)) == '55P03':
             raise SkeletonEditLockTimeout("The target is being edited. Please retry.") from error
         raise
+
+
+def lock_skeleton_topology(project_id, skeleton_ids):
+    """Serialize changes to skeleton topology within the caller's transaction."""
+    with connection.cursor() as cursor, skeleton_edit_lock_timeout(cursor):
+        cursor.execute('''
+            SELECT pg_advisory_xact_lock(
+                hashtextextended('catmaid-reroot:' || %s::text || ':' || id, 0))
+            FROM unnest(%s::bigint[]) AS skeletons(id)
+            ORDER BY id
+        ''', [int(project_id), sorted(set(skeleton_ids))])

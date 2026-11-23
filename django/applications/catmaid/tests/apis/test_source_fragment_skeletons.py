@@ -21,6 +21,7 @@ from catmaid.control.skeleton import (
     _get_neuronname_from_skeletonid, _import_skeleton, _join_skeleton,
     _lock_source_fragment_neurons,
 )
+from catmaid.locks import SkeletonEditLockTimeout
 from catmaid.models import ClassInstance, ClassInstanceClassInstance, Treenode, User
 from catmaid.source_fragments import SOURCE_FRAGMENT_ANNOTATION_PREFIX
 from catmaid.state import make_nocheck_state
@@ -507,7 +508,7 @@ class SourceFragmentTransactionTests(SourceFragmentFixtures, CatmaidApiTransacti
                     with connections['default'].cursor() as cursor:
                         cursor.execute("SELECT set_config('lock_timeout', %s, true)",
                                 [f'{previous_timeout}ms'])
-                        with self.assertRaisesRegex(ValueError, 'being edited; retry'):
+                        with self.assertRaises(SkeletonEditLockTimeout):
                             _lock_source_fragment_neurons(self.test_project_id,
                                     [free.neuron, winner.neuron], cursor)
                         cursor.execute("SELECT setting::integer FROM pg_settings WHERE name='lock_timeout'")
@@ -602,7 +603,7 @@ class SourceFragmentTransactionTests(SourceFragmentFixtures, CatmaidApiTransacti
         first = self.fragment('B', ['B'])
         second = self.fragment('C', ['C'])
         with self.paused_join(winner, first):
-            with self.assertRaisesRegex(ValueError, 'being edited; retry'):
+            with self.assertRaises(SkeletonEditLockTimeout):
                 with transaction.atomic():
                     _join_skeleton(self.test_user, winner.nodes[2], second.nodes[0],
                             self.test_project_id, {})
@@ -620,8 +621,8 @@ class SourceFragmentTransactionTests(SourceFragmentFixtures, CatmaidApiTransacti
                 'upstream_annotation_map': '{}', 'downstream_annotation_map': '{}'}
         with self.paused_join(winner, loser):
             response = self.client.post(f'/{self.test_project_id}/skeleton/split', data)
-            self.assertStatus(response, 400)
-            self.assertIn('being edited; retry', response.json()['error'])
+            self.assertStatus(response, 409)
+            self.assertEqual({'code': 'edit_lock_timeout'}, response.json()['meta'])
         response = self.client.post(f'/{self.test_project_id}/skeleton/split', data)
         self.assertStatus(response)
         new_skeleton = response.json()['new_skeleton_id']

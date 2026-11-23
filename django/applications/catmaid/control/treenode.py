@@ -16,7 +16,7 @@ from rest_framework.decorators import api_view
 
 from catmaid import state
 from catmaid.error import ClientError
-from catmaid.locks import skeleton_edit_lock_timeout
+from catmaid.locks import lock_skeleton_topology, skeleton_edit_lock_timeout
 from catmaid.models import UserRole, Treenode, ClassInstance, \
         TreenodeConnector, Location, SamplerInterval
 from catmaid.control.authentication import requires_user_role, \
@@ -550,6 +550,8 @@ def update_radius(request:HttpRequest, project_id=None, treenode_id=None) -> Jso
         })
 
     if 0 == option:
+        # Task assignment can change edit permission while the node lock waits.
+        can_edit_treenode_or_fail(request.user, project_id, treenode_id)
         # Update radius only for the passed in treenode and return the old
         # radius.
         old_radii = update_node_radii(treenode_id, radius, cursor)
@@ -642,6 +644,15 @@ def delete_treenode(request:HttpRequest, project_id=None) -> JsonResponse:
     # Raise an exception if the user doesn't have permission to edit the
     # treenode.
     can_edit_or_fail(request.user, treenode_id, 'treenode')
+
+    # Reroot locks the skeleton before any treenode rows. Deletion can also
+    # change those parent links, so it must take the locks in the same order.
+    skeleton_id = Treenode.objects.values_list('skeleton_id', flat=True).get(
+            id=treenode_id, project_id=project_id)
+    lock_skeleton_topology(project_id, [skeleton_id])
+    if not Treenode.objects.filter(id=treenode_id, project_id=project_id, skeleton_id=skeleton_id).exists():
+        raise ValueError('The treenode changed skeletons during deletion, please retry')
+
     # Raise an Exception if the user doesn't have permission to edit the neuron
     # the skeleton of the treenode is modeling.
     can_edit_treenode_or_fail(request.user, project_id, treenode_id)
@@ -1066,11 +1077,14 @@ def update_confidence(request:HttpRequest, project_id=None, treenode_id=None) ->
             required: true
     """
     tnid = int(treenode_id)
-    can_edit_treenode_or_fail(request.user, project_id, tnid)
     cursor = connection.cursor()
 
+    # Rerooting can change the edge and edit permissions while we wait.
+    cursor.execute('SELECT id FROM treenode WHERE id = %s AND project_id = %s '
+            'FOR NO KEY UPDATE', [tnid, project_id])
+    can_edit_treenode_or_fail(request.user, project_id, tnid)
     state.validate_state(tnid, request.POST.get('state'),
-            node=True, lock=True, cursor=cursor)
+            node=True, lock=False, cursor=cursor)
 
     to_connector = get_request_bool(request.POST, 'to_connector', False)
     partner_ids = get_request_list(request.POST, 'partner_ids', None, int)
