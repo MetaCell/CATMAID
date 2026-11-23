@@ -2407,6 +2407,7 @@ def _reroot_skeleton_locked(treenode_id, project_id, skeleton_id):
                 WHERE treenode.id = v.id
                 ''' % ','.join(['(%s,%s,%s)' % node for node in new_parents]))
 
+        rootnode.refresh_from_db(fields=['parent_id', 'confidence', 'edition_time'])
         return rootnode
 
     except (ClientError, ImproperlyConfigured):
