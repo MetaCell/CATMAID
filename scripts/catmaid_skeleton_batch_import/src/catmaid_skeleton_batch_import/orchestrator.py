@@ -258,7 +258,7 @@ def _classified_runtime_error(
             getattr(cause, "diag", None), "sqlstate", None
         )
         if sqlstate == "42501":
-            return InvalidInputError(
+            return OperationalFailureError(
                 f"Database role lacks a required privilege during {context}: {exc}"
             )
         if preflight:
