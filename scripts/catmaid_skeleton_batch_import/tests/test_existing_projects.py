@@ -135,6 +135,24 @@ def test_project_selection_is_read_only_and_requires_tracing():
         project.existing_project_context(123, components=components)
 
 
+def test_missing_database_privilege_is_an_operational_failure(monkeypatch):
+    db = pytest.importorskip("django.db")
+
+    class InsufficientPrivilege(Exception):
+        pgcode = "42501"
+
+    def denied(_connection):
+        message = 'permission denied to set parameter "session_replication_role"'
+        raise db.ProgrammingError(message) from InsufficientPrivilege(message)
+
+    monkeypatch.setattr(database, "bootstrap_django", object)
+    monkeypatch.setattr(database, "preflight_database", denied)
+
+    with pytest.raises(OperationalFailureError, match="Database role lacks a required privilege") as error:
+        orchestrator._database_context(None, {})
+    assert error.value.category == "operation_failed"
+
+
 def test_append_uses_bulk_materialization_in_one_atomic_batch(monkeypatch):
     connection = Connection()
     monkeypatch.setitem(sys.modules, "django.db", SimpleNamespace(
