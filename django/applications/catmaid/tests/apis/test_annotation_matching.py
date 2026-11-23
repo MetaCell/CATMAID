@@ -399,6 +399,23 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
         self.assertEqual(11, self.root(1))
 
     @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=75)
+    def test_native_reroot_reports_neuron_lock_timeout_as_409(self):
+        parents = dict(Treenode.objects.filter(skeleton_id=1).values_list('id', 'parent_id'))
+        url = '/%d/skeleton/reroot' % self.test_project_id
+        payload = {'treenode_id': 11}
+
+        with self.held_lock('SELECT id FROM class_instance WHERE id=%s FOR UPDATE',
+                [SKELETON_1_NEURON]):
+            response = self.client.post(url, payload)
+
+        self.assertEqual(409, response.status_code, response.content)
+        self.assertEqual({'code': 'edit_lock_timeout'}, response.json()['meta'])
+        self.assertEqual(parents,
+                dict(Treenode.objects.filter(skeleton_id=1).values_list('id', 'parent_id')))
+        self.assertStatus(self.client.post(url, payload))
+        self.assertEqual(11, self.root(1))
+
+    @override_settings(SKELETON_EDIT_LOCK_TIMEOUT_MS=75)
     def test_topology_lock_timeout_restores_policy_and_releases_partial_locks(self):
         with self.held_topology_lock(373):
             for previous_timeout in (25, 2500):
@@ -668,6 +685,20 @@ class AnnotationMatchingConcurrencyTests(AnnotationMatchingFixtures, CatmaidApiT
                  Treenode.objects.filter(pk__in=[7, 11]).values_list('id', 'parent_id', 'confidence')}
         self.assertEqual({7: (11, edited.confidence), 11: (13, selected.confidence)}, edges)
         self.assertEqual({SKELETON_1_NEURON}, self.neurons_with(self.annotation_a))
+
+    def test_confidence_edit_can_proceed_while_treenode_key_is_shared(self):
+        node = Treenode.objects.get(pk=11)
+        url = '/%d/treenodes/%d/confidence' % (self.test_project_id, node.id)
+        payload = {'new_confidence': 3, 'state': make_nocheck_state()}
+
+        with self.held_lock('SELECT id FROM treenode WHERE id=%s FOR KEY SHARE', [node.id]):
+            with transaction.atomic(), connection.cursor() as cursor:
+                # Bound the request even if it tries to acquire a conflicting lock.
+                cursor.execute("SET LOCAL lock_timeout = '400ms'")
+                response = self.client.post(url, payload)
+            self.assertStatus(response)
+
+        self.assertEqual(3, Treenode.objects.get(pk=node.id).confidence)
 
     def test_single_node_radius_rechecks_permission_after_matching_reroot(self):
         user = User.objects.create_user(username='radius-editor')

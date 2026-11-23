@@ -41,9 +41,11 @@ included in this changelog.
   The new parameter 'with_edition_times' can now be used to return the edition
   time for every returned treenode, connector and labe/tag.
 
-- `POST /{project_id}/skeletons/reroot`:
-  A successful reroot operation now returns also the new root node's edition
-  time.
+- `POST /{project_id}/skeleton/reroot` now requires permission to edit the neuron
+  modeled by the skeleton, in addition to the project's Annotate role.
+  A successful reroot also returns the new root node's edition time.
+  Lock acquisition timeouts return a retryable 409 with
+  `meta.code: "edit_lock_timeout"`.
 
 ### Deprecations
 

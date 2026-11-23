@@ -508,7 +508,7 @@ class SourceFragmentTransactionTests(SourceFragmentFixtures, CatmaidApiTransacti
                     with connections['default'].cursor() as cursor:
                         cursor.execute("SELECT set_config('lock_timeout', %s, true)",
                                 [f'{previous_timeout}ms'])
-                        with self.assertRaisesRegex(ValueError, 'being edited; retry'):
+                        with self.assertRaises(SkeletonEditLockTimeout):
                             _lock_source_fragment_neurons(self.test_project_id,
                                     [free.neuron, winner.neuron], cursor)
                         cursor.execute("SELECT setting::integer FROM pg_settings WHERE name='lock_timeout'")

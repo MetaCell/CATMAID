@@ -29,7 +29,7 @@ from rest_framework.views import APIView
 
 from catmaid.error import ClientError
 from catmaid.history import add_log_entry
-from catmaid.locks import SkeletonEditLockTimeout, lock_skeleton_topology, skeleton_edit_lock_timeout
+from catmaid.locks import lock_skeleton_topology, skeleton_edit_lock_timeout
 from catmaid.neuroglass_task_annotations import prepare_split_annotations
 from catmaid.neuroglass_tasks import protect_task_annotations_on_join
 from catmaid.source_fragments import (
@@ -2477,27 +2477,22 @@ def join_skeleton(request:HttpRequest, project_id=None) -> JsonResponse:
 
 
 def _lock_source_fragment_neurons(project_id, neuron_ids, cursor) -> None:
-    """Serialize inheritance even when edits select different nodes of one neuron.
+    """Lock neurons before checking edit permission or reading provenance.
 
-    Read provenance after locking its owner, then recheck captured node ownership.
-    Wait briefly for a conflicting editor; longer contention asks the caller to
-    retry. Limit only this lock acquisition, not the rest of the request.
+    Raise a retryable error if a conflicting edit holds the lock too long.
     """
     expected = set(neuron_ids)
-    try:
-        with skeleton_edit_lock_timeout(cursor):
-            cursor.execute("""
-                SELECT ci.id
-                FROM class_instance ci
-                JOIN class c ON c.id = ci.class_id
-                WHERE ci.project_id = %s AND ci.id = ANY(%s::bigint[])
-                    AND c.class_name = 'neuron'
-                ORDER BY ci.id
-                FOR NO KEY UPDATE OF ci
-            """, (project_id, sorted(expected)))
-            locked = {row[0] for row in cursor.fetchall()}
-    except SkeletonEditLockTimeout as error:
-        raise ValueError('A source neuron is being edited; retry the operation.') from error
+    with skeleton_edit_lock_timeout(cursor):
+        cursor.execute("""
+            SELECT ci.id
+            FROM class_instance ci
+            JOIN class c ON c.id = ci.class_id
+            WHERE ci.project_id = %s AND ci.id = ANY(%s::bigint[])
+                AND c.class_name = 'neuron'
+            ORDER BY ci.id
+            FOR NO KEY UPDATE OF ci
+        """, (project_id, sorted(expected)))
+        locked = {row[0] for row in cursor.fetchall()}
     if locked != expected:
         raise ValueError('A source neuron changed during the operation; retry it.')
 
