@@ -11,6 +11,7 @@ from django.shortcuts import get_object_or_404
 
 from rest_framework.decorators import api_view
 
+from catmaid.review_items import reject_reserved_label_change
 from catmaid.models import Project, Class, ClassInstance, Relation, Connector, \
         ConnectorClassInstance, UserRole, Treenode, TreenodeClassInstance, \
         ChangeRequest
@@ -272,6 +273,9 @@ def label_update(request:HttpRequest, project_id, location_id, ntype:str) -> Jso
     # that are not in the new list.
     existing_labels = table.objects.filter(**kwargs).select_related('class_instance')
     existing_names = set(ele.class_instance.name for ele in existing_labels)
+    requested_names = set(new_tags)
+    reject_reserved_label_change(requested_names - existing_names,
+            existing_names - requested_names if delete_existing_labels else ())
     duplicate_labels = table.objects.filter(**kwargs).exclude(class_instance__name__in=new_tags).select_related('class_instance')
 
     other_labels = []
@@ -423,6 +427,7 @@ def remove_label_link(request:HttpRequest, project_id, ntype:str, location_id) -
     label = request.POST.get('tag', None)
     if not label:
         raise ValueError("No label parameter given")
+    reject_reserved_label_change((), [label])
 
     table = get_link_model(ntype)
     try:
