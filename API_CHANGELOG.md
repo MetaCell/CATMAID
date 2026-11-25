@@ -42,7 +42,8 @@ included in this changelog.
 
 - `POST /{project_id}/label/{ntype}/{location_id}/update` and `.../remove`: adding or removing
   the reserved `neuroglass:review-item` label returns HTTP 403; only NeuroGlass imports
-  (`label_treenodes`, `prune_treenode_labels`) write it.
+  (`resolve_review_items`, which finds the treenode at each review-item position and labels it,
+  and `prune_treenode_labels`) write it.
 
 - `GET|POST /{project_id}/skeletons/compact-detail`:
   The new parameter 'with_edition_times' can now be used to return the edition

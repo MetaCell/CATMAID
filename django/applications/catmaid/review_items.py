@@ -9,10 +9,12 @@ from django.db import connection
 
 from catmaid.control.common import get_request_bool
 from catmaid.error import ClientError
+from catmaid.models import Class, ClassInstance, Relation, TreenodeClassInstance
 
 REVIEW_ITEM_LABEL = "neuroglass:review-item"
 MAX_REPORTED_IDS = 1000
 CONFIRM_PARAMETER = "confirm_review_items"
+LABEL_CHUNK = 10_000
 
 
 class ReviewItemNodesProtected(ClientError):
@@ -61,3 +63,39 @@ def reject_reserved_label_change(added: Iterable[str], removed: Iterable[str]) -
     if REVIEW_ITEM_LABEL in set(added) | set(removed):
         from catmaid.control.authentication import PermissionError
         raise PermissionError(f"The {REVIEW_ITEM_LABEL} label is managed by NeuroGlass imports")
+
+
+def _chunks(values):
+    for start in range(0, len(values), LABEL_CHUNK):
+        yield values[start:start + LABEL_CHUNK]
+
+
+def _label_instance(project_id: int, name: str, user) -> ClassInstance:
+    label_class = Class.objects.get(project_id=project_id, class_name="label")
+    label = ClassInstance.objects.filter(project_id=project_id, class_column=label_class, name=name).order_by("pk").first()
+    return label or ClassInstance.objects.create(project_id=project_id, class_column=label_class, name=name, user=user)
+
+
+def label_treenodes(project_id: int, label_name: str, treenode_ids: Iterable[int], user) -> tuple[int, int]:
+    """Label treenodes of one project, skipping those that carry the label already.
+
+    Returns how many were labelled and how many already were. The caller vouches that the
+    treenodes exist in the project.
+    """
+    ids = sorted({int(treenode_id) for treenode_id in treenode_ids})
+    if not ids:
+        return 0, 0
+    label = _label_instance(project_id, label_name, user)
+    relation = Relation.objects.get(project_id=project_id, relation_name="labeled_as")
+    already = set()
+    for chunk in _chunks(ids):
+        already.update(TreenodeClassInstance.objects.filter(
+            project_id=project_id, relation=relation, class_instance=label, treenode_id__in=chunk,
+        ).values_list("treenode_id", flat=True))
+    TreenodeClassInstance.objects.bulk_create(
+        (TreenodeClassInstance(user=user, project_id=project_id, relation=relation, treenode_id=treenode_id,
+                               class_instance=label)
+         for treenode_id in ids if treenode_id not in already),
+        batch_size=LABEL_CHUNK,
+    )
+    return len(ids) - len(already), len(already)
