@@ -1,7 +1,41 @@
-"""Publish grid cells atomically across bulk rebuilds and normal cache workers."""
+"""Coordinate grid-cache writes and invalidation replay."""
 
 from contextlib import contextmanager
 import hashlib
+
+
+DIRTY_CACHE_CHANNEL = 'catmaid.dirty-cache'
+DEFAULT_REPLAY_BATCH_SIZE = 10
+
+
+def requeue_dirty_grid_cells(cursor, batch_size=DEFAULT_REPLAY_BATCH_SIZE):
+    """Re-notify persisted dirty cells, yielding after each batch."""
+    cursor.execute('SELECT MAX(id) FROM dirty_node_grid_cache_cell')
+    last_id, = cursor.fetchone()
+    if last_id is None:
+        return
+
+    after_id = 0
+    while after_id < last_id:
+        cursor.execute("""
+            WITH batch AS (
+                SELECT id, grid_id, x_index, y_index, z_index
+                FROM dirty_node_grid_cache_cell
+                WHERE id > %s AND id <= %s
+                ORDER BY id
+                LIMIT %s
+            )
+            SELECT id, pg_notify(%s, json_build_object(
+                'grid_id', grid_id, 'x', x_index, 'y', y_index, 'z', z_index
+            )::text)
+            FROM batch
+            ORDER BY id
+        """, [after_id, last_id, batch_size, DIRTY_CACHE_CHANNEL])
+        rows = cursor.fetchall()
+        if not rows:
+            return
+        after_id = rows[-1][0]
+        yield
 
 
 def cell_lock_id(grid_id, x, y, z):

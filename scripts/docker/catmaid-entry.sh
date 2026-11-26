@@ -199,8 +199,12 @@ init_catmaid () {
   fi
 
   # Migrate the database, collect static files and create a superuser.
-  echo "Migrating databse"
-  python manage.py migrate --noinput
+  echo "Migrating database"
+  python manage.py migrate --noinput || {
+    echo "CATMAID database migration failed, exiting" >&2
+    trap - EXIT
+    exit 1
+  }
   echo "Updating static files"
   python manage.py collectstatic --clear --noinput
 

@@ -13,7 +13,7 @@ from django.db import connection
 
 from catmaid.consumers import msg_all
 from catmaid.control.edge import get_intersected_grid_cells
-from catmaid.control.grid_cache import locked_grid_cell
+from catmaid.control.grid_cache import DIRTY_CACHE_CHANNEL, locked_grid_cell, requeue_dirty_grid_cells
 from catmaid.control.node import (get_configured_node_providers,
         GridCachedNodeProvider, Postgis3dNodeProvider, update_grid_cell)
 from catmaid.models import NodeGridCache
@@ -48,7 +48,9 @@ class GridWorker():
         updated_grids = set()
         updated_cell_refs: List[Any] = []
         for update in updates:
-            g = grid_map[update['grid_id']]
+            g = grid_map.get(update['grid_id'])
+            if g is None:
+                continue
             w_i, h_i, d_i = update['x'], update['y'], update['z']
 
             params = {
@@ -95,7 +97,7 @@ class Command(BaseCommand):
     help = ""
     # The queue to process. Subclass and set this.
     queue:List = []
-    notify_channel = "catmaid.dirty-cache"
+    notify_channel = DIRTY_CACHE_CHANNEL
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -129,6 +131,12 @@ class Command(BaseCommand):
             # Handle the signals for warm shutdown.
             signal.signal(signal.SIGINT, self.handle_shutdown)
             signal.signal(signal.SIGTERM, self.handle_shutdown)
+
+            # LISTEN is active before taking the backlog snapshot. Handle each
+            # batch as it is published, along with any live invalidations.
+            with connection.cursor() as cursor:
+                for _ in requeue_dirty_grid_cells(cursor):
+                    self.wait_and_queue()
 
             while True:
                 self.wait_and_queue()

@@ -14,8 +14,8 @@ using the Django management command ``catmaid_update_cache_tables``. It allows
 to specify the type of cache using the ``--cache`` option, which can be
 ``section`` or ``grid``.
 
-Caches can be automatically updated on data changes as long as the variable
-``SPATIAL_UPDATE_NOTIFICATIONS`` is set to ``True`` (disabled by default). If
+Caches can be automatically updated on data changes when
+``SPATIAL_UPDATE_NOTIFICATIONS`` is enabled, which is the default. If
 caches are not used on a CATMAID instance with a large amount of tracing data,
 it might make sense to disable this setting to improve the speed of operations
 like skeleton joins.
@@ -125,22 +125,20 @@ following the *pubsub* model. To lower the impact on regular tracing operations
 (especially joining), an insert/update/delete trigger for treenode and connector
 will execute a conditional trigger function, which is set on CATMAID startup.
 
-These events ("catmaid.spatial-update" and "catmaid.dirty-cache") are disabled by
-default, because they add slightly to the query time, even if not used. To
-enable these database events and allow automatic cache updates, set the
-``settings.py`` variable `SPATIAL_UPDATE_NOTIFICATIONS = True`. Once enabled,
-these events can be consumed by third party clients as well.
+These events, ``catmaid.spatial-update`` and ``catmaid.dirty-cache``, are enabled
+by default and can also be consumed by third party clients. These events add to
+query time, so installations without automatic cache updates can set
+``SPATIAL_UPDATE_NOTIFICATIONS = False`` in ``settings.py``.
 
 Cache updates work by running two additional worker processes in the form of
 management commands: `catmaid_spatial_update_worker` and
 `catmaid_cache_update_worker`. The former is responsible for listening to the
 "catmaid.spatial-update" Postgres event and adds entries to the table
 `dirty_node_grid_cache_cell` for each intersected cache cell in an enabled grid
-cache. Upon inserts and updates this table issues the "catmaid-dirty" cache
-event, which the second management command will listen to. It's its
-responsibility to update the respective cache cells and remove entries from the
-dirty table. If single worker processes aren't enough, more workers need to be
-started.
+cache. Inserts and updates to this table emit the ``catmaid.dirty-cache``
+event. The second worker listens for these events, refreshes the affected cells
+and removes their dirty entries. On startup it subscribes first, then sends
+fresh notifications for any persisted dirty entries.
 
 When treenodes are created, moved or deleted the database emits the event
 "catmaid.spatial-update" along with the start and end node coordinates. The same
